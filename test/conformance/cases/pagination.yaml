@@ -1,0 +1,17 @@
+cases:
+  - id: rest_datasets_list_pagination
+    method: GET
+    path: /bigquery/v2/projects/p1/datasets?maxResults=2
+    expected_status: 200
+  - id: rest_tables_list_pagination
+    method: GET
+    path: /bigquery/v2/projects/p1/datasets/ds1/tables?maxResults=2
+    expected_status: 200
+  - id: rest_jobs_list_pagination
+    method: GET
+    path: /bigquery/v2/projects/p1/jobs?maxResults=2&pageToken=2
+    expected_status: 200
+  - id: rest_tabledata_list_pagination
+    method: GET
+    path: /bigquery/v2/projects/p1/tabledata/ds1/t1/data?startIndex=1&maxResults=2
+    expected_status: 200
