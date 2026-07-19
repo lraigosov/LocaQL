@@ -2,6 +2,7 @@ package server
 
 import (
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -24,11 +25,6 @@ type tableRow struct {
 }
 
 func (s *Server) bigQueryV2(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
-		return
-	}
-
 	path := strings.TrimPrefix(r.URL.Path, "/bigquery/v2/projects/")
 	parts := strings.Split(strings.Trim(path, "/"), "/")
 	if len(parts) < 2 {
@@ -41,6 +37,10 @@ func (s *Server) bigQueryV2(w http.ResponseWriter, r *http.Request) {
 
 	switch scope {
 	case "datasets":
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+			return
+		}
 		if len(parts) == 2 {
 			s.listDatasets(w, r, projectID)
 			return
@@ -51,10 +51,30 @@ func (s *Server) bigQueryV2(w http.ResponseWriter, r *http.Request) {
 		}
 	case "jobs":
 		if len(parts) == 2 {
-			s.listJobs(w, r, projectID)
+			if r.Method == http.MethodGet {
+				s.listJobs(w, r, projectID)
+				return
+			}
+			if r.Method == http.MethodPost {
+				s.insertJob(w, r, projectID)
+				return
+			}
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+			return
+		}
+		if len(parts) == 3 && r.Method == http.MethodGet {
+			s.getJob(w, r, projectID, parts[2])
+			return
+		}
+		if len(parts) == 4 && parts[3] == "cancel" && r.Method == http.MethodPost {
+			s.cancelJob(w, r, projectID, parts[2])
 			return
 		}
 	case "tabledata":
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+			return
+		}
 		if len(parts) == 5 && parts[4] == "data" {
 			s.listTableData(w, r, projectID, parts[2], parts[3])
 			return
@@ -120,30 +140,59 @@ func (s *Server) listTables(w http.ResponseWriter, r *http.Request, projectID, d
 }
 
 func (s *Server) listJobs(w http.ResponseWriter, r *http.Request, projectID string) {
-	items := []job{{ID: "job_1"}, {ID: "job_2"}, {ID: "job_3"}, {ID: "job_4"}, {ID: "job_5"}}
 	start, size := parsePagination(r, 2, 1000)
-	end := clampEnd(start, size, len(items))
+	stateFilter := r.URL.Query().Get("stateFilter")
+	items, next := s.jobs.list(projectID, stateFilter, start, size)
 
-	out := make([]map[string]any, 0, end-start)
-	for _, j := range items[start:end] {
-		out = append(out, map[string]any{
-			"kind": "bigquery#job",
-			"id":   fmt.Sprintf("%s:%s", projectID, j.ID),
-			"jobReference": map[string]string{
-				"projectId": projectID,
-				"jobId":     j.ID,
-			},
-		})
+	out := make([]map[string]any, 0, len(items))
+	for _, j := range items {
+		out = append(out, renderJobResource(j))
 	}
 
 	resp := map[string]any{
 		"kind": "bigquery#jobList",
 		"jobs": out,
 	}
-	if end < len(items) {
-		resp["nextPageToken"] = strconv.Itoa(end)
+	if next != "" {
+		resp["nextPageToken"] = next
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) insertJob(w http.ResponseWriter, r *http.Request, projectID string) {
+	requestID := r.URL.Query().Get("requestId")
+	if r.Body != nil {
+		_, _ = io.ReadAll(r.Body)
+		_ = r.Body.Close()
+	}
+
+	jr, created := s.jobs.insert(projectID, requestID)
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+	}
+	writeJSON(w, status, renderJobResource(jr))
+}
+
+func (s *Server) getJob(w http.ResponseWriter, _ *http.Request, projectID, jobID string) {
+	jr, ok := s.jobs.get(projectID, jobID)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "job not found"})
+		return
+	}
+	writeJSON(w, http.StatusOK, renderJobResource(jr))
+}
+
+func (s *Server) cancelJob(w http.ResponseWriter, _ *http.Request, projectID, jobID string) {
+	jr, ok := s.jobs.cancel(projectID, jobID)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "job not found"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"kind": "bigquery#jobCancelResponse",
+		"job":  renderJobResource(jr),
+	})
 }
 
 func (s *Server) listTableData(w http.ResponseWriter, r *http.Request, projectID, datasetID, tableID string) {
