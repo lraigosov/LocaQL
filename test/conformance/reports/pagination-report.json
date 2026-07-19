@@ -1,0 +1,41 @@
+{
+  "suite": "pagination",
+  "started_at": "2026-07-19T20:11:43Z",
+  "base_url": "http://localhost:9050",
+  "passed": 4,
+  "failed": 0,
+  "results": [
+    {
+      "id": "rest_datasets_list_pagination",
+      "method": "GET",
+      "path": "/bigquery/v2/projects/p1/datasets?maxResults=2",
+      "expected_status": 200,
+      "actual_status": 200,
+      "passed": true
+    },
+    {
+      "id": "rest_tables_list_pagination",
+      "method": "GET",
+      "path": "/bigquery/v2/projects/p1/datasets/ds1/tables?maxResults=2",
+      "expected_status": 200,
+      "actual_status": 200,
+      "passed": true
+    },
+    {
+      "id": "rest_jobs_list_pagination",
+      "method": "GET",
+      "path": "/bigquery/v2/projects/p1/jobs?maxResults=2\u0026pageToken=2",
+      "expected_status": 200,
+      "actual_status": 200,
+      "passed": true
+    },
+    {
+      "id": "rest_tabledata_list_pagination",
+      "method": "GET",
+      "path": "/bigquery/v2/projects/p1/tabledata/ds1/t1/data?startIndex=1\u0026maxResults=2",
+      "expected_status": 200,
+      "actual_status": 200,
+      "passed": true
+    }
+  ]
+}
