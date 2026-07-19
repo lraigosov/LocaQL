@@ -45,6 +45,31 @@ capabilities:
     tests:
       - unit/server/jobs_request_id_idempotency
     reason: requestId behavior implemented for jobs insert subset
+  rest.jobs.executors.query_load_extract_copy:
+    status: partial
+    fidelity: medium
+    tests:
+      - unit/server/jobs_executor_type_and_statistics
+    reason: simulated executors implemented with synthetic statistics
+  rest.jobs.persistence.restart:
+    status: partial
+    fidelity: medium
+    tests:
+      - unit/server/jobs_persistence_across_restart
+    reason: optional local persistence implemented for job lifecycle state
+  rest.jobs.concurrency.limits:
+    status: partial
+    fidelity: medium
+    tests:
+      - unit/server/jobs_worker_limit_backpressure
+      - unit/server/jobs_concurrent_projects_clients
+    reason: configurable worker slots add local backpressure for async jobs
+  rest.jobs.mutations.resource_serialization:
+    status: partial
+    fidelity: medium
+    tests:
+      - unit/server/jobs_serialize_conflicting_resource_mutations
+    reason: jobs with same destination dataset and table execute sequentially for determinism
   rest.tabledata.list.pagination:
     status: supported
     fidelity: medium
