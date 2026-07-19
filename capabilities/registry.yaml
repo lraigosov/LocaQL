@@ -1,0 +1,41 @@
+capabilities:
+  rest.datasets.list:
+    status: supported
+    fidelity: high
+    tests:
+      - conformance/foundation/rest_datasets_list
+  rest.jobs.query:
+    status: supported
+    fidelity: high
+    tests:
+      - conformance/foundation/rest_jobs_query
+  rest.datasets.list.pagination:
+    status: supported
+    fidelity: medium
+    tests:
+      - conformance/pagination/rest_datasets_list_pagination
+  rest.tables.list.pagination:
+    status: supported
+    fidelity: medium
+    tests:
+      - conformance/pagination/rest_tables_list_pagination
+  rest.jobs.list.pagination:
+    status: supported
+    fidelity: medium
+    tests:
+      - conformance/pagination/rest_jobs_list_pagination
+  rest.tabledata.list.pagination:
+    status: supported
+    fidelity: medium
+    tests:
+      - conformance/pagination/rest_tabledata_list_pagination
+  emulator.health:
+    status: supported
+    fidelity: high
+    tests:
+      - conformance/foundation/emulator_health
+  emulator.version:
+    status: supported
+    fidelity: high
+    tests:
+      - conformance/foundation/emulator_version

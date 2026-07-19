@@ -1,0 +1,13 @@
+cases:
+  - id: emulator_health
+    method: GET
+    path: /_emulator/health
+    expected_status: 200
+  - id: emulator_version
+    method: GET
+    path: /_emulator/version
+    expected_status: 200
+  - id: emulator_capabilities
+    method: GET
+    path: /_emulator/capabilities
+    expected_status: 200
