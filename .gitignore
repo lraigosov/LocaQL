@@ -1,0 +1,33 @@
+# Local development plans and temporary notes
+bigquery-local-platform-master-plan.md
+repro/visual-console-plan.md
+devlog.md
+
+# IDEs and Editors
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+
+# OS Files
+.DS_Store
+Thumbs.db
+
+# Go binaries and build artifacts
+bin/
+dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Go dependency and coverage files
+vendor/
+coverage.txt
+profile.cov
