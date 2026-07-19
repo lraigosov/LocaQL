@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -108,7 +109,7 @@ func (s *Server) listDatasets(w http.ResponseWriter, r *http.Request, projectID 
 		"datasets": out,
 	}
 	if end < len(items) {
-		resp["nextPageToken"] = strconv.Itoa(end)
+		resp["nextPageToken"] = encodePageToken(end)
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -136,7 +137,7 @@ func (s *Server) listTables(w http.ResponseWriter, r *http.Request, projectID, d
 		"tables": out,
 	}
 	if end < len(items) {
-		resp["nextPageToken"] = strconv.Itoa(end)
+		resp["nextPageToken"] = encodePageToken(end)
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -170,7 +171,11 @@ func (s *Server) listJobs(w http.ResponseWriter, r *http.Request, projectID stri
 		"jobs": out,
 	}
 	if next != "" {
-		resp["nextPageToken"] = next
+		if n, err := strconv.Atoi(next); err == nil {
+			resp["nextPageToken"] = encodePageToken(n)
+		} else {
+			resp["nextPageToken"] = next
+		}
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -335,7 +340,7 @@ func (s *Server) listTableData(w http.ResponseWriter, r *http.Request, projectID
 		"startIndexUsed": start,
 	}
 	if end < len(rows) {
-		resp["nextPageToken"] = strconv.Itoa(end)
+		resp["nextPageToken"] = encodePageToken(end)
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -352,11 +357,38 @@ func parsePagination(r *http.Request, defaultSize, maxSize int) (start, size int
 	}
 
 	if token := r.URL.Query().Get("pageToken"); token != "" {
-		if n, err := strconv.Atoi(token); err == nil && n >= 0 {
+		if n, ok := decodePageToken(token); ok {
 			start = n
 		}
 	}
 	return start, size
+}
+
+func encodePageToken(start int) string {
+	if start < 0 {
+		start = 0
+	}
+	raw := "idx:" + strconv.Itoa(start)
+	return base64.RawURLEncoding.EncodeToString([]byte(raw))
+}
+
+func decodePageToken(token string) (int, bool) {
+	if n, err := strconv.Atoi(token); err == nil && n >= 0 {
+		return n, true
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(token)
+	if err != nil {
+		return 0, false
+	}
+	text := string(decoded)
+	if !strings.HasPrefix(text, "idx:") {
+		return 0, false
+	}
+	n, err := strconv.Atoi(strings.TrimPrefix(text, "idx:"))
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return n, true
 }
 
 func clampEnd(start, size, total int) int {
