@@ -12,6 +12,7 @@ type Server struct {
 	mux      *http.ServeMux
 	registry capabilities.Registry
 	jobs     *jobService
+	datasets *datasetService
 }
 
 func New(reg capabilities.Registry) *Server {
@@ -19,6 +20,7 @@ func New(reg capabilities.Registry) *Server {
 		mux:      http.NewServeMux(),
 		registry: reg,
 		jobs:     newJobService(),
+		datasets: newDatasetService(),
 	}
 	s.routes()
 	return s
@@ -30,6 +32,7 @@ func (s *Server) Handler() http.Handler {
 
 func (s *Server) routes() {
 	s.mux.HandleFunc("/_emulator/health", s.health)
+	s.mux.HandleFunc("/_emulator/readiness", s.readiness)
 	s.mux.HandleFunc("/_emulator/version", s.version)
 	s.mux.HandleFunc("/_emulator/capabilities", s.capabilities)
 	s.mux.HandleFunc("/bigquery/v2/projects/", s.bigQueryV2)
@@ -38,6 +41,13 @@ func (s *Server) routes() {
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":  "ok",
+		"service": version.Name,
+	})
+}
+
+func (s *Server) readiness(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":  "ready",
 		"service": version.Name,
 	})
 }
