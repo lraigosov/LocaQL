@@ -30,6 +30,9 @@ func TestDatasetsListPagination(t *testing.T) {
 	if body["nextPageToken"] == nil {
 		t.Fatalf("expected nextPageToken")
 	}
+	if body["nextPageToken"] == "2" {
+		t.Fatalf("expected opaque nextPageToken, got plain numeric token")
+	}
 }
 
 func TestJobsListPagination(t *testing.T) {
@@ -60,6 +63,57 @@ func TestJobsListPagination(t *testing.T) {
 	}
 	if len(body.Jobs) != 2 {
 		t.Fatalf("expected 2 jobs, got %d", len(body.Jobs))
+	}
+}
+
+func TestJobsListPaginationWithOpaqueToken(t *testing.T) {
+	s := newTestServer()
+
+	for i := 0; i < 5; i++ {
+		createReq := httptest.NewRequest(http.MethodPost, "/bigquery/v2/projects/p1/jobs", nil)
+		createRes := httptest.NewRecorder()
+		s.Handler().ServeHTTP(createRes, createReq)
+		if createRes.Code != http.StatusCreated {
+			t.Fatalf("expected 201, got %d", createRes.Code)
+		}
+	}
+
+	firstReq := httptest.NewRequest(http.MethodGet, "/bigquery/v2/projects/p1/jobs?maxResults=2", nil)
+	firstRes := httptest.NewRecorder()
+	s.Handler().ServeHTTP(firstRes, firstReq)
+	if firstRes.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", firstRes.Code)
+	}
+
+	var firstBody struct {
+		Jobs          []any  `json:"jobs"`
+		NextPageToken string `json:"nextPageToken"`
+	}
+	if err := json.NewDecoder(firstRes.Body).Decode(&firstBody); err != nil {
+		t.Fatalf("decode first page: %v", err)
+	}
+	if firstBody.NextPageToken == "" {
+		t.Fatalf("expected nextPageToken on first page")
+	}
+	if firstBody.NextPageToken == "2" {
+		t.Fatalf("expected opaque nextPageToken, got plain numeric token")
+	}
+
+	secondReq := httptest.NewRequest(http.MethodGet, "/bigquery/v2/projects/p1/jobs?maxResults=2&pageToken="+firstBody.NextPageToken, nil)
+	secondRes := httptest.NewRecorder()
+	s.Handler().ServeHTTP(secondRes, secondReq)
+	if secondRes.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", secondRes.Code)
+	}
+
+	var secondBody struct {
+		Jobs []any `json:"jobs"`
+	}
+	if err := json.NewDecoder(secondRes.Body).Decode(&secondBody); err != nil {
+		t.Fatalf("decode second page: %v", err)
+	}
+	if len(secondBody.Jobs) != 2 {
+		t.Fatalf("expected 2 jobs on second page, got %d", len(secondBody.Jobs))
 	}
 }
 
