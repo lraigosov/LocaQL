@@ -12,6 +12,7 @@ type Server struct {
 	mux      *http.ServeMux
 	registry capabilities.Registry
 	jobs     *jobService
+	datasets *datasetService
 }
 
 func New(reg capabilities.Registry) *Server {
@@ -19,6 +20,7 @@ func New(reg capabilities.Registry) *Server {
 		mux:      http.NewServeMux(),
 		registry: reg,
 		jobs:     newJobService(),
+		datasets: newDatasetService(),
 	}
 	s.routes()
 	return s
