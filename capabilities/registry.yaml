@@ -4,6 +4,21 @@ capabilities:
     fidelity: high
     tests:
       - conformance/foundation/rest_datasets_list
+  rest.datasets.get:
+    status: supported
+    fidelity: medium
+    tests:
+      - unit/server/datasets_get
+  rest.datasets.insert:
+    status: supported
+    fidelity: medium
+    tests:
+      - unit/server/datasets_insert
+  rest.datasets.delete:
+    status: supported
+    fidelity: medium
+    tests:
+      - unit/server/datasets_delete
   rest.jobs.query:
     status: supported
     fidelity: high
@@ -24,6 +39,12 @@ capabilities:
     fidelity: medium
     tests:
       - conformance/pagination/rest_jobs_list_pagination
+  rest.pagination.page_token.opaque:
+    status: supported
+    fidelity: medium
+    tests:
+      - unit/server/pagination_opaque_page_token
+    reason: list endpoints return opaque tokens and accept legacy numeric tokens for compatibility
   rest.jobs.insert:
     status: supported
     fidelity: medium
@@ -65,12 +86,25 @@ capabilities:
       - unit/server/jobs_concurrent_projects_clients
       - unit/server/jobs_concurrent_reads_during_writes
     reason: configurable worker slots add local backpressure for async jobs
+  rest.storage.write.backpressure:
+    status: partial
+    fidelity: medium
+    tests:
+      - unit/server/jobs_storage_write_backpressure
+      - unit/server/jobs_storage_write_limit_env
+    reason: load and copy jobs honor dedicated storage-write worker slots
   rest.jobs.mutations.resource_serialization:
     status: partial
     fidelity: medium
     tests:
       - unit/server/jobs_serialize_conflicting_resource_mutations
     reason: jobs with same destination dataset and table execute sequentially for determinism
+  emulator.catalog.persistence.atomic_snapshot:
+    status: partial
+    fidelity: medium
+    tests:
+      - unit/server/jobs_persistence_atomic_replace
+    reason: state snapshot is committed via temp file replacement to avoid partial catalog writes
   rest.tabledata.list.pagination:
     status: supported
     fidelity: medium
@@ -81,6 +115,11 @@ capabilities:
     fidelity: high
     tests:
       - conformance/foundation/emulator_health
+  emulator.readiness:
+    status: supported
+    fidelity: high
+    tests:
+      - unit/server/emulator_readiness
   emulator.version:
     status: supported
     fidelity: high

@@ -27,6 +27,12 @@ Health check:
 curl http://localhost:9050/_emulator/health
 ```
 
+Readiness check:
+
+```bash
+curl http://localhost:9050/_emulator/readiness
+```
+
 ## Capability Registry
 
 List loaded capabilities:
@@ -43,15 +49,19 @@ Registry file:
 
 | Area | Status | Notes |
 | --- | --- | --- |
-| Emulator internal endpoints | Supported | `/_emulator/health`, `/_emulator/version`, `/_emulator/capabilities` |
+| Emulator internal endpoints | Supported | `/_emulator/health`, `/_emulator/readiness`, `/_emulator/version`, `/_emulator/capabilities` |
+| Dataset management | Partial | `datasets.list`, `datasets.get`, `datasets.insert`, `datasets.delete` |
 | REST pagination baseline | Supported | `datasets.list`, `tables.list`, `jobs.list`, `tabledata.list` |
+| Opaque pagination tokens | Supported | `nextPageToken` is opaque; legacy numeric token input remains accepted |
 | Jobs lifecycle | Supported | `PENDING -> RUNNING -> DONE`, cancel before/during run |
 | requestId idempotency | Partial | Implemented for `jobs.insert` subset with TTL |
 | Job executors (query/load/extract/copy) | Partial | Simulated execution and synthetic stats |
 | Job persistence across restart | Partial | Optional local file persistence |
 | Job concurrency limit | Partial | Controlled with `LOCAQL_JOB_WORKERS` |
+| Storage Write backpressure | Partial | `load/copy` jobs throttled by `LOCAQL_STORAGE_WRITE_WORKERS` |
 | Concurrent reads safety | Partial | `jobs.get` and `jobs.list` use read locks (`RWMutex`) |
 | Resource mutation serialization | Partial | Conflicting mutations serialized by `project:dataset.table` |
+| Catalog snapshot atomicity | Partial | Optional persisted state uses temp file replace to avoid partial commits |
 
 ## Runtime Architecture
 
@@ -61,10 +71,19 @@ flowchart LR
 	REST --> JobService[jobService]
 	REST --> Registry[Capability registry]
 	JobService --> WorkerSlots[Worker slots by LOCAQL_JOB_WORKERS]
+	JobService --> StorageSlots[Storage write slots by LOCAQL_STORAGE_WRITE_WORKERS]
 	JobService --> ResourceSlots[Per-resource serialization slots]
 	JobService --> StateStore[(In-memory state)]
 	JobService --> Persist[(Optional file persistence)]
 ```
+
+## Concurrency and Isolation Notes
+
+- `jobs.get` and `jobs.list` use read locks while mutating paths use exclusive locks.
+- Conflicting table mutations are serialized by resource key (`project:dataset.table`).
+- `load/copy` jobs can be throttled independently from generic job workers through `LOCAQL_STORAGE_WRITE_WORKERS`.
+- When persistence is enabled, metadata and request-id index are written in one snapshot file commit.
+- Snapshot commit uses a temp file and replace strategy so failed writes do not leave partial catalog content.
 
 ## Job State Model
 

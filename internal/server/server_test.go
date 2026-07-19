@@ -21,6 +21,18 @@ func TestHealthEndpoint(t *testing.T) {
 	}
 }
 
+func TestReadinessEndpoint(t *testing.T) {
+	s := New(capabilities.Registry{Capabilities: map[string]capabilities.Entry{"emulator.readiness": {Status: "supported", Fidelity: "high"}}})
+	req := httptest.NewRequest(http.MethodGet, "/_emulator/readiness", nil)
+	res := httptest.NewRecorder()
+
+	s.Handler().ServeHTTP(res, req)
+
+	if res.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, res.Code)
+	}
+}
+
 func TestCapabilitiesEndpoint(t *testing.T) {
 	reg := capabilities.Registry{Capabilities: map[string]capabilities.Entry{"emulator.health": {Status: "supported", Fidelity: "high"}}}
 	s := New(reg)
