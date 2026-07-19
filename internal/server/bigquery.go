@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -39,15 +40,19 @@ func (s *Server) bigQueryV2(w http.ResponseWriter, r *http.Request) {
 
 	switch scope {
 	case "datasets":
-		if r.Method != http.MethodGet {
-			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+		if len(parts) == 2 {
+			s.handleDatasetsCollection(w, r, projectID)
 			return
 		}
-		if len(parts) == 2 {
-			s.listDatasets(w, r, projectID)
+		if len(parts) == 3 {
+			s.handleDatasetByID(w, r, projectID, parts[2])
 			return
 		}
 		if len(parts) == 4 && parts[3] == "tables" {
+			if !s.datasets.exists(projectID, parts[2]) {
+				writeJSON(w, http.StatusNotFound, map[string]any{"error": "dataset not found"})
+				return
+			}
 			s.listTables(w, r, projectID, parts[2])
 			return
 		}
@@ -86,31 +91,122 @@ func (s *Server) bigQueryV2(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusNotFound, map[string]any{"error": "not found"})
 }
 
-func (s *Server) listDatasets(w http.ResponseWriter, r *http.Request, projectID string) {
-	items := []dataset{{ID: "analytics"}, {ID: "finance"}, {ID: "ops"}, {ID: "sandbox"}}
-	start, size := parsePagination(r, 2, 1000)
-	end := clampEnd(start, size, len(items))
+func (s *Server) handleDatasetsCollection(w http.ResponseWriter, r *http.Request, projectID string) {
+	switch r.Method {
+	case http.MethodGet:
+		s.listDatasets(w, r, projectID)
+	case http.MethodPost:
+		s.insertDataset(w, r, projectID)
+	default:
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+	}
+}
 
-	out := make([]map[string]any, 0, end-start)
-	for _, ds := range items[start:end] {
-		out = append(out, map[string]any{
-			"kind": "bigquery#dataset",
-			"id":   fmt.Sprintf("%s:%s", projectID, ds.ID),
-			"datasetReference": map[string]string{
-				"projectId": projectID,
-				"datasetId": ds.ID,
-			},
-		})
+func (s *Server) handleDatasetByID(w http.ResponseWriter, r *http.Request, projectID, datasetID string) {
+	switch r.Method {
+	case http.MethodGet:
+		s.getDataset(w, projectID, datasetID)
+	case http.MethodDelete:
+		s.deleteDataset(w, projectID, datasetID)
+	default:
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+	}
+}
+
+func (s *Server) listDatasets(w http.ResponseWriter, r *http.Request, projectID string) {
+	start, size := parsePagination(r, 2, 1000)
+	items, next := s.datasets.list(projectID, start, size)
+
+	out := make([]map[string]any, 0, len(items))
+	for _, ds := range items {
+		out = append(out, renderDatasetResource(ds))
 	}
 
 	resp := map[string]any{
 		"kind":     "bigquery#datasetList",
 		"datasets": out,
 	}
-	if end < len(items) {
-		resp["nextPageToken"] = strconv.Itoa(end)
+	if next >= 0 {
+		resp["nextPageToken"] = encodePageToken(next)
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) insertDataset(w http.ResponseWriter, r *http.Request, projectID string) {
+	defer func() {
+		if r.Body != nil {
+			_ = r.Body.Close()
+		}
+	}()
+
+	var payload struct {
+		FriendlyName     string            `json:"friendlyName"`
+		Location         string            `json:"location"`
+		Labels           map[string]string `json:"labels"`
+		DatasetReference struct {
+			DatasetID string `json:"datasetId"`
+		} `json:"datasetReference"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid request body"})
+		return
+	}
+	datasetID := strings.TrimSpace(payload.DatasetReference.DatasetID)
+	if datasetID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "datasetReference.datasetId is required"})
+		return
+	}
+
+	rec, created := s.datasets.insert(datasetInsert{
+		ProjectID:    projectID,
+		DatasetID:    datasetID,
+		FriendlyName: payload.FriendlyName,
+		Location:     payload.Location,
+		Labels:       payload.Labels,
+	})
+	if !created {
+		writeJSON(w, http.StatusConflict, map[string]any{"error": "dataset already exists"})
+		return
+	}
+	writeJSON(w, http.StatusOK, renderDatasetResource(rec))
+}
+
+func (s *Server) getDataset(w http.ResponseWriter, projectID, datasetID string) {
+	rec, ok := s.datasets.get(projectID, datasetID)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "dataset not found"})
+		return
+	}
+	writeJSON(w, http.StatusOK, renderDatasetResource(rec))
+}
+
+func (s *Server) deleteDataset(w http.ResponseWriter, projectID, datasetID string) {
+	if !s.datasets.delete(projectID, datasetID) {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "dataset not found"})
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func renderDatasetResource(ds *datasetRecord) map[string]any {
+	resp := map[string]any{
+		"kind": "bigquery#dataset",
+		"id":   fmt.Sprintf("%s:%s", ds.ProjectID, ds.DatasetID),
+		"datasetReference": map[string]string{
+			"projectId": ds.ProjectID,
+			"datasetId": ds.DatasetID,
+		},
+	}
+	if ds.FriendlyName != "" {
+		resp["friendlyName"] = ds.FriendlyName
+	}
+	if ds.Location != "" {
+		resp["location"] = ds.Location
+	}
+	if len(ds.Labels) > 0 {
+		resp["labels"] = ds.Labels
+	}
+	return resp
 }
 
 func (s *Server) listTables(w http.ResponseWriter, r *http.Request, projectID, datasetID string) {
@@ -136,7 +232,7 @@ func (s *Server) listTables(w http.ResponseWriter, r *http.Request, projectID, d
 		"tables": out,
 	}
 	if end < len(items) {
-		resp["nextPageToken"] = strconv.Itoa(end)
+		resp["nextPageToken"] = encodePageToken(end)
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -170,7 +266,11 @@ func (s *Server) listJobs(w http.ResponseWriter, r *http.Request, projectID stri
 		"jobs": out,
 	}
 	if next != "" {
-		resp["nextPageToken"] = next
+		if n, err := strconv.Atoi(next); err == nil {
+			resp["nextPageToken"] = encodePageToken(n)
+		} else {
+			resp["nextPageToken"] = next
+		}
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -335,7 +435,7 @@ func (s *Server) listTableData(w http.ResponseWriter, r *http.Request, projectID
 		"startIndexUsed": start,
 	}
 	if end < len(rows) {
-		resp["nextPageToken"] = strconv.Itoa(end)
+		resp["nextPageToken"] = encodePageToken(end)
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -352,11 +452,38 @@ func parsePagination(r *http.Request, defaultSize, maxSize int) (start, size int
 	}
 
 	if token := r.URL.Query().Get("pageToken"); token != "" {
-		if n, err := strconv.Atoi(token); err == nil && n >= 0 {
+		if n, ok := decodePageToken(token); ok {
 			start = n
 		}
 	}
 	return start, size
+}
+
+func encodePageToken(start int) string {
+	if start < 0 {
+		start = 0
+	}
+	raw := "idx:" + strconv.Itoa(start)
+	return base64.RawURLEncoding.EncodeToString([]byte(raw))
+}
+
+func decodePageToken(token string) (int, bool) {
+	if n, err := strconv.Atoi(token); err == nil && n >= 0 {
+		return n, true
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(token)
+	if err != nil {
+		return 0, false
+	}
+	text := string(decoded)
+	if !strings.HasPrefix(text, "idx:") {
+		return 0, false
+	}
+	n, err := strconv.Atoi(strings.TrimPrefix(text, "idx:"))
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return n, true
 }
 
 func clampEnd(start, size, total int) int {

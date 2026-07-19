@@ -80,6 +80,8 @@ type jobService struct {
 	requestIDTTL    time.Duration
 	maxConcurrent   int
 	runSlots        chan struct{}
+	maxStorageWrite int
+	storageWriteSlots chan struct{}
 	resourceSlots   map[string]chan struct{}
 	persistencePath string
 	counter         int64
@@ -101,6 +103,11 @@ func newJobServiceWithWorkerLimit(limit int) *jobService {
 		requestIDIndex: make(map[string]map[string]requestIDRecord),
 		resourceSlots:  make(map[string]chan struct{}),
 		requestIDTTL:   15 * time.Minute,
+	}
+	storageLimit := readDefaultStorageWriteWorkerLimit()
+	if storageLimit > 0 {
+		s.maxStorageWrite = storageLimit
+		s.storageWriteSlots = make(chan struct{}, storageLimit)
 	}
 	if limit > 0 {
 		s.maxConcurrent = limit
@@ -124,6 +131,18 @@ func newJobServiceWithPersistence(path string) *jobService {
 
 func readDefaultJobWorkerLimit() int {
 	raw := strings.TrimSpace(os.Getenv("LOCAQL_JOB_WORKERS"))
+	if raw == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
+}
+
+func readDefaultStorageWriteWorkerLimit() int {
+	raw := strings.TrimSpace(os.Getenv("LOCAQL_STORAGE_WRITE_WORKERS"))
 	if raw == "" {
 		return 0
 	}
@@ -230,16 +249,20 @@ func (s *jobService) run(jobID, projectID string) {
 		return
 	}
 	resourceKey := jr.ResourceKey
+	jobType := jr.JobType
 	if jr.CancelRequested {
 		jr.State = jobStateDone
 		jr.ErrorReason = "stopped"
 		jr.ErrorMessage = "job cancelled before execution"
 		jr.EndedAt = time.Now().UTC()
-		s.persistLocked()
+		_ = s.persistLocked()
 		s.mu.Unlock()
 		return
 	}
 	s.mu.Unlock()
+
+	releaseStorageWrite := s.acquireStorageWriteSlot(jobType)
+	defer releaseStorageWrite()
 
 	releaseResource := s.acquireResourceSlot(resourceKey)
 	defer releaseResource()
@@ -255,13 +278,13 @@ func (s *jobService) run(jobID, projectID string) {
 		jr.ErrorReason = "stopped"
 		jr.ErrorMessage = "job cancelled before execution"
 		jr.EndedAt = time.Now().UTC()
-		s.persistLocked()
+		_ = s.persistLocked()
 		s.mu.Unlock()
 		return
 	}
 	jr.State = jobStateRunning
 	jr.StartedAt = time.Now().UTC()
-	s.persistLocked()
+	_ = s.persistLocked()
 	s.mu.Unlock()
 
 	d := executorDuration(jr.JobType)
@@ -278,13 +301,13 @@ func (s *jobService) run(jobID, projectID string) {
 		jr.ErrorReason = "stopped"
 		jr.ErrorMessage = "job cancelled"
 		jr.EndedAt = time.Now().UTC()
-		s.persistLocked()
+		_ = s.persistLocked()
 		return
 	}
 	applyExecutorResult(jr)
 	jr.State = jobStateDone
 	jr.EndedAt = time.Now().UTC()
-	s.persistLocked()
+	_ = s.persistLocked()
 }
 
 func (s *jobService) get(projectID, jobID string) (*jobRecord, bool) {
@@ -320,7 +343,7 @@ func (s *jobService) cancel(projectID, jobID string) (*jobRecord, bool) {
 		jr.ErrorMessage = "job cancelled before execution"
 		jr.EndedAt = time.Now().UTC()
 	}
-	s.persistLocked()
+	_ = s.persistLocked()
 	cp := *jr
 	return &cp, true
 }
@@ -432,6 +455,28 @@ func (s *jobService) acquireResourceSlot(resourceKey string) func() {
 	slot <- struct{}{}
 	return func() {
 		<-slot
+	}
+}
+
+func (s *jobService) acquireStorageWriteSlot(jobType string) func() {
+	if s.storageWriteSlots == nil {
+		return func() {}
+	}
+	if !requiresStorageWriteBackpressure(jobType) {
+		return func() {}
+	}
+	s.storageWriteSlots <- struct{}{}
+	return func() {
+		<-s.storageWriteSlots
+	}
+}
+
+func requiresStorageWriteBackpressure(jobType string) bool {
+	switch strings.ToLower(strings.TrimSpace(jobType)) {
+	case "load", "copy":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -547,9 +592,9 @@ func (s *jobService) loadPersistence() {
 	s.counter = snap.Counter
 }
 
-func (s *jobService) persistLocked() {
+func (s *jobService) persistLocked() error {
 	if strings.TrimSpace(s.persistencePath) == "" {
-		return
+		return nil
 	}
 	snap := jobServiceSnapshot{
 		Counter:        s.counter,
@@ -558,11 +603,28 @@ func (s *jobService) persistLocked() {
 	}
 	content, err := json.MarshalIndent(snap, "", "  ")
 	if err != nil {
-		return
+		return err
 	}
 	dir := filepath.Dir(s.persistencePath)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return
+		return err
 	}
-	_ = os.WriteFile(s.persistencePath, content, 0o644)
+	tmpPath := s.persistencePath + ".tmp"
+	if err := os.WriteFile(tmpPath, content, 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, s.persistencePath); err == nil {
+		return nil
+	}
+
+	// Windows does not always allow replacing an existing file with Rename.
+	if removeErr := os.Remove(s.persistencePath); removeErr != nil && !os.IsNotExist(removeErr) {
+		_ = os.Remove(tmpPath)
+		return removeErr
+	}
+	if err := os.Rename(tmpPath, s.persistencePath); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	return nil
 }
