@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -313,6 +314,22 @@ func TestJobsPersistenceAcrossRestart(t *testing.T) {
 	}
 }
 
+func TestJobsPersistenceAtomicReplaceDoesNotLeakTempFile(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "jobs", "state.json")
+	js := newJobServiceWithPersistence(storePath)
+
+	if _, created := js.insert(jobInsertOptions{ProjectID: "p1", RequestID: "persist-tmp", JobType: "query"}); !created {
+		t.Fatalf("expected job creation")
+	}
+
+	time.Sleep(20 * time.Millisecond)
+	if _, err := os.Stat(storePath + ".tmp"); err == nil {
+		t.Fatalf("expected temporary file to be cleaned up")
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("unexpected error checking temp file: %v", err)
+	}
+}
+
 func TestJobServiceWorkerLimitBackpressure(t *testing.T) {
 	js := newJobServiceWithWorkerLimit(1)
 
@@ -373,6 +390,55 @@ func TestJobServiceReadsWorkerLimitFromEnv(t *testing.T) {
 	}
 	if js.runSlots == nil || cap(js.runSlots) != 2 {
 		t.Fatalf("expected runSlots capacity 2")
+	}
+}
+
+func TestJobServiceReadsStorageWriteLimitFromEnv(t *testing.T) {
+	t.Setenv("LOCAQL_STORAGE_WRITE_WORKERS", "1")
+	js := newJobService()
+	if js.maxStorageWrite != 1 {
+		t.Fatalf("expected storage write worker limit 1 from env, got %d", js.maxStorageWrite)
+	}
+	if js.storageWriteSlots == nil || cap(js.storageWriteSlots) != 1 {
+		t.Fatalf("expected storageWriteSlots capacity 1")
+	}
+}
+
+func TestJobServiceStorageWriteBackpressure(t *testing.T) {
+	t.Setenv("LOCAQL_STORAGE_WRITE_WORKERS", "1")
+	js := newJobServiceWithWorkerLimit(4)
+
+	if _, created := js.insert(jobInsertOptions{ProjectID: "p1", JobType: "load"}); !created {
+		t.Fatalf("expected first storage-write job to be created")
+	}
+	if _, created := js.insert(jobInsertOptions{ProjectID: "p1", JobType: "copy"}); !created {
+		t.Fatalf("expected second storage-write job to be created")
+	}
+
+	deadline := time.Now().Add(130 * time.Millisecond)
+	foundBackpressure := false
+	for time.Now().Before(deadline) {
+		items, _ := js.list("p1", jobListFilters{}, 0, 10)
+		running := 0
+		pending := 0
+		for _, item := range items {
+			switch item.State {
+			case jobStateRunning:
+				running++
+			case jobStatePending:
+				pending++
+			}
+		}
+		if running == 1 && pending == 1 {
+			foundBackpressure = true
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if !foundBackpressure {
+		items, _ := js.list("p1", jobListFilters{}, 0, 10)
+		t.Fatalf("expected one RUNNING and one PENDING storage-write job under storage backpressure, got %#v", items)
 	}
 }
 
