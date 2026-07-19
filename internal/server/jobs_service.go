@@ -25,6 +25,7 @@ type jobRecord struct {
 	JobID           string
 	ParentJobID     string
 	JobType         string
+	ResourceKey     string
 	State           jobState
 	RequestID       string
 	UserEmail       string
@@ -53,13 +54,15 @@ type requestIDRecord struct {
 }
 
 type jobInsertOptions struct {
-	ProjectID   string
-	RequestID   string
-	ParentJobID string
-	UserEmail   string
-	QueryText   string
-	JobType     string
-	IsScript    bool
+	ProjectID     string
+	RequestID     string
+	ParentJobID   string
+	UserEmail     string
+	QueryText     string
+	JobType       string
+	TargetDataset string
+	TargetTable   string
+	IsScript      bool
 }
 
 type jobListFilters struct {
@@ -75,6 +78,9 @@ type jobService struct {
 	jobsByProject   map[string]map[string]*jobRecord
 	requestIDIndex  map[string]map[string]requestIDRecord
 	requestIDTTL    time.Duration
+	maxConcurrent   int
+	runSlots        chan struct{}
+	resourceSlots   map[string]chan struct{}
 	persistencePath string
 	counter         int64
 }
@@ -86,11 +92,21 @@ type jobServiceSnapshot struct {
 }
 
 func newJobService() *jobService {
-	return &jobService{
+	return newJobServiceWithWorkerLimit(readDefaultJobWorkerLimit())
+}
+
+func newJobServiceWithWorkerLimit(limit int) *jobService {
+	s := &jobService{
 		jobsByProject:  make(map[string]map[string]*jobRecord),
 		requestIDIndex: make(map[string]map[string]requestIDRecord),
+		resourceSlots:  make(map[string]chan struct{}),
 		requestIDTTL:   15 * time.Minute,
 	}
+	if limit > 0 {
+		s.maxConcurrent = limit
+		s.runSlots = make(chan struct{}, limit)
+	}
+	return s
 }
 
 func newJobServiceWithTTL(ttl time.Duration) *jobService {
@@ -104,6 +120,18 @@ func newJobServiceWithPersistence(path string) *jobService {
 	s.persistencePath = path
 	s.loadPersistence()
 	return s
+}
+
+func readDefaultJobWorkerLimit() int {
+	raw := strings.TrimSpace(os.Getenv("LOCAQL_JOB_WORKERS"))
+	if raw == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
 }
 
 func (s *jobService) insert(opts jobInsertOptions) (*jobRecord, bool) {
@@ -133,6 +161,7 @@ func (s *jobService) insert(opts jobInsertOptions) (*jobRecord, bool) {
 		JobID:       jobID,
 		ParentJobID: opts.ParentJobID,
 		JobType:     normalizeJobType(opts),
+		ResourceKey: buildResourceKey(opts),
 		State:       jobStatePending,
 		RequestID:   requestID,
 		UserEmail:   opts.UserEmail,
@@ -185,8 +214,38 @@ func (s *jobService) insertScriptWithChildren(opts jobInsertOptions) (*jobRecord
 }
 
 func (s *jobService) run(jobID, projectID string) {
+	releaseSlot := func() {}
+	if s.runSlots != nil {
+		s.runSlots <- struct{}{}
+		releaseSlot = func() {
+			<-s.runSlots
+		}
+	}
+	defer releaseSlot()
+
 	s.mu.Lock()
 	jr := s.jobsByProject[projectID][jobID]
+	if jr == nil {
+		s.mu.Unlock()
+		return
+	}
+	resourceKey := jr.ResourceKey
+	if jr.CancelRequested {
+		jr.State = jobStateDone
+		jr.ErrorReason = "stopped"
+		jr.ErrorMessage = "job cancelled before execution"
+		jr.EndedAt = time.Now().UTC()
+		s.persistLocked()
+		s.mu.Unlock()
+		return
+	}
+	s.mu.Unlock()
+
+	releaseResource := s.acquireResourceSlot(resourceKey)
+	defer releaseResource()
+
+	s.mu.Lock()
+	jr = s.jobsByProject[projectID][jobID]
 	if jr == nil {
 		s.mu.Unlock()
 		return
@@ -349,6 +408,32 @@ func splitScriptStatements(query string) []string {
 		return []string{"noop"}
 	}
 	return out
+}
+
+func buildResourceKey(opts jobInsertOptions) string {
+	if opts.TargetDataset == "" || opts.TargetTable == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s:%s.%s", opts.ProjectID, opts.TargetDataset, opts.TargetTable)
+}
+
+func (s *jobService) acquireResourceSlot(resourceKey string) func() {
+	if strings.TrimSpace(resourceKey) == "" {
+		return func() {}
+	}
+
+	s.mu.Lock()
+	slot, ok := s.resourceSlots[resourceKey]
+	if !ok {
+		slot = make(chan struct{}, 1)
+		s.resourceSlots[resourceKey] = slot
+	}
+	s.mu.Unlock()
+
+	slot <- struct{}{}
+	return func() {
+		<-slot
+	}
 }
 
 func renderJobResource(j *jobRecord) map[string]any {
