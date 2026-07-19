@@ -74,7 +74,7 @@ type jobListFilters struct {
 }
 
 type jobService struct {
-	mu              sync.Mutex
+	mu              sync.RWMutex
 	jobsByProject   map[string]map[string]*jobRecord
 	requestIDIndex  map[string]map[string]requestIDRecord
 	requestIDTTL    time.Duration
@@ -288,8 +288,8 @@ func (s *jobService) run(jobID, projectID string) {
 }
 
 func (s *jobService) get(projectID, jobID string) (*jobRecord, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	proj := s.jobsByProject[projectID]
 	if proj == nil {
 		return nil, false
@@ -326,9 +326,8 @@ func (s *jobService) cancel(projectID, jobID string) (*jobRecord, bool) {
 }
 
 func (s *jobService) list(projectID string, filters jobListFilters, start, size int) ([]*jobRecord, string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.cleanupExpiredRequestIDsLocked(time.Now().UTC())
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
 	proj := s.jobsByProject[projectID]
 	if proj == nil {

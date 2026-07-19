@@ -459,3 +459,45 @@ func TestJobServiceSerializesConflictingResourceMutations(t *testing.T) {
 		t.Fatalf("expected serialized mutation execution with one RUNNING and one PENDING job, got %#v", items)
 	}
 }
+
+func TestJobServiceConcurrentReadsDuringWrites(t *testing.T) {
+	js := newJobServiceWithWorkerLimit(3)
+
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		for i := 0; i < 25; i++ {
+			_, _ = js.insert(jobInsertOptions{
+				ProjectID: "p-read",
+				UserEmail: "reader@example.com",
+				JobType:   "query",
+			})
+			time.Sleep(2 * time.Millisecond)
+		}
+	}()
+
+	readerDone := make(chan struct{})
+	go func() {
+		defer close(readerDone)
+		deadline := time.Now().Add(250 * time.Millisecond)
+		for time.Now().Before(deadline) {
+			items, _ := js.list("p-read", jobListFilters{}, 0, 100)
+			for _, item := range items {
+				_, _ = js.get("p-read", item.JobID)
+			}
+			time.Sleep(1 * time.Millisecond)
+		}
+	}()
+
+	select {
+	case <-writerDone:
+	case <-time.After(1 * time.Second):
+		t.Fatalf("writer did not finish in time")
+	}
+
+	select {
+	case <-readerDone:
+	case <-time.After(1 * time.Second):
+		t.Fatalf("reader did not finish in time")
+	}
+}
