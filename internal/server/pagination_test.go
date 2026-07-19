@@ -34,6 +34,16 @@ func TestDatasetsListPagination(t *testing.T) {
 
 func TestJobsListPagination(t *testing.T) {
 	s := newTestServer()
+
+	for i := 0; i < 5; i++ {
+		createReq := httptest.NewRequest(http.MethodPost, "/bigquery/v2/projects/p1/jobs", nil)
+		createRes := httptest.NewRecorder()
+		s.Handler().ServeHTTP(createRes, createReq)
+		if createRes.Code != http.StatusCreated {
+			t.Fatalf("expected 201, got %d", createRes.Code)
+		}
+	}
+
 	req := httptest.NewRequest(http.MethodGet, "/bigquery/v2/projects/p1/jobs?maxResults=2&pageToken=2", nil)
 	res := httptest.NewRecorder()
 
