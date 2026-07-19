@@ -73,6 +73,10 @@ func (s *Server) bigQueryV2(w http.ResponseWriter, r *http.Request) {
 			s.getJob(w, r, projectID, parts[2])
 			return
 		}
+		if len(parts) == 4 && parts[3] == "queryResults" && r.Method == http.MethodGet {
+			s.getQueryResults(w, r, projectID, parts[2])
+			return
+		}
 		if len(parts) == 4 && parts[3] == "cancel" && r.Method == http.MethodPost {
 			s.cancelJob(w, r, projectID, parts[2])
 			return
@@ -395,6 +399,96 @@ func (s *Server) cancelJob(w http.ResponseWriter, _ *http.Request, projectID, jo
 		"kind": "bigquery#jobCancelResponse",
 		"job":  renderJobResource(jr),
 	})
+}
+
+func (s *Server) getQueryResults(w http.ResponseWriter, r *http.Request, projectID, jobID string) {
+	j, ok := s.jobs.get(projectID, jobID)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "job not found"})
+		return
+	}
+	if j.JobType != "query" && j.JobType != "script" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "query results only available for query jobs"})
+		return
+	}
+
+	start, size := parsePagination(r, 20, 1000)
+	schema, values := simulateQueryResultTable(j.QueryText)
+	end := clampEnd(start, size, len(values))
+
+	rows := make([]map[string]any, 0, end-start)
+	for _, raw := range values[start:end] {
+		cells := make([]map[string]string, 0, len(raw))
+		for _, value := range raw {
+			cells = append(cells, map[string]string{"v": value})
+		}
+		rows = append(rows, map[string]any{"f": cells})
+	}
+
+	resp := map[string]any{
+		"kind": "bigquery#getQueryResultsResponse",
+		"jobReference": map[string]string{
+			"projectId": projectID,
+			"jobId":     jobID,
+		},
+		"schema": map[string]any{
+			"fields": schema,
+		},
+		"rows":           rows,
+		"totalRows":      strconv.Itoa(len(values)),
+		"jobComplete":    j.State == jobStateDone,
+		"pageToken":      strconv.Itoa(start),
+		"maxResults":     size,
+		"startIndexUsed": start,
+	}
+	if end < len(values) {
+		resp["pageToken"] = encodePageToken(end)
+	}
+
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func simulateQueryResultTable(queryText string) ([]map[string]string, [][]string) {
+	trimmed := strings.TrimSpace(queryText)
+	if trimmed == "" {
+		return []map[string]string{{"name": "result", "type": "STRING"}}, [][]string{{"query job executed"}}
+	}
+
+	lower := strings.ToLower(trimmed)
+	if strings.HasPrefix(lower, "select") && !strings.Contains(lower, " from ") {
+		expr := strings.TrimSpace(trimmed[len("select"):])
+		if expr == "" {
+			return []map[string]string{{"name": "result", "type": "STRING"}}, [][]string{{"empty select"}}
+		}
+		parts := strings.Split(expr, ",")
+		schema := make([]map[string]string, 0, len(parts))
+		row := make([]string, 0, len(parts))
+		for idx, p := range parts {
+			part := strings.TrimSpace(p)
+			name := fmt.Sprintf("col_%d", idx+1)
+			value := part
+			if asIdx := strings.LastIndex(strings.ToLower(part), " as "); asIdx >= 0 {
+				value = strings.TrimSpace(part[:asIdx])
+				alias := strings.TrimSpace(part[asIdx+4:])
+				if alias != "" {
+					name = strings.Trim(alias, "`")
+				}
+			}
+			value = strings.Trim(value, "'\"")
+			schema = append(schema, map[string]string{"name": name, "type": "STRING"})
+			row = append(row, value)
+		}
+		return schema, [][]string{row}
+	}
+
+	return []map[string]string{
+		{"name": "row_num", "type": "INT64"},
+		{"name": "preview", "type": "STRING"},
+	}, [][]string{
+		{"1", "Simulated query result row"},
+		{"2", "Add SQL engine integration for full fidelity"},
+		{"3", "Current mode returns deterministic preview"},
+	}
 }
 
 func (s *Server) listTableData(w http.ResponseWriter, r *http.Request, projectID, datasetID, tableID string) {

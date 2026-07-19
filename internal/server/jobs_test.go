@@ -294,6 +294,45 @@ func TestJobsExecutorTypeAndStatistics(t *testing.T) {
 	}
 }
 
+func TestJobsGetQueryResults(t *testing.T) {
+	s := newTestServer()
+	body := `{"configuration":{"query":{"query":"SELECT 1 AS one, 'two' AS two"}}}`
+	createReq := httptest.NewRequest(http.MethodPost, "/bigquery/v2/projects/p1/jobs", strings.NewReader(body))
+	createReq.Header.Set("Content-Type", "application/json")
+	createRes := httptest.NewRecorder()
+	s.Handler().ServeHTTP(createRes, createReq)
+	if createRes.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d", createRes.Code)
+	}
+
+	var created map[string]any
+	if err := json.NewDecoder(createRes.Body).Decode(&created); err != nil {
+		t.Fatalf("decode created job: %v", err)
+	}
+	jobRef := created["jobReference"].(map[string]any)
+	jobID := jobRef["jobId"].(string)
+
+	getReq := httptest.NewRequest(http.MethodGet, "/bigquery/v2/projects/p1/jobs/"+jobID+"/queryResults", nil)
+	getRes := httptest.NewRecorder()
+	s.Handler().ServeHTTP(getRes, getReq)
+	if getRes.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", getRes.Code)
+	}
+
+	var out map[string]any
+	if err := json.NewDecoder(getRes.Body).Decode(&out); err != nil {
+		t.Fatalf("decode query results: %v", err)
+	}
+	rows, ok := out["rows"].([]any)
+	if !ok || len(rows) == 0 {
+		t.Fatalf("expected non-empty rows in query results")
+	}
+	schema, ok := out["schema"].(map[string]any)
+	if !ok || schema["fields"] == nil {
+		t.Fatalf("expected schema fields in query results")
+	}
+}
+
 func TestJobsPersistenceAcrossRestart(t *testing.T) {
 	storePath := filepath.Join(t.TempDir(), "jobs", "state.json")
 	firstService := newJobServiceWithPersistence(storePath)
