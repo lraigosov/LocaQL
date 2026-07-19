@@ -27,6 +27,12 @@ Health check:
 curl http://localhost:9050/_emulator/health
 ```
 
+Readiness check:
+
+```bash
+curl http://localhost:9050/_emulator/readiness
+```
+
 ## Capability Registry
 
 List loaded capabilities:
@@ -43,7 +49,7 @@ Registry file:
 
 | Area | Status | Notes |
 | --- | --- | --- |
-| Emulator internal endpoints | Supported | `/_emulator/health`, `/_emulator/version`, `/_emulator/capabilities` |
+| Emulator internal endpoints | Supported | `/_emulator/health`, `/_emulator/readiness`, `/_emulator/version`, `/_emulator/capabilities` |
 | REST pagination baseline | Supported | `datasets.list`, `tables.list`, `jobs.list`, `tabledata.list` |
 | Jobs lifecycle | Supported | `PENDING -> RUNNING -> DONE`, cancel before/during run |
 | requestId idempotency | Partial | Implemented for `jobs.insert` subset with TTL |

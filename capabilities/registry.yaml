@@ -81,6 +81,11 @@ capabilities:
     fidelity: high
     tests:
       - conformance/foundation/emulator_health
+  emulator.readiness:
+    status: supported
+    fidelity: high
+    tests:
+      - unit/server/emulator_readiness
   emulator.version:
     status: supported
     fidelity: high
