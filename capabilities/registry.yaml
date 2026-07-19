@@ -125,3 +125,10 @@ capabilities:
     fidelity: high
     tests:
       - conformance/foundation/emulator_version
+  console.ui.service:
+    status: partial
+    fidelity: medium
+    tests:
+      - unit/ui/proxy_rewrite
+      - unit/ui/config_endpoint
+    reason: standalone UI service proxies emulator APIs and adapts views using capabilities

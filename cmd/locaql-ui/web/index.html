@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LocaQL Console</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/web/styles.css">
+</head>
+<body>
+  <main class="studio-shell">
+    <aside class="studio-sidebar">
+      <div class="brand">
+        <p class="brand-kicker">Local Analytics Studio</p>
+        <h1>LocaQL Studio</h1>
+        <p class="brand-note">Independent interface, not affiliated with Google.</p>
+      </div>
+
+      <section class="sidebar-section">
+        <div class="section-head">
+          <h2>Project</h2>
+        </div>
+        <div class="project-controls">
+          <label for="projectId">Project ID</label>
+          <input id="projectId" value="p1" />
+          <div class="row-actions">
+            <button id="loadProjectBtn" type="button">Load</button>
+            <button id="refreshBtn" type="button">Refresh</button>
+            <button id="themeToggle" type="button">Dark</button>
+          </div>
+          <span id="emulatorTarget" class="meta-text">emulator: -</span>
+        </div>
+      </section>
+
+      <section class="sidebar-section">
+        <div class="section-head">
+          <h2>Explorer</h2>
+        </div>
+        <form id="createDatasetForm" class="compact-form">
+          <input id="newDatasetId" placeholder="new dataset id" required />
+          <button type="submit">Create</button>
+        </form>
+        <div id="explorerTree" class="tree"></div>
+      </section>
+
+      <section class="sidebar-section">
+        <div class="section-head">
+          <h2>Saved Queries</h2>
+        </div>
+        <form id="saveQueryForm" class="compact-form">
+          <input id="savedQueryName" placeholder="query name" required />
+          <button type="submit">Save</button>
+        </form>
+        <ul id="savedQueriesList" class="list sidebar-list"></ul>
+      </section>
+    </aside>
+
+    <section class="studio-main">
+      <header class="studio-header">
+        <div class="tabs">
+          <span class="tab active">Query</span>
+          <span class="tab">Jobs</span>
+          <span class="tab">Capabilities</span>
+        </div>
+        <div class="status-strip">
+          <article class="status-card">
+            <h3>Runtime</h3>
+            <p id="healthStatus" class="metric">-</p>
+          </article>
+          <article class="status-card">
+            <h3>Capabilities</h3>
+            <p id="capabilitiesStatus" class="metric">-</p>
+          </article>
+          <article class="status-card">
+            <h3>Jobs</h3>
+            <p id="jobsStatus" class="metric">-</p>
+          </article>
+        </div>
+      </header>
+
+      <section class="workspace-grid">
+        <article class="panel query-panel">
+          <div class="panel-head">
+            <h3>SQL Workspace</h3>
+            <span id="queryRunStatus" class="meta-text">ready</span>
+          </div>
+          <form id="runQueryForm" class="stack-form">
+            <textarea id="queryText" rows="9" placeholder="SELECT 1 AS sample"></textarea>
+            <div class="row-actions">
+              <button type="submit">Run Query Job</button>
+            </div>
+          </form>
+        </article>
+
+        <article class="panel panel-wide">
+          <div class="panel-head">
+            <h3>Query Results</h3>
+            <span id="queryResultsMeta" class="meta-text">no results yet</span>
+          </div>
+          <div class="table-wrap">
+            <table id="queryResultsTable" class="result-table"></table>
+          </div>
+        </article>
+
+        <article class="panel jobs-panel">
+          <div class="panel-head">
+            <h3>Jobs Explorer</h3>
+          </div>
+          <form id="jobsFilterForm" class="jobs-filter-form">
+            <input id="jobsStateFilter" placeholder="state filter (e.g. DONE)" />
+            <input id="jobsUserEmailFilter" placeholder="user email" />
+            <button type="submit">Apply</button>
+            <button id="clearJobsFiltersBtn" type="button">Clear</button>
+          </form>
+          <div class="row-actions jobs-pagination">
+            <button id="jobsPrevBtn" type="button">Previous</button>
+            <button id="jobsNextBtn" type="button">Next</button>
+            <span id="jobsPageHint" class="meta-text">page: start</span>
+          </div>
+          <ul id="jobsList" class="list"></ul>
+        </article>
+
+        <article class="panel details-panel">
+          <div class="panel-head">
+            <h3>Job Details</h3>
+          </div>
+          <div class="row-actions">
+            <button id="refreshJobBtn" type="button">Refresh Job</button>
+            <button id="cancelJobBtn" type="button">Cancel Job</button>
+            <span id="selectedJobHint" class="meta-text">selected: none</span>
+          </div>
+          <pre id="jobDetailsJson" class="code-block"></pre>
+        </article>
+
+        <article class="panel panel-wide">
+          <div class="panel-head">
+            <h3>Capabilities JSON</h3>
+          </div>
+          <pre id="capabilitiesJson" class="code-block"></pre>
+        </article>
+      </section>
+    </section>
+  </main>
+
+  <script src="/web/app.js" type="module"></script>
+</body>
+</html>

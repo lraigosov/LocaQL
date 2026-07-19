@@ -62,6 +62,7 @@ Registry file:
 | Concurrent reads safety | Partial | `jobs.get` and `jobs.list` use read locks (`RWMutex`) |
 | Resource mutation serialization | Partial | Conflicting mutations serialized by `project:dataset.table` |
 | Catalog snapshot atomicity | Partial | Optional persisted state uses temp file replace to avoid partial commits |
+| Standalone UI service | Partial | `cmd/locaql-ui` with dynamic capability-driven console and API proxy |
 
 ## Runtime Architecture
 
@@ -127,3 +128,35 @@ Race validation for server concurrency:
 ```bash
 wsl -d Ubuntu-24.04 -- bash -lc 'cd /mnt/f/GitHub/LocaQL && CGO_ENABLED=1 go test -race ./internal/server'
 ```
+
+## LocaQL Console (Standalone UI)
+
+Run the emulator first:
+
+```bash
+wsl -d Ubuntu-24.04 -- bash -lc 'cd /mnt/f/GitHub/LocaQL && go run ./cmd/locaql start --addr :9050'
+```
+
+Run the UI service on a separate port:
+
+```bash
+wsl -d Ubuntu-24.04 -- bash -lc 'cd /mnt/f/GitHub/LocaQL && go run ./cmd/locaql-ui --addr :9070 --emulator http://localhost:9050'
+```
+
+Open:
+
+- `http://localhost:9070`
+
+UI notes:
+
+- The UI is a separate service and does not access emulator internals directly.
+- The UI integrates dynamically through `/_emulator/capabilities` and REST APIs.
+- The UI backend proxies `/api/*` to the emulator to avoid browser CORS issues.
+- Default UI port: `9070`.
+
+Current UI scope:
+
+- Health and capabilities dashboard.
+- Dataset listing and basic dataset creation.
+- Query job submission from SQL input.
+- Job list with selection, detail refresh, and cancellation.
