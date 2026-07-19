@@ -1,11 +1,13 @@
 package server
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type dataset struct {
@@ -141,8 +143,22 @@ func (s *Server) listTables(w http.ResponseWriter, r *http.Request, projectID, d
 
 func (s *Server) listJobs(w http.ResponseWriter, r *http.Request, projectID string) {
 	start, size := parsePagination(r, 2, 1000)
-	stateFilter := r.URL.Query().Get("stateFilter")
-	items, next := s.jobs.list(projectID, stateFilter, start, size)
+	filters := jobListFilters{
+		StateFilter: r.URL.Query().Get("stateFilter"),
+		UserEmail:   r.URL.Query().Get("userEmail"),
+		ParentJobID: r.URL.Query().Get("parentJobId"),
+	}
+	if raw := r.URL.Query().Get("minCreationTime"); raw != "" {
+		if ms, err := strconv.ParseInt(raw, 10, 64); err == nil {
+			filters.MinCreated = time.UnixMilli(ms).UTC()
+		}
+	}
+	if raw := r.URL.Query().Get("maxCreationTime"); raw != "" {
+		if ms, err := strconv.ParseInt(raw, 10, 64); err == nil {
+			filters.MaxCreated = time.UnixMilli(ms).UTC()
+		}
+	}
+	items, next := s.jobs.list(projectID, filters, start, size)
 
 	out := make([]map[string]any, 0, len(items))
 	for _, j := range items {
@@ -161,12 +177,98 @@ func (s *Server) listJobs(w http.ResponseWriter, r *http.Request, projectID stri
 
 func (s *Server) insertJob(w http.ResponseWriter, r *http.Request, projectID string) {
 	requestID := r.URL.Query().Get("requestId")
+	userEmail := r.URL.Query().Get("userEmail")
+	if userEmail == "" {
+		userEmail = r.Header.Get("X-User-Email")
+	}
+	queryText := ""
+	isScript := false
+	jobType := "query"
+	targetDataset := ""
+	targetTable := ""
 	if r.Body != nil {
-		_, _ = io.ReadAll(r.Body)
+		body, _ := io.ReadAll(r.Body)
+		if len(body) > 0 {
+			extractTableRef := func(v any) (string, string) {
+				m, ok := v.(map[string]any)
+				if !ok {
+					return "", ""
+				}
+				datasetID, _ := m["datasetId"].(string)
+				tableID, _ := m["tableId"].(string)
+				return strings.TrimSpace(datasetID), strings.TrimSpace(tableID)
+			}
+
+			var raw map[string]any
+			if err := json.Unmarshal(body, &raw); err == nil {
+				if conf, ok := raw["configuration"].(map[string]any); ok {
+					if loadRaw, ok := conf["load"]; ok {
+						jobType = "load"
+						if loadCfg, ok := loadRaw.(map[string]any); ok {
+							targetDataset, targetTable = extractTableRef(loadCfg["destinationTable"])
+						}
+					}
+					if _, ok := conf["extract"]; ok {
+						jobType = "extract"
+					}
+					if copyRaw, ok := conf["copy"]; ok {
+						jobType = "copy"
+						if copyCfg, ok := copyRaw.(map[string]any); ok {
+							targetDataset, targetTable = extractTableRef(copyCfg["destinationTable"])
+						}
+					}
+				}
+			}
+
+			var payload struct {
+				Configuration struct {
+					Query struct {
+						Query string `json:"query"`
+					} `json:"query"`
+				} `json:"configuration"`
+			}
+			if err := json.Unmarshal(body, &payload); err == nil {
+				queryText = payload.Configuration.Query.Query
+				if queryText != "" {
+					jobType = "query"
+				}
+			}
+		}
 		_ = r.Body.Close()
 	}
+	if strings.Count(queryText, ";") > 0 {
+		isScript = true
+	}
 
-	jr, created := s.jobs.insert(projectID, requestID)
+	insertOpts := jobInsertOptions{
+		ProjectID:     projectID,
+		RequestID:     requestID,
+		UserEmail:     userEmail,
+		QueryText:     queryText,
+		JobType:       jobType,
+		TargetDataset: targetDataset,
+		TargetTable:   targetTable,
+		IsScript:      isScript,
+	}
+
+	if isScript {
+		jr, childJobs, created := s.jobs.insertScriptWithChildren(insertOpts)
+		status := http.StatusOK
+		if created {
+			status = http.StatusCreated
+		}
+		children := make([]map[string]any, 0, len(childJobs))
+		for _, c := range childJobs {
+			children = append(children, renderJobResource(c))
+		}
+		writeJSON(w, status, map[string]any{
+			"job":      renderJobResource(jr),
+			"children": children,
+		})
+		return
+	}
+
+	jr, created := s.jobs.insert(insertOpts)
 	status := http.StatusOK
 	if created {
 		status = http.StatusCreated
