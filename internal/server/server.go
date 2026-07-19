@@ -11,12 +11,14 @@ import (
 type Server struct {
 	mux      *http.ServeMux
 	registry capabilities.Registry
+	jobs     *jobService
 }
 
 func New(reg capabilities.Registry) *Server {
 	s := &Server{
 		mux:      http.NewServeMux(),
 		registry: reg,
+		jobs:     newJobService(),
 	}
 	s.routes()
 	return s
