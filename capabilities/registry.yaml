@@ -63,6 +63,7 @@ capabilities:
     tests:
       - unit/server/jobs_worker_limit_backpressure
       - unit/server/jobs_concurrent_projects_clients
+      - unit/server/jobs_concurrent_reads_during_writes
     reason: configurable worker slots add local backpressure for async jobs
   rest.jobs.mutations.resource_serialization:
     status: partial
