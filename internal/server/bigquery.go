@@ -184,20 +184,38 @@ func (s *Server) insertJob(w http.ResponseWriter, r *http.Request, projectID str
 	queryText := ""
 	isScript := false
 	jobType := "query"
+	targetDataset := ""
+	targetTable := ""
 	if r.Body != nil {
 		body, _ := io.ReadAll(r.Body)
 		if len(body) > 0 {
+			extractTableRef := func(v any) (string, string) {
+				m, ok := v.(map[string]any)
+				if !ok {
+					return "", ""
+				}
+				datasetID, _ := m["datasetId"].(string)
+				tableID, _ := m["tableId"].(string)
+				return strings.TrimSpace(datasetID), strings.TrimSpace(tableID)
+			}
+
 			var raw map[string]any
 			if err := json.Unmarshal(body, &raw); err == nil {
 				if conf, ok := raw["configuration"].(map[string]any); ok {
-					if _, ok := conf["load"]; ok {
+					if loadRaw, ok := conf["load"]; ok {
 						jobType = "load"
+						if loadCfg, ok := loadRaw.(map[string]any); ok {
+							targetDataset, targetTable = extractTableRef(loadCfg["destinationTable"])
+						}
 					}
 					if _, ok := conf["extract"]; ok {
 						jobType = "extract"
 					}
-					if _, ok := conf["copy"]; ok {
+					if copyRaw, ok := conf["copy"]; ok {
 						jobType = "copy"
+						if copyCfg, ok := copyRaw.(map[string]any); ok {
+							targetDataset, targetTable = extractTableRef(copyCfg["destinationTable"])
+						}
 					}
 				}
 			}
@@ -223,12 +241,14 @@ func (s *Server) insertJob(w http.ResponseWriter, r *http.Request, projectID str
 	}
 
 	insertOpts := jobInsertOptions{
-		ProjectID: projectID,
-		RequestID: requestID,
-		UserEmail: userEmail,
-		QueryText: queryText,
-		JobType:   jobType,
-		IsScript:  isScript,
+		ProjectID:     projectID,
+		RequestID:     requestID,
+		UserEmail:     userEmail,
+		QueryText:     queryText,
+		JobType:       jobType,
+		TargetDataset: targetDataset,
+		TargetTable:   targetTable,
+		IsScript:      isScript,
 	}
 
 	if isScript {
