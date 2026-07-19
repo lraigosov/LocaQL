@@ -1,0 +1,33 @@
+{
+  "suite": "foundation",
+  "started_at": "2026-07-19T20:11:42Z",
+  "base_url": "http://localhost:9050",
+  "passed": 3,
+  "failed": 0,
+  "results": [
+    {
+      "id": "emulator_health",
+      "method": "GET",
+      "path": "/_emulator/health",
+      "expected_status": 200,
+      "actual_status": 200,
+      "passed": true
+    },
+    {
+      "id": "emulator_version",
+      "method": "GET",
+      "path": "/_emulator/version",
+      "expected_status": 200,
+      "actual_status": 200,
+      "passed": true
+    },
+    {
+      "id": "emulator_capabilities",
+      "method": "GET",
+      "path": "/_emulator/capabilities",
+      "expected_status": 200,
+      "actual_status": 200,
+      "passed": true
+    }
+  ]
+}
