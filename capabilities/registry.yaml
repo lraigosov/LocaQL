@@ -24,6 +24,27 @@ capabilities:
     fidelity: medium
     tests:
       - conformance/pagination/rest_jobs_list_pagination
+  rest.jobs.insert:
+    status: supported
+    fidelity: medium
+    tests:
+      - unit/server/jobs_insert
+  rest.jobs.get:
+    status: supported
+    fidelity: medium
+    tests:
+      - unit/server/jobs_get
+  rest.jobs.cancel:
+    status: supported
+    fidelity: medium
+    tests:
+      - unit/server/jobs_cancel
+  rest.jobs.idempotency.requestId:
+    status: partial
+    fidelity: medium
+    tests:
+      - unit/server/jobs_request_id_idempotency
+    reason: requestId behavior implemented for jobs insert subset
   rest.tabledata.list.pagination:
     status: supported
     fidelity: medium
