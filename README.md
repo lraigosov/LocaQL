@@ -50,6 +50,7 @@ Registry file:
 | Area | Status | Notes |
 | --- | --- | --- |
 | Emulator internal endpoints | Supported | `/_emulator/health`, `/_emulator/readiness`, `/_emulator/version`, `/_emulator/capabilities` |
+| Dataset management | Partial | `datasets.list`, `datasets.get`, `datasets.insert`, `datasets.delete` |
 | REST pagination baseline | Supported | `datasets.list`, `tables.list`, `jobs.list`, `tabledata.list` |
 | Opaque pagination tokens | Supported | `nextPageToken` is opaque; legacy numeric token input remains accepted |
 | Jobs lifecycle | Supported | `PENDING -> RUNNING -> DONE`, cancel before/during run |

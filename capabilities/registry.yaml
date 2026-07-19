@@ -4,6 +4,21 @@ capabilities:
     fidelity: high
     tests:
       - conformance/foundation/rest_datasets_list
+  rest.datasets.get:
+    status: supported
+    fidelity: medium
+    tests:
+      - unit/server/datasets_get
+  rest.datasets.insert:
+    status: supported
+    fidelity: medium
+    tests:
+      - unit/server/datasets_insert
+  rest.datasets.delete:
+    status: supported
+    fidelity: medium
+    tests:
+      - unit/server/datasets_delete
   rest.jobs.query:
     status: supported
     fidelity: high
