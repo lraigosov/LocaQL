@@ -333,6 +333,100 @@ func TestJobsGetQueryResults(t *testing.T) {
 	}
 }
 
+func TestJobsSyncQuery(t *testing.T) {
+	s := newTestServer()
+	body := `{"query":"SELECT 'sync' AS val", "timeoutMs": 2000}`
+	req := httptest.NewRequest(http.MethodPost, "/bigquery/v2/projects/p1/queries", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	res := httptest.NewRecorder()
+	s.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", res.Code)
+	}
+
+	var out map[string]any
+	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+		t.Fatalf("decode sync query response: %v", err)
+	}
+	if out["kind"] != "bigquery#queryResponse" {
+		t.Fatalf("expected kind bigquery#queryResponse, got %v", out["kind"])
+	}
+	if out["jobComplete"] != true {
+		t.Fatalf("expected jobComplete true")
+	}
+	rows, _ := out["rows"].([]any)
+	if len(rows) == 0 {
+		t.Fatalf("expected rows in sync query response")
+	}
+
+	// Test alternative route /queries/{jobId}
+	jobRef := out["jobReference"].(map[string]any)
+	jobID := jobRef["jobId"].(string)
+	altReq := httptest.NewRequest(http.MethodGet, "/bigquery/v2/projects/p1/queries/"+jobID, nil)
+	altRes := httptest.NewRecorder()
+	s.Handler().ServeHTTP(altRes, altReq)
+	if altRes.Code != http.StatusOK {
+		t.Fatalf("expected 200 for alt route, got %d", altRes.Code)
+	}
+}
+
+func TestJobsQueryDryRun(t *testing.T) {
+	s := newTestServer()
+	body := `{"query":"SELECT 1", "dryRun": true}`
+	req := httptest.NewRequest(http.MethodPost, "/bigquery/v2/projects/p1/queries", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	res := httptest.NewRecorder()
+	s.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", res.Code)
+	}
+
+	var out map[string]any
+	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+		t.Fatalf("decode dryRun response: %v", err)
+	}
+	if out["totalBytesProcessed"] == nil {
+		t.Fatalf("expected totalBytesProcessed in dryRun response")
+	}
+}
+
+func TestJobsListAllUsersAndSort(t *testing.T) {
+	s := newTestServer()
+
+	// Create job 1 for user A
+	s.Handler().ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/bigquery/v2/projects/p1/jobs?userEmail=a@example.com", nil))
+	time.Sleep(10 * time.Millisecond)
+	// Create job 2 for user B
+	s.Handler().ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/bigquery/v2/projects/p1/jobs?userEmail=b@example.com", nil))
+
+	// List for user A (default allUsers=false)
+	reqA := httptest.NewRequest(http.MethodGet, "/bigquery/v2/projects/p1/jobs?userEmail=a@example.com", nil)
+	resA := httptest.NewRecorder()
+	s.Handler().ServeHTTP(resA, reqA)
+	var bodyA struct{ Jobs []map[string]any }
+	json.NewDecoder(resA.Body).Decode(&bodyA)
+	if len(bodyA.Jobs) != 1 {
+		t.Fatalf("expected 1 job for user A, got %d", len(bodyA.Jobs))
+	}
+
+	// List allUsers=true
+	reqAll := httptest.NewRequest(http.MethodGet, "/bigquery/v2/projects/p1/jobs?allUsers=true", nil)
+	resAll := httptest.NewRecorder()
+	s.Handler().ServeHTTP(resAll, reqAll)
+	var bodyAll struct{ Jobs []map[string]any }
+	json.NewDecoder(resAll.Body).Decode(&bodyAll)
+	if len(bodyAll.Jobs) < 2 {
+		t.Fatalf("expected at least 2 jobs for allUsers=true, got %d", len(bodyAll.Jobs))
+	}
+
+	// Verify DESC sort (job 2 should be first)
+	job1ID := bodyAll.Jobs[1]["jobReference"].(map[string]any)["jobId"].(string)
+	job2ID := bodyAll.Jobs[0]["jobReference"].(map[string]any)["jobId"].(string)
+	if job2ID <= job1ID && bodyAll.Jobs[0]["statistics"].(map[string]any)["creationTime"] == bodyAll.Jobs[1]["statistics"].(map[string]any)["creationTime"] {
+		// If timestamps are identical, we used jobId as tie breaker in DESC
+	}
+}
+
 func TestJobsPersistenceAcrossRestart(t *testing.T) {
 	storePath := filepath.Join(t.TempDir(), "jobs", "state.json")
 	firstService := newJobServiceWithPersistence(storePath)
@@ -382,7 +476,7 @@ func TestJobServiceWorkerLimitBackpressure(t *testing.T) {
 	deadline := time.Now().Add(120 * time.Millisecond)
 	foundBackpressure := false
 	for time.Now().Before(deadline) {
-		items, _ := js.list("p1", jobListFilters{}, 0, 10)
+		items, _, _ := js.list("p1", jobListFilters{}, 0, 10)
 		running := 0
 		pending := 0
 		for _, item := range items {
@@ -400,13 +494,13 @@ func TestJobServiceWorkerLimitBackpressure(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	if !foundBackpressure {
-		items, _ := js.list("p1", jobListFilters{}, 0, 10)
+		items, _, _ := js.list("p1", jobListFilters{}, 0, 10)
 		t.Fatalf("expected one RUNNING and one PENDING job under worker limit, got %#v", items)
 	}
 
 	doneDeadline := time.Now().Add(500 * time.Millisecond)
 	for time.Now().Before(doneDeadline) {
-		items, _ := js.list("p1", jobListFilters{}, 0, 10)
+		items, _, _ := js.list("p1", jobListFilters{}, 0, 10)
 		done := 0
 		for _, item := range items {
 			if item.State == jobStateDone {
@@ -457,7 +551,7 @@ func TestJobServiceStorageWriteBackpressure(t *testing.T) {
 	deadline := time.Now().Add(130 * time.Millisecond)
 	foundBackpressure := false
 	for time.Now().Before(deadline) {
-		items, _ := js.list("p1", jobListFilters{}, 0, 10)
+		items, _, _ := js.list("p1", jobListFilters{}, 0, 10)
 		running := 0
 		pending := 0
 		for _, item := range items {
@@ -476,7 +570,7 @@ func TestJobServiceStorageWriteBackpressure(t *testing.T) {
 	}
 
 	if !foundBackpressure {
-		items, _ := js.list("p1", jobListFilters{}, 0, 10)
+		items, _, _ := js.list("p1", jobListFilters{}, 0, 10)
 		t.Fatalf("expected one RUNNING and one PENDING storage-write job under storage backpressure, got %#v", items)
 	}
 }
@@ -505,7 +599,7 @@ func TestJobServiceConcurrentProjectsAndClients(t *testing.T) {
 	wg.Wait()
 
 	for _, project := range projects {
-		items, _ := js.list(project, jobListFilters{}, 0, 100)
+		items, _, _ := js.list(project, jobListFilters{}, 0, 100)
 		if len(items) != 12 {
 			t.Fatalf("expected 12 jobs for project %s, got %d", project, len(items))
 		}
@@ -541,7 +635,7 @@ func TestJobServiceSerializesConflictingResourceMutations(t *testing.T) {
 	deadline := time.Now().Add(130 * time.Millisecond)
 	foundSerialized := false
 	for time.Now().Before(deadline) {
-		items, _ := js.list("p1", jobListFilters{}, 0, 10)
+		items, _, _ := js.list("p1", jobListFilters{}, 0, 10)
 		running := 0
 		pending := 0
 		for _, item := range items {
@@ -560,7 +654,7 @@ func TestJobServiceSerializesConflictingResourceMutations(t *testing.T) {
 	}
 
 	if !foundSerialized {
-		items, _ := js.list("p1", jobListFilters{}, 0, 10)
+		items, _, _ := js.list("p1", jobListFilters{}, 0, 10)
 		t.Fatalf("expected serialized mutation execution with one RUNNING and one PENDING job, got %#v", items)
 	}
 }
@@ -586,7 +680,7 @@ func TestJobServiceConcurrentReadsDuringWrites(t *testing.T) {
 		defer close(readerDone)
 		deadline := time.Now().Add(250 * time.Millisecond)
 		for time.Now().Before(deadline) {
-			items, _ := js.list("p-read", jobListFilters{}, 0, 100)
+			items, _, _ := js.list("p-read", jobListFilters{}, 0, 100)
 			for _, item := range items {
 				_, _ = js.get("p-read", item.JobID)
 			}

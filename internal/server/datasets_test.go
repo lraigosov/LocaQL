@@ -73,3 +73,40 @@ func TestTablesListReturnsNotFoundForMissingDataset(t *testing.T) {
 		t.Fatalf("expected 404, got %d", res.Code)
 	}
 }
+
+func TestDatasetsListETag(t *testing.T) {
+	s := newTestServer()
+
+	// Initial list to get ETag
+	req1 := httptest.NewRequest(http.MethodGet, "/bigquery/v2/projects/p1/datasets", nil)
+	res1 := httptest.NewRecorder()
+	s.Handler().ServeHTTP(res1, req1)
+	etag := res1.Header().Get("ETag")
+	if etag == "" {
+		t.Fatalf("expected ETag header")
+	}
+
+	// Request with If-None-Match
+	req2 := httptest.NewRequest(http.MethodGet, "/bigquery/v2/projects/p1/datasets", nil)
+	req2.Header.Set("If-None-Match", etag)
+	res2 := httptest.NewRecorder()
+	s.Handler().ServeHTTP(res2, req2)
+	if res2.Code != http.StatusNotModified {
+		t.Fatalf("expected 304, got %d", res2.Code)
+	}
+
+	// Modify datasets
+	body := `{"datasetReference":{"datasetId":"new_ds"}}`
+	req3 := httptest.NewRequest(http.MethodPost, "/bigquery/v2/projects/p1/datasets", strings.NewReader(body))
+	req3.Header.Set("Content-Type", "application/json")
+	s.Handler().ServeHTTP(httptest.NewRecorder(), req3)
+
+	// Request again with old ETag
+	req4 := httptest.NewRequest(http.MethodGet, "/bigquery/v2/projects/p1/datasets", nil)
+	req4.Header.Set("If-None-Match", etag)
+	res4 := httptest.NewRecorder()
+	s.Handler().ServeHTTP(res4, req4)
+	if res4.Code != http.StatusOK {
+		t.Fatalf("expected 200 after modification, got %d", res4.Code)
+	}
+}
