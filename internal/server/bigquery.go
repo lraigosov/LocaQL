@@ -31,7 +31,7 @@ func (s *Server) bigQueryV2(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/bigquery/v2/projects/")
 	parts := strings.Split(strings.Trim(path, "/"), "/")
 	if len(parts) < 2 {
-		writeJSON(w, http.StatusNotFound, map[string]any{"error": "not found"})
+		writeError(w, http.StatusNotFound, "Not found: Project identifier missing", "notFound")
 		return
 	}
 
@@ -50,7 +50,7 @@ func (s *Server) bigQueryV2(w http.ResponseWriter, r *http.Request) {
 		}
 		if len(parts) == 4 && parts[3] == "tables" {
 			if !s.datasets.exists(projectID, parts[2]) {
-				writeJSON(w, http.StatusNotFound, map[string]any{"error": "dataset not found"})
+				writeError(w, http.StatusNotFound, fmt.Sprintf("Not found: Dataset %s:%s", projectID, parts[2]), "notFound")
 				return
 			}
 			s.listTables(w, r, projectID, parts[2])
@@ -66,7 +66,7 @@ func (s *Server) bigQueryV2(w http.ResponseWriter, r *http.Request) {
 				s.insertJob(w, r, projectID)
 				return
 			}
-			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+			writeError(w, http.StatusMethodNotAllowed, "Method not allowed", "methodNotAllowed")
 			return
 		}
 		if len(parts) == 3 && r.Method == http.MethodGet {
@@ -81,9 +81,19 @@ func (s *Server) bigQueryV2(w http.ResponseWriter, r *http.Request) {
 			s.cancelJob(w, r, projectID, parts[2])
 			return
 		}
+	case "queries":
+		if len(parts) == 2 && r.Method == http.MethodPost {
+			s.handleJobsQuery(w, r, projectID)
+			return
+		}
+		if len(parts) == 3 && r.Method == http.MethodGet {
+			// GET /queries/{jobId} is an alias for jobs.getQueryResults
+			s.getQueryResults(w, r, projectID, parts[2])
+			return
+		}
 	case "tabledata":
 		if r.Method != http.MethodGet {
-			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+			writeError(w, http.StatusMethodNotAllowed, "Method not allowed", "methodNotAllowed")
 			return
 		}
 		if len(parts) == 5 && parts[4] == "data" {
@@ -92,7 +102,7 @@ func (s *Server) bigQueryV2(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	writeJSON(w, http.StatusNotFound, map[string]any{"error": "not found"})
+	writeError(w, http.StatusNotFound, "Not found", "notFound")
 }
 
 func (s *Server) handleDatasetsCollection(w http.ResponseWriter, r *http.Request, projectID string) {
@@ -102,7 +112,7 @@ func (s *Server) handleDatasetsCollection(w http.ResponseWriter, r *http.Request
 	case http.MethodPost:
 		s.insertDataset(w, r, projectID)
 	default:
-		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+		writeError(w, http.StatusMethodNotAllowed, "Method not allowed", "methodNotAllowed")
 	}
 }
 
@@ -113,13 +123,17 @@ func (s *Server) handleDatasetByID(w http.ResponseWriter, r *http.Request, proje
 	case http.MethodDelete:
 		s.deleteDataset(w, projectID, datasetID)
 	default:
-		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+		writeError(w, http.StatusMethodNotAllowed, "Method not allowed", "methodNotAllowed")
 	}
 }
 
 func (s *Server) listDatasets(w http.ResponseWriter, r *http.Request, projectID string) {
 	start, size := parsePagination(r, 2, 1000)
-	items, next := s.datasets.list(projectID, start, size)
+	items, next, version := s.datasets.list(projectID, start, size)
+
+	if s.checkETag(w, r, version) {
+		return
+	}
 
 	out := make([]map[string]any, 0, len(items))
 	for _, ds := range items {
@@ -129,6 +143,7 @@ func (s *Server) listDatasets(w http.ResponseWriter, r *http.Request, projectID 
 	resp := map[string]any{
 		"kind":     "bigquery#datasetList",
 		"datasets": out,
+		"etag":     fmt.Sprintf("\"v%d\"", version),
 	}
 	if next >= 0 {
 		resp["nextPageToken"] = encodePageToken(next)
@@ -152,12 +167,12 @@ func (s *Server) insertDataset(w http.ResponseWriter, r *http.Request, projectID
 		} `json:"datasetReference"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid request body"})
+		writeError(w, http.StatusBadRequest, "Invalid request body", "invalid")
 		return
 	}
 	datasetID := strings.TrimSpace(payload.DatasetReference.DatasetID)
 	if datasetID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "datasetReference.datasetId is required"})
+		writeError(w, http.StatusBadRequest, "datasetReference.datasetId is required", "required")
 		return
 	}
 
@@ -169,7 +184,7 @@ func (s *Server) insertDataset(w http.ResponseWriter, r *http.Request, projectID
 		Labels:       payload.Labels,
 	})
 	if !created {
-		writeJSON(w, http.StatusConflict, map[string]any{"error": "dataset already exists"})
+		writeError(w, http.StatusConflict, fmt.Sprintf("Already Exists: Dataset %s:%s", projectID, datasetID), "duplicate")
 		return
 	}
 	writeJSON(w, http.StatusOK, renderDatasetResource(rec))
@@ -178,7 +193,7 @@ func (s *Server) insertDataset(w http.ResponseWriter, r *http.Request, projectID
 func (s *Server) getDataset(w http.ResponseWriter, projectID, datasetID string) {
 	rec, ok := s.datasets.get(projectID, datasetID)
 	if !ok {
-		writeJSON(w, http.StatusNotFound, map[string]any{"error": "dataset not found"})
+		writeError(w, http.StatusNotFound, fmt.Sprintf("Not found: Dataset %s:%s", projectID, datasetID), "notFound")
 		return
 	}
 	writeJSON(w, http.StatusOK, renderDatasetResource(rec))
@@ -186,7 +201,7 @@ func (s *Server) getDataset(w http.ResponseWriter, projectID, datasetID string) 
 
 func (s *Server) deleteDataset(w http.ResponseWriter, projectID, datasetID string) {
 	if !s.datasets.delete(projectID, datasetID) {
-		writeJSON(w, http.StatusNotFound, map[string]any{"error": "dataset not found"})
+		writeError(w, http.StatusNotFound, fmt.Sprintf("Not found: Dataset %s:%s", projectID, datasetID), "notFound")
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -246,7 +261,11 @@ func (s *Server) listJobs(w http.ResponseWriter, r *http.Request, projectID stri
 	filters := jobListFilters{
 		StateFilter: r.URL.Query().Get("stateFilter"),
 		UserEmail:   r.URL.Query().Get("userEmail"),
+		AllUsers:    r.URL.Query().Get("allUsers") == "true",
 		ParentJobID: r.URL.Query().Get("parentJobId"),
+	}
+	if filters.UserEmail == "" {
+		filters.UserEmail = r.Header.Get("X-User-Email")
 	}
 	if raw := r.URL.Query().Get("minCreationTime"); raw != "" {
 		if ms, err := strconv.ParseInt(raw, 10, 64); err == nil {
@@ -258,7 +277,11 @@ func (s *Server) listJobs(w http.ResponseWriter, r *http.Request, projectID stri
 			filters.MaxCreated = time.UnixMilli(ms).UTC()
 		}
 	}
-	items, next := s.jobs.list(projectID, filters, start, size)
+	items, next, version := s.jobs.list(projectID, filters, start, size)
+
+	if s.checkETag(w, r, version) {
+		return
+	}
 
 	out := make([]map[string]any, 0, len(items))
 	for _, j := range items {
@@ -268,6 +291,7 @@ func (s *Server) listJobs(w http.ResponseWriter, r *http.Request, projectID stri
 	resp := map[string]any{
 		"kind": "bigquery#jobList",
 		"jobs": out,
+		"etag": fmt.Sprintf("\"v%d\"", version),
 	}
 	if next != "" {
 		if n, err := strconv.Atoi(next); err == nil {
@@ -383,7 +407,7 @@ func (s *Server) insertJob(w http.ResponseWriter, r *http.Request, projectID str
 func (s *Server) getJob(w http.ResponseWriter, _ *http.Request, projectID, jobID string) {
 	jr, ok := s.jobs.get(projectID, jobID)
 	if !ok {
-		writeJSON(w, http.StatusNotFound, map[string]any{"error": "job not found"})
+		writeError(w, http.StatusNotFound, fmt.Sprintf("Not found: Job %s:%s", projectID, jobID), "notFound")
 		return
 	}
 	writeJSON(w, http.StatusOK, renderJobResource(jr))
@@ -392,7 +416,7 @@ func (s *Server) getJob(w http.ResponseWriter, _ *http.Request, projectID, jobID
 func (s *Server) cancelJob(w http.ResponseWriter, _ *http.Request, projectID, jobID string) {
 	jr, ok := s.jobs.cancel(projectID, jobID)
 	if !ok {
-		writeJSON(w, http.StatusNotFound, map[string]any{"error": "job not found"})
+		writeError(w, http.StatusNotFound, fmt.Sprintf("Not found: Job %s:%s", projectID, jobID), "notFound")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -401,14 +425,101 @@ func (s *Server) cancelJob(w http.ResponseWriter, _ *http.Request, projectID, jo
 	})
 }
 
+func (s *Server) handleJobsQuery(w http.ResponseWriter, r *http.Request, projectID string) {
+	defer func() {
+		if r.Body != nil {
+			_ = r.Body.Close()
+		}
+	}()
+
+	var payload struct {
+		Query      string `json:"query"`
+		MaxResults int    `json:"maxResults"`
+		TimeoutMs  int    `json:"timeoutMs"`
+		DryRun     bool   `json:"dryRun"`
+		RequestId  string `json:"requestId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid request body", "invalid")
+		return
+	}
+
+	if payload.DryRun {
+		// Basic dry run simulation
+		writeJSON(w, http.StatusOK, map[string]any{
+			"kind":                "bigquery#queryResponse",
+			"jobComplete":         true,
+			"totalBytesProcessed": "1024", // simulated
+			"schema": map[string]any{
+				"fields": []map[string]string{
+					{"name": "dry_run", "type": "BOOLEAN"},
+				},
+			},
+		})
+		return
+	}
+
+	// For now, we reuse jobs.insert logic by creating a job and immediately waiting/polling for results
+	// In a real implementation, we would wait up to TimeoutMs
+	insertOpts := jobInsertOptions{
+		ProjectID: projectID,
+		RequestID: payload.RequestId,
+		QueryText: payload.Query,
+		JobType:   "query",
+	}
+
+	jr, created := s.jobs.insert(insertOpts)
+	_ = created // jobId is what matters
+
+	// Wait loop (simulated)
+	start := time.Now()
+	timeout := 10 * time.Second
+	if payload.TimeoutMs > 0 {
+		timeout = time.Duration(payload.TimeoutMs) * time.Millisecond
+	}
+
+	for {
+		job, ok := s.jobs.get(projectID, jr.JobID)
+		if !ok {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "job lost after creation"})
+			return
+		}
+
+		if job.State == jobStateDone {
+			// Job finished, fetch results
+			s.writeQueryResults(w, r, projectID, jr.JobID, "bigquery#queryResponse")
+			return
+		}
+
+		if time.Since(start) > timeout {
+			// Timeout reached, return jobReference with jobComplete=false
+			writeJSON(w, http.StatusOK, map[string]any{
+				"kind": "bigquery#queryResponse",
+				"jobReference": map[string]string{
+					"projectId": projectID,
+					"jobId":     jr.JobID,
+				},
+				"jobComplete": false,
+			})
+			return
+		}
+
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
 func (s *Server) getQueryResults(w http.ResponseWriter, r *http.Request, projectID, jobID string) {
+	s.writeQueryResults(w, r, projectID, jobID, "bigquery#getQueryResultsResponse")
+}
+
+func (s *Server) writeQueryResults(w http.ResponseWriter, r *http.Request, projectID, jobID, kind string) {
 	j, ok := s.jobs.get(projectID, jobID)
 	if !ok {
-		writeJSON(w, http.StatusNotFound, map[string]any{"error": "job not found"})
+		writeError(w, http.StatusNotFound, fmt.Sprintf("Not found: Job %s:%s", projectID, jobID), "notFound")
 		return
 	}
 	if j.JobType != "query" && j.JobType != "script" {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "query results only available for query jobs"})
+		writeError(w, http.StatusBadRequest, "Query results only available for query jobs", "invalid")
 		return
 	}
 
@@ -426,7 +537,7 @@ func (s *Server) getQueryResults(w http.ResponseWriter, r *http.Request, project
 	}
 
 	resp := map[string]any{
-		"kind": "bigquery#getQueryResultsResponse",
+		"kind": kind,
 		"jobReference": map[string]string{
 			"projectId": projectID,
 			"jobId":     jobID,

@@ -26,19 +26,22 @@ type datasetService struct {
 	mu       sync.RWMutex
 	defaults []string
 	projects map[string]map[string]*datasetRecord
+	versions map[string]int
 }
 
 func newDatasetService() *datasetService {
 	return &datasetService{
 		defaults: []string{"analytics", "finance", "ops", "sandbox"},
 		projects: make(map[string]map[string]*datasetRecord),
+		versions: make(map[string]int),
 	}
 }
 
-func (s *datasetService) list(projectID string, start, size int) ([]*datasetRecord, int) {
+func (s *datasetService) list(projectID string, start, size int) ([]*datasetRecord, int, int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	version := s.versions[projectID]
 	proj := s.ensureProjectLocked(projectID)
 	ids := make([]string, 0, len(proj))
 	for id := range proj {
@@ -66,7 +69,7 @@ func (s *datasetService) list(projectID string, start, size int) ([]*datasetReco
 		next = end
 	}
 
-	return out, next
+	return out, next, version
 }
 
 func (s *datasetService) get(projectID, datasetID string) (*datasetRecord, bool) {
@@ -106,6 +109,7 @@ func (s *datasetService) insert(input datasetInsert) (*datasetRecord, bool) {
 		Labels:       cloneLabels(input.Labels),
 	}
 	proj[datasetID] = rec
+	s.versions[projectID]++
 
 	cp := *rec
 	cp.Labels = cloneLabels(cp.Labels)
@@ -121,6 +125,7 @@ func (s *datasetService) delete(projectID, datasetID string) bool {
 		return false
 	}
 	delete(proj, datasetID)
+	s.versions[projectID]++
 	return true
 }
 
