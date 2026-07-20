@@ -68,6 +68,7 @@ type jobInsertOptions struct {
 type jobListFilters struct {
 	StateFilter string
 	UserEmail   string
+	AllUsers    bool
 	ParentJobID string
 	MinCreated  time.Time
 	MaxCreated  time.Time
@@ -77,6 +78,7 @@ type jobService struct {
 	mu              sync.RWMutex
 	jobsByProject   map[string]map[string]*jobRecord
 	requestIDIndex  map[string]map[string]requestIDRecord
+	projectVersions map[string]int
 	requestIDTTL    time.Duration
 	maxConcurrent   int
 	runSlots        chan struct{}
@@ -88,9 +90,10 @@ type jobService struct {
 }
 
 type jobServiceSnapshot struct {
-	Counter        int64                                 `json:"counter"`
-	JobsByProject  map[string]map[string]*jobRecord      `json:"jobs_by_project"`
-	RequestIDIndex map[string]map[string]requestIDRecord `json:"request_id_index"`
+	Counter         int64                                 `json:"counter"`
+	JobsByProject   map[string]map[string]*jobRecord      `json:"jobs_by_project"`
+	RequestIDIndex  map[string]map[string]requestIDRecord `json:"request_id_index"`
+	ProjectVersions map[string]int                         `json:"project_versions"`
 }
 
 func newJobService() *jobService {
@@ -99,10 +102,11 @@ func newJobService() *jobService {
 
 func newJobServiceWithWorkerLimit(limit int) *jobService {
 	s := &jobService{
-		jobsByProject:  make(map[string]map[string]*jobRecord),
-		requestIDIndex: make(map[string]map[string]requestIDRecord),
-		resourceSlots:  make(map[string]chan struct{}),
-		requestIDTTL:   15 * time.Minute,
+		jobsByProject:   make(map[string]map[string]*jobRecord),
+		requestIDIndex:  make(map[string]map[string]requestIDRecord),
+		projectVersions: make(map[string]int),
+		resourceSlots:   make(map[string]chan struct{}),
+		requestIDTTL:    15 * time.Minute,
 	}
 	storageLimit := readDefaultStorageWriteWorkerLimit()
 	if storageLimit > 0 {
@@ -284,6 +288,7 @@ func (s *jobService) run(jobID, projectID string) {
 	}
 	jr.State = jobStateRunning
 	jr.StartedAt = time.Now().UTC()
+	s.projectVersions[projectID]++
 	_ = s.persistLocked()
 	s.mu.Unlock()
 
@@ -301,12 +306,14 @@ func (s *jobService) run(jobID, projectID string) {
 		jr.ErrorReason = "stopped"
 		jr.ErrorMessage = "job cancelled"
 		jr.EndedAt = time.Now().UTC()
+		s.projectVersions[projectID]++
 		_ = s.persistLocked()
 		return
 	}
 	applyExecutorResult(jr)
 	jr.State = jobStateDone
 	jr.EndedAt = time.Now().UTC()
+	s.projectVersions[projectID]++
 	_ = s.persistLocked()
 }
 
@@ -343,33 +350,41 @@ func (s *jobService) cancel(projectID, jobID string) (*jobRecord, bool) {
 		jr.ErrorMessage = "job cancelled before execution"
 		jr.EndedAt = time.Now().UTC()
 	}
+	s.projectVersions[projectID]++
 	_ = s.persistLocked()
 	cp := *jr
 	return &cp, true
 }
 
-func (s *jobService) list(projectID string, filters jobListFilters, start, size int) ([]*jobRecord, string) {
+func (s *jobService) list(projectID string, filters jobListFilters, start, size int) ([]*jobRecord, string, int) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
+	version := s.projectVersions[projectID]
 	proj := s.jobsByProject[projectID]
 	if proj == nil {
-		return []*jobRecord{}, ""
+		return []*jobRecord{}, "", version
 	}
 
-	ids := make([]string, 0, len(proj))
-	for id := range proj {
-		ids = append(ids, id)
+	all := make([]*jobRecord, 0, len(proj))
+	for _, jr := range proj {
+		all = append(all, jr)
 	}
-	sort.Strings(ids)
 
-	filtered := make([]*jobRecord, 0, len(ids))
-	for _, id := range ids {
-		jr := proj[id]
+	// Sort by CreatedAt DESC (newest first)
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].CreatedAt.Equal(all[j].CreatedAt) {
+			return all[i].JobID > all[j].JobID
+		}
+		return all[i].CreatedAt.After(all[j].CreatedAt)
+	})
+
+	filtered := make([]*jobRecord, 0, len(all))
+	for _, jr := range all {
 		if filters.StateFilter != "" && string(jr.State) != filters.StateFilter {
 			continue
 		}
-		if filters.UserEmail != "" && jr.UserEmail != filters.UserEmail {
+		if !filters.AllUsers && filters.UserEmail != "" && jr.UserEmail != filters.UserEmail {
 			continue
 		}
 		if filters.ParentJobID != "" && jr.ParentJobID != filters.ParentJobID {
@@ -398,7 +413,7 @@ func (s *jobService) list(projectID string, filters jobListFilters, start, size 
 		next = fmt.Sprintf("%d", end)
 	}
 
-	return filtered[start:end], next
+	return filtered[start:end], next, version
 }
 
 func (s *jobService) cleanupExpiredRequestIDsLocked(now time.Time) {

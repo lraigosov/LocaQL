@@ -10,6 +10,9 @@ const queryText = document.getElementById("queryText");
 const queryRunStatus = document.getElementById("queryRunStatus");
 const queryResultsMeta = document.getElementById("queryResultsMeta");
 const queryResultsTable = document.getElementById("queryResultsTable");
+const queryResultsJson = document.getElementById("queryResultsJson");
+const queryResultsStats = document.getElementById("queryResultsStats");
+const resultTabs = document.getElementById("resultTabs");
 const refreshJobBtn = document.getElementById("refreshJobBtn");
 const cancelJobBtn = document.getElementById("cancelJobBtn");
 const selectedJobHint = document.getElementById("selectedJobHint");
@@ -17,6 +20,7 @@ const jobDetailsJson = document.getElementById("jobDetailsJson");
 const jobsFilterForm = document.getElementById("jobsFilterForm");
 const jobsStateFilter = document.getElementById("jobsStateFilter");
 const jobsUserEmailFilter = document.getElementById("jobsUserEmailFilter");
+const allUsersToggle = document.getElementById("allUsersToggle");
 const clearJobsFiltersBtn = document.getElementById("clearJobsFiltersBtn");
 const jobsPrevBtn = document.getElementById("jobsPrevBtn");
 const jobsNextBtn = document.getElementById("jobsNextBtn");
@@ -197,6 +201,9 @@ async function loadJobs(projectId) {
   if (userEmail) {
     params.set("userEmail", userEmail);
   }
+  if (allUsersToggle.checked) {
+    params.set("allUsers", "true");
+  }
 
   const data = await fetchJson(`/api/bigquery/v2/projects/${encodeURIComponent(projectId)}/jobs?${params.toString()}`);
   const rows = data.jobs || [];
@@ -299,6 +306,8 @@ async function loadQueryResults(projectId, jobId) {
   if (!jobId) {
     renderResultsGrid(["result"], [["No query selected"]]);
     queryResultsMeta.textContent = "no results yet";
+    queryResultsJson.textContent = "{}";
+    queryResultsStats.textContent = "{}";
     return;
   }
   try {
@@ -307,9 +316,19 @@ async function loadQueryResults(projectId, jobId) {
     const rows = (res.rows || []).map((r) => (r.f || []).map((cell) => String(cell.v ?? "")));
     renderResultsGrid(fields, rows);
     queryResultsMeta.textContent = `rows: ${rows.length} / total: ${res.totalRows || rows.length}`;
+    
+    // Detailed views
+    queryResultsJson.textContent = JSON.stringify(res, null, 2);
+    
+    // Fetch full job for stats
+    const details = await fetchJson(`/api/bigquery/v2/projects/${encodeURIComponent(projectId)}/jobs/${encodeURIComponent(jobId)}`);
+    queryResultsStats.textContent = JSON.stringify(details.statistics || {}, null, 2);
+
   } catch (err) {
     renderResultsGrid(["error"], [[err.message]]);
     queryResultsMeta.textContent = "query results unavailable";
+    queryResultsJson.textContent = JSON.stringify({ error: err.message }, null, 2);
+    queryResultsStats.textContent = "{}";
   }
 }
 
@@ -483,6 +502,7 @@ saveQueryForm.addEventListener("submit", (event) => {
 clearJobsFiltersBtn.addEventListener("click", async () => {
   jobsStateFilter.value = "";
   jobsUserEmailFilter.value = "";
+  allUsersToggle.checked = false;
   resetJobsPaging();
   await loadJobs(getProjectId());
   await loadJobDetails(getProjectId(), selectedJobId);
@@ -535,6 +555,55 @@ createDatasetForm.addEventListener("submit", async (event) => {
     alert(`Create dataset failed: ${err.message}`);
   }
 });
+
+if (mainTabs) {
+  mainTabs.addEventListener("click", (e) => {
+    const tab = e.target.closest(".tab");
+    if (!tab) return;
+
+    // Update active tab UI
+    mainTabs.querySelectorAll(".tab").forEach((t) => t.classList.remove("active"));
+    tab.classList.add("active");
+
+    // Hide all sections and show targeted one
+    const targetId = tab.getAttribute("data-target");
+    ["query-workspace", "query-results-panel", "jobs-explorer", "details-section", "capabilities-view"].forEach((id) => {
+      const section = document.getElementById(id);
+      if (!section) return;
+      
+      let show = false;
+      if (id === targetId) show = true;
+      if (targetId === "query-workspace" && id === "query-results-panel") show = true;
+      if (targetId === "jobs-explorer" && id === "details-section") show = true;
+
+      section.style.display = show ? "block" : "none";
+    });
+  });
+
+  // Default view
+  ["jobs-explorer", "details-section", "capabilities-view"].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.style.display = "none";
+  });
+}
+
+if (resultTabs) {
+  resultTabs.addEventListener("click", (e) => {
+    const tab = e.target.closest(".tab");
+    if (!tab) return;
+
+    resultTabs.querySelectorAll(".tab").forEach((t) => t.classList.remove("active"));
+    tab.classList.add("active");
+
+    const targetId = tab.getAttribute("data-target");
+    ["result-table-view", "result-json-view", "result-stats-view"].forEach((id) => {
+      const el = document.getElementById(id);
+      if (el) {
+        el.style.display = id === targetId ? "block" : "none";
+      }
+    });
+  });
+}
 
 updateSelectedJobHint();
 jobDetailsJson.textContent = "{}";
