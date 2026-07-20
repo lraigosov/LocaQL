@@ -59,10 +59,10 @@
 
     <section class="studio-main">
       <header class="studio-header">
-        <div class="tabs">
-          <span class="tab active">Query</span>
-          <span class="tab">Jobs</span>
-          <span class="tab">Capabilities</span>
+        <div class="tabs" id="mainTabs">
+          <span class="tab active" data-target="query-workspace">Query</span>
+          <span class="tab" data-target="jobs-explorer">Jobs</span>
+          <span class="tab" data-target="capabilities-view">Capabilities</span>
         </div>
         <div class="status-strip">
           <article class="status-card">
@@ -81,7 +81,7 @@
       </header>
 
       <section class="workspace-grid">
-        <article class="panel query-panel">
+        <article class="panel query-panel" id="query-workspace">
           <div class="panel-head">
             <h3>SQL Workspace</h3>
             <span id="queryRunStatus" class="meta-text">ready</span>
@@ -94,25 +94,39 @@
           </form>
         </article>
 
-        <article class="panel panel-wide">
+        <article class="panel panel-wide" id="query-results-panel">
           <div class="panel-head">
             <h3>Query Results</h3>
+            <div class="tabs result-tabs" id="resultTabs">
+              <span class="tab active" data-target="result-table-view">Table</span>
+              <span class="tab" data-target="result-json-view">JSON</span>
+              <span class="tab" data-target="result-stats-view">Execution Details</span>
+            </div>
             <span id="queryResultsMeta" class="meta-text">no results yet</span>
           </div>
-          <div class="table-wrap">
+          <div class="table-wrap" id="result-table-view">
             <table id="queryResultsTable" class="result-table"></table>
+          </div>
+          <div id="result-json-view" style="display: none;">
+            <pre id="queryResultsJson" class="code-block"></pre>
+          </div>
+          <div id="result-stats-view" style="display: none;">
+            <pre id="queryResultsStats" class="code-block"></pre>
           </div>
         </article>
 
-        <article class="panel jobs-panel">
+        <article class="panel jobs-panel" id="jobs-explorer">
           <div class="panel-head">
             <h3>Jobs Explorer</h3>
           </div>
           <form id="jobsFilterForm" class="jobs-filter-form">
             <input id="jobsStateFilter" placeholder="state filter (e.g. DONE)" />
             <input id="jobsUserEmailFilter" placeholder="user email" />
-            <button type="submit">Apply</button>
-            <button id="clearJobsFiltersBtn" type="button">Clear</button>
+            <div class="row-actions">
+              <label class="meta-text"><input type="checkbox" id="allUsersToggle" /> Project History</label>
+              <button type="submit">Apply</button>
+              <button id="clearJobsFiltersBtn" type="button">Clear</button>
+            </div>
           </form>
           <div class="row-actions jobs-pagination">
             <button id="jobsPrevBtn" type="button">Previous</button>
@@ -122,7 +136,7 @@
           <ul id="jobsList" class="list"></ul>
         </article>
 
-        <article class="panel details-panel">
+        <article class="panel details-panel" id="details-section">
           <div class="panel-head">
             <h3>Job Details</h3>
           </div>
@@ -134,7 +148,7 @@
           <pre id="jobDetailsJson" class="code-block"></pre>
         </article>
 
-        <article class="panel panel-wide">
+        <article class="panel panel-wide" id="capabilities-view">
           <div class="panel-head">
             <h3>Capabilities JSON</h3>
           </div>
