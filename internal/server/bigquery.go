@@ -1095,7 +1095,7 @@ func extractTableRefs(v any, defaultProjectID string) []tableReference {
 }
 
 var fromTablePattern = regexp.MustCompile("(?is)\\bfrom\\s+`?([a-zA-Z0-9_\\-\\.]+)`?")
-var informationSchemaPattern = regexp.MustCompile("(?is)(?:`?([a-zA-Z0-9_\\-]+)`?\\.)?(?:`?([a-zA-Z0-9_\\-]+)`?\\.)?information_schema\\.(schemata|tables|columns|jobs|partitions)")
+var informationSchemaPattern = regexp.MustCompile("(?is)(?:`?([a-zA-Z0-9_\\-]+)`?\\.)?(?:`?([a-zA-Z0-9_\\-]+)`?\\.)?information_schema\\.(schemata_options|schemata|tables|columns|jobs|partitions)")
 
 func (s *Server) simulateTableSelectQuery(projectID, queryText string) ([]map[string]string, [][]string, bool) {
 	matches := fromTablePattern.FindStringSubmatch(queryText)
@@ -1135,7 +1135,12 @@ func (s *Server) simulateInformationSchemaQuery(projectID, queryText, lower stri
 		}
 		targetDatasetID = strings.TrimSpace(matches[2])
 	} else if strings.TrimSpace(matches[1]) != "" {
-		targetDatasetID = strings.TrimSpace(matches[1])
+		candidate := strings.TrimSpace(matches[1])
+		if candidate == projectID || !s.datasets.exists(projectID, candidate) {
+			targetProjectID = candidate
+		} else {
+			targetDatasetID = candidate
+		}
 	}
 
 	objectType := strings.ToLower(strings.TrimSpace(matches[3]))
@@ -1154,6 +1159,20 @@ func (s *Server) simulateInformationSchemaQuery(projectID, queryText, lower stri
 			rows = append(rows, []string{targetProjectID, ds.DatasetID})
 		}
 		return []map[string]string{{"name": "catalog_name", "type": "STRING"}, {"name": "schema_name", "type": "STRING"}}, rows, true
+	case "schemata_options":
+		rows := make([][]string, 0, len(datasets)*2)
+		for _, ds := range datasets {
+			if !filterDataset(ds.DatasetID) {
+				continue
+			}
+			if strings.TrimSpace(ds.Location) != "" {
+				rows = append(rows, []string{targetProjectID, ds.DatasetID, "location", "STRING", ds.Location})
+			}
+			if strings.TrimSpace(ds.FriendlyName) != "" {
+				rows = append(rows, []string{targetProjectID, ds.DatasetID, "friendly_name", "STRING", ds.FriendlyName})
+			}
+		}
+		return []map[string]string{{"name": "catalog_name", "type": "STRING"}, {"name": "schema_name", "type": "STRING"}, {"name": "option_name", "type": "STRING"}, {"name": "option_type", "type": "STRING"}, {"name": "option_value", "type": "STRING"}}, rows, true
 	case "tables":
 		rows := [][]string{}
 		for _, ds := range datasets {
