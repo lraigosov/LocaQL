@@ -53,6 +53,12 @@ const datasetMetaDatasetId = document.getElementById("datasetMetaDatasetId");
 const datasetFriendlyNameInput = document.getElementById("datasetFriendlyNameInput");
 const datasetLocationInput = document.getElementById("datasetLocationInput");
 const datasetLabelsInput = document.getElementById("datasetLabelsInput");
+const datasetSummaryStatus = document.getElementById("datasetSummaryStatus");
+const datasetSummaryId = document.getElementById("datasetSummaryId");
+const datasetSummaryFriendlyName = document.getElementById("datasetSummaryFriendlyName");
+const datasetSummaryLocation = document.getElementById("datasetSummaryLocation");
+const datasetSummaryTables = document.getElementById("datasetSummaryTables");
+const datasetSummaryLabels = document.getElementById("datasetSummaryLabels");
 const breadcrumbDatasetChip = document.getElementById("breadcrumbDatasetChip");
 const breadcrumbTableChip = document.getElementById("breadcrumbTableChip");
 const tableDetailsMeta = document.getElementById("tableDetailsMeta");
@@ -168,6 +174,30 @@ function syncDatasetMetaInputs() {
   }
   if (datasetLabelsInput) {
     datasetLabelsInput.value = match && match.labels ? JSON.stringify(match.labels) : "";
+  }
+  syncDatasetSummary(activeDatasetId, match);
+}
+
+function syncDatasetSummary(activeDatasetId, datasetMeta) {
+  const datasetId = activeDatasetId || "";
+  const tables = datasetId ? (explorerTablesCache.get(datasetId) || []) : [];
+  if (datasetSummaryStatus) {
+    datasetSummaryStatus.textContent = datasetId ? "selected" : "none";
+  }
+  if (datasetSummaryId) {
+    datasetSummaryId.textContent = datasetId || "-";
+  }
+  if (datasetSummaryFriendlyName) {
+    datasetSummaryFriendlyName.textContent = (datasetMeta && datasetMeta.friendlyName) || "-";
+  }
+  if (datasetSummaryLocation) {
+    datasetSummaryLocation.textContent = (datasetMeta && datasetMeta.location) || "-";
+  }
+  if (datasetSummaryTables) {
+    datasetSummaryTables.textContent = String(tables.length || 0);
+  }
+  if (datasetSummaryLabels) {
+    datasetSummaryLabels.textContent = JSON.stringify((datasetMeta && datasetMeta.labels) || {}, null, 2);
   }
 }
 

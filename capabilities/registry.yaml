@@ -159,7 +159,7 @@ capabilities:
   console.ui.resource_forms.basic:
     status: partial
     fidelity: medium
-    reason: explorer supports validated dataset create/update/delete with labels, basic table creation, table metadata editing and table labels editing against emulator REST endpoints
+    reason: explorer supports validated dataset create/update/delete with labels, basic table creation, table metadata editing, table labels editing and a selected-dataset summary panel against emulator REST endpoints
   emulator.health:
     status: supported
     fidelity: high

@@ -90,6 +90,31 @@
           <input id="newTableId" placeholder="new table id" required />
           <button type="submit">Add Table</button>
         </form>
+        <section id="datasetSummaryCard" class="dataset-summary-card" aria-label="selected dataset summary">
+          <div class="section-head dataset-summary-head">
+            <h2>Selected Dataset</h2>
+            <span id="datasetSummaryStatus" class="meta-text">none</span>
+          </div>
+          <div class="dataset-summary-grid">
+            <article class="dataset-summary-item">
+              <h3>ID</h3>
+              <p id="datasetSummaryId">-</p>
+            </article>
+            <article class="dataset-summary-item">
+              <h3>Friendly Name</h3>
+              <p id="datasetSummaryFriendlyName">-</p>
+            </article>
+            <article class="dataset-summary-item">
+              <h3>Location</h3>
+              <p id="datasetSummaryLocation">-</p>
+            </article>
+            <article class="dataset-summary-item">
+              <h3>Tables</h3>
+              <p id="datasetSummaryTables">0</p>
+            </article>
+          </div>
+          <pre id="datasetSummaryLabels" class="code-block small">{}</pre>
+        </section>
         <div id="explorerTree" class="tree"></div>
       </section>
 
