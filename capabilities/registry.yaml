@@ -19,6 +19,12 @@ capabilities:
     fidelity: medium
     tests:
       - unit/server/datasets_delete
+  rest.datasets.patch:
+    status: partial
+    fidelity: medium
+    tests:
+      - unit/server/datasets_patch
+    reason: partial update for friendlyName, location and labels is supported
   rest.jobs.query:
     status: supported
     fidelity: high
@@ -34,6 +40,21 @@ capabilities:
     fidelity: medium
     tests:
       - conformance/pagination/rest_tables_list_pagination
+  rest.tables.get:
+    status: supported
+    fidelity: medium
+    tests:
+      - unit/server/tables_get
+  rest.tables.insert:
+    status: supported
+    fidelity: medium
+    tests:
+      - unit/server/tables_insert
+  rest.tables.delete:
+    status: supported
+    fidelity: medium
+    tests:
+      - unit/server/tables_delete
   rest.jobs.list.pagination:
     status: supported
     fidelity: medium
@@ -146,3 +167,15 @@ capabilities:
     status: partial
     fidelity: medium
     reason: explorer supports local search by project, dataset and table names over cached resources
+  console.ui.saved_queries.versioning:
+    status: partial
+    fidelity: medium
+    reason: saved queries keep local version history per query name and allow navigating versions
+  console.ui.saved_queries.import_export:
+    status: partial
+    fidelity: medium
+    reason: saved queries can be exported and imported as JSON in local console
+  console.ui.saved_queries.share_link:
+    status: partial
+    fidelity: medium
+    reason: saved query text can be shared via local URL query parameter

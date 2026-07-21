@@ -726,7 +726,7 @@ func TestJobPriorityAndErrors(t *testing.T) {
 	reqE.Header.Set("Content-Type", "application/json")
 	resE := httptest.NewRecorder()
 	s.Handler().ServeHTTP(resE, reqE)
-	
+
 	var outE map[string]any
 	json.NewDecoder(resE.Body).Decode(&outE)
 	jobRef := outE["jobReference"].(map[string]any)

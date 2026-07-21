@@ -57,6 +57,11 @@
           <input id="savedQueryName" placeholder="query name" required />
           <button type="submit">Save</button>
         </form>
+        <div class="compact-form">
+          <button id="exportSavedQueriesBtn" type="button">Export</button>
+          <button id="importSavedQueriesBtn" type="button">Import</button>
+          <input id="savedQueriesImportInput" type="file" accept="application/json" hidden />
+        </div>
         <ul id="savedQueriesList" class="list sidebar-list"></ul>
       </section>
     </aside>

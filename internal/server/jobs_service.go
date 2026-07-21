@@ -84,25 +84,25 @@ type jobListFilters struct {
 }
 
 type jobService struct {
-	mu              sync.RWMutex
-	jobsByProject   map[string]map[string]*jobRecord
-	requestIDIndex  map[string]map[string]requestIDRecord
-	projectVersions map[string]int
-	requestIDTTL    time.Duration
-	maxConcurrent   int
-	runSlots        chan struct{}
-	maxStorageWrite int
+	mu                sync.RWMutex
+	jobsByProject     map[string]map[string]*jobRecord
+	requestIDIndex    map[string]map[string]requestIDRecord
+	projectVersions   map[string]int
+	requestIDTTL      time.Duration
+	maxConcurrent     int
+	runSlots          chan struct{}
+	maxStorageWrite   int
 	storageWriteSlots chan struct{}
-	resourceSlots   map[string]chan struct{}
-	persistencePath string
-	counter         int64
+	resourceSlots     map[string]chan struct{}
+	persistencePath   string
+	counter           int64
 }
 
 type jobServiceSnapshot struct {
 	Counter         int64                                 `json:"counter"`
 	JobsByProject   map[string]map[string]*jobRecord      `json:"jobs_by_project"`
 	RequestIDIndex  map[string]map[string]requestIDRecord `json:"request_id_index"`
-	ProjectVersions map[string]int                         `json:"project_versions"`
+	ProjectVersions map[string]int                        `json:"project_versions"`
 }
 
 func newJobService() *jobService {
