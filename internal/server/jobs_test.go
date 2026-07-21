@@ -357,6 +357,67 @@ func TestJobsSyncQuerySupportsInformationSchemaTables(t *testing.T) {
 	}
 }
 
+func TestJobsSyncQuerySupportsInformationSchemaJobs(t *testing.T) {
+	s := newTestServer()
+	createReq := httptest.NewRequest(http.MethodPost, "/bigquery/v2/projects/p1/jobs?userEmail=tester@example.com", strings.NewReader(`{"configuration":{"query":{"query":"SELECT 1 AS one"}}}`))
+	createReq.Header.Set("Content-Type", "application/json")
+	createRes := httptest.NewRecorder()
+	s.Handler().ServeHTTP(createRes, createReq)
+	if createRes.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d", createRes.Code)
+	}
+
+	time.Sleep(160 * time.Millisecond)
+
+	body := `{"query":"SELECT * FROM p1.INFORMATION_SCHEMA.JOBS"}`
+	req := httptest.NewRequest(http.MethodPost, "/bigquery/v2/projects/p1/queries", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	res := httptest.NewRecorder()
+	s.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", res.Code)
+	}
+
+	var out map[string]any
+	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+		t.Fatalf("decode information schema jobs response: %v", err)
+	}
+	rows, ok := out["rows"].([]any)
+	if !ok || len(rows) == 0 {
+		t.Fatalf("expected rows from INFORMATION_SCHEMA.JOBS")
+	}
+	firstRow := rows[0].(map[string]any)["f"].([]any)
+	if len(firstRow) < 5 {
+		t.Fatalf("expected job metadata columns, got %v", firstRow)
+	}
+}
+
+func TestJobsSyncQuerySupportsInformationSchemaPartitions(t *testing.T) {
+	s := newTestServer()
+	body := `{"query":"SELECT * FROM p1.analytics.INFORMATION_SCHEMA.PARTITIONS"}`
+	req := httptest.NewRequest(http.MethodPost, "/bigquery/v2/projects/p1/queries", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	res := httptest.NewRecorder()
+	s.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", res.Code)
+	}
+
+	var out map[string]any
+	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+		t.Fatalf("decode information schema partitions response: %v", err)
+	}
+	rows, ok := out["rows"].([]any)
+	if !ok || len(rows) == 0 {
+		t.Fatalf("expected rows from INFORMATION_SCHEMA.PARTITIONS")
+	}
+	firstRow := rows[0].(map[string]any)["f"].([]any)
+	partitionID := firstRow[3].(map[string]any)["v"]
+	if partitionID != "__UNPARTITIONED__" {
+		t.Fatalf("expected __UNPARTITIONED__ partition id, got %v", partitionID)
+	}
+}
+
 func TestJobsGetQueryResults(t *testing.T) {
 	s := newTestServer()
 	body := `{"configuration":{"query":{"query":"SELECT 1 AS one, 'two' AS two"}}}`

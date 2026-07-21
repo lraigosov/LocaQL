@@ -77,6 +77,11 @@
           <input id="newDatasetId" placeholder="new dataset id" required />
           <button type="submit">Create</button>
         </form>
+        <form id="createTableForm" class="compact-form">
+          <input id="newTableDatasetId" placeholder="dataset id" />
+          <input id="newTableId" placeholder="new table id" required />
+          <button type="submit">Add Table</button>
+        </form>
         <div id="explorerTree" class="tree"></div>
       </section>
 
@@ -220,6 +225,11 @@
                 <p id="tableInfoUpdated" class="detail-value">-</p>
               </article>
             </div>
+            <form id="updateTableMetaForm" class="compact-form table-meta-form">
+              <input id="tableFriendlyNameInput" placeholder="friendly name" />
+              <input id="tableDescriptionInput" placeholder="description" />
+              <button type="submit">Save Meta</button>
+            </form>
             <pre id="tableInfoLabels" class="code-block small">{}</pre>
           </div>
 
@@ -287,6 +297,6 @@
     </section>
   </main>
 
-  <script src="/web/app.js?v=9" type="module"></script>
+  <script src="/web/app.js?v=11" type="module"></script>
 </body>
 </html>
