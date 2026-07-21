@@ -218,3 +218,35 @@ capabilities:
     status: partial
     fidelity: medium
     reason: jobs explorer supports explicit personal and project history tabs mapped to allUsers behavior
+  workspace.validate.structure:
+    status: supported
+    fidelity: medium
+    tests:
+      - unit/workspace/validate_required_structure
+      - unit/cli/workspace_validate
+    reason: CLI command `locaql workspace validate` checks required and recommended portable workspace layout
+  workspace.plan:
+    status: supported
+    fidelity: medium
+    tests:
+      - unit/workspace/build_plan
+      - unit/cli/workspace_plan
+    reason: CLI command `locaql workspace plan` produces deterministic workspace inventory from portable artifact roots
+  workspace.diff:
+    status: supported
+    fidelity: medium
+    tests:
+      - unit/workspace/diff_source_target
+      - unit/cli/workspace_diff
+    reason: CLI command `locaql workspace diff` compares source and target workspaces using file path, size and content hash
+  workspace.apply.dry_run:
+    status: supported
+    fidelity: medium
+    tests:
+      - unit/workspace/apply_dry_run_actions
+      - unit/cli/workspace_apply_dry_run
+    reason: CLI command `locaql workspace apply --dry-run=true` returns planned mkdir, copy and update actions without mutating target
+  security.iam.policies:
+    status: unsupported
+    fidelity: none
+    reason: IAM and policy enforcement are cloud control-plane concerns and are intentionally out of emulator scope

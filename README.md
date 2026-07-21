@@ -63,6 +63,10 @@ Registry file:
 | Resource mutation serialization | Partial | Conflicting mutations serialized by `project:dataset.table` |
 | Catalog snapshot atomicity | Partial | Optional persisted state uses temp file replace to avoid partial commits |
 | INFORMATION_SCHEMA priority | Partial | Basic `SCHEMATA`, `SCHEMATA_OPTIONS`, `TABLES`, `COLUMNS`, `JOBS` and `PARTITIONS` queries are served from the in-memory catalog |
+| Workspace validation | Supported | `locaql workspace validate` checks required portable workspace structure before promotion |
+| Workspace planning and diff | Supported | `locaql workspace plan` and `locaql workspace diff` provide portable inventory and deterministic source-target delta |
+| Workspace apply dry-run | Supported | `locaql workspace apply --dry-run=true` returns planned actions without mutating target |
+| IAM and policies | Unsupported | Deliberately out of scope for local emulator parity; treated as cloud control-plane concerns |
 | Standalone UI service | Partial | `cmd/locaql-ui` with dynamic capability-driven console and API proxy |
 | UI resource forms | Partial | Explorer can create, update and delete datasets, create tables, and edit basic table metadata against emulator REST endpoints |
 
@@ -123,6 +127,25 @@ wsl -d Ubuntu-24.04 -- bash -lc 'cd /mnt/f/GitHub/LocaQL && go run ./cmd/locaql 
 
 ```bash
 wsl -d Ubuntu-24.04 -- bash -lc 'cd /mnt/f/GitHub/LocaQL && go test ./...'
+```
+
+Validate consumer workspace layout (Delivery E baseline):
+
+```bash
+wsl -d Ubuntu-24.04 -- bash -lc 'cd /mnt/f/GitHub/LocaQL && go run ./cmd/locaql workspace validate --path .'
+```
+
+Build workspace plan and diff:
+
+```bash
+wsl -d Ubuntu-24.04 -- bash -lc 'cd /mnt/f/GitHub/LocaQL && go run ./cmd/locaql workspace plan --path .'
+wsl -d Ubuntu-24.04 -- bash -lc 'cd /mnt/f/GitHub/LocaQL && go run ./cmd/locaql workspace diff --source . --target /tmp/target-workspace'
+```
+
+Preview apply actions only (no target mutations):
+
+```bash
+wsl -d Ubuntu-24.04 -- bash -lc 'cd /mnt/f/GitHub/LocaQL && go run ./cmd/locaql workspace apply --source . --target /tmp/target-workspace --dry-run=true'
 ```
 
 Race validation for server concurrency:
