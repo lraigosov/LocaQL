@@ -27,6 +27,7 @@ func New(reg capabilities.Registry) *Server {
 		tables:   newTableService(),
 	}
 	s.jobs.copyExecutor = s.executeCopyJob
+	s.jobs.loadExecutor = s.executeLoadJob
 	s.routes()
 	return s
 }

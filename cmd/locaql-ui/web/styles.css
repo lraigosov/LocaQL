@@ -373,6 +373,15 @@ body[data-theme="dark"] .section-head h2 {
   word-break: break-word;
 }
 
+.dataset-summary-actions {
+  margin-top: 10px;
+  gap: 8px;
+}
+
+.dataset-summary-actions button {
+  min-width: 0;
+}
+
 .sidebar-list {
   max-height: 36vh;
   overflow: auto;
@@ -714,6 +723,10 @@ body[data-theme="dark"] .list li {
   cursor: pointer;
   padding: 6px 10px;
   color: var(--muted);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
 }
 
 .tree .node.table:hover {
@@ -764,6 +777,66 @@ body[data-theme="dark"] .list li {
   display: inline-flex;
   align-items: center;
   gap: 8px;
+}
+
+.node-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cap-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  padding: 1px 8px;
+  font-size: 0.67rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  border: 1px solid transparent;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.cap-legend {
+  margin-top: 6px;
+  margin-bottom: 8px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.cap-supported {
+  background: rgba(19, 115, 51, 0.12);
+  border-color: rgba(19, 115, 51, 0.35);
+  color: var(--ok);
+}
+
+.cap-partial {
+  background: rgba(178, 106, 0, 0.14);
+  border-color: rgba(178, 106, 0, 0.35);
+  color: var(--warn);
+}
+
+.cap-unsupported {
+  background: rgba(173, 24, 37, 0.14);
+  border-color: rgba(173, 24, 37, 0.35);
+  color: #ad1825;
+}
+
+.cap-context {
+  background: rgba(95, 99, 104, 0.14);
+  border-color: rgba(95, 99, 104, 0.32);
+  color: var(--muted);
+}
+
+body[data-theme="dark"] .cap-unsupported {
+  background: rgba(255, 113, 113, 0.16);
+  border-color: rgba(255, 113, 113, 0.35);
+  color: #ff8f8f;
 }
 
 .dataset-meta {

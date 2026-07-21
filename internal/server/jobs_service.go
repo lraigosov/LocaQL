@@ -28,6 +28,7 @@ type jobRecord struct {
 	Priority        string // INTERACTIVE or BATCH
 	ResourceKey     string
 	SourceTables    []tableReference
+	LoadSchema      []tableField
 	TargetDataset   string
 	TargetTable     string
 	CreateDisposition string
@@ -75,6 +76,7 @@ type jobInsertOptions struct {
 	JobType       string
 	Priority      string
 	SourceTables   []tableReference
+	LoadSchema      []tableField
 	CreateDisposition string
 	WriteDisposition  string
 	TargetDataset string
@@ -104,6 +106,7 @@ type jobService struct {
 	resourceSlots     map[string]chan struct{}
 	persistencePath   string
 	copyExecutor      func(*jobRecord) (jobStatistics, error)
+	loadExecutor      func(*jobRecord) (jobStatistics, error)
 	counter           int64
 }
 
@@ -205,6 +208,7 @@ func (s *jobService) insert(opts jobInsertOptions) (*jobRecord, bool) {
 		Priority:    normalizePriority(opts.Priority),
 		ResourceKey: buildResourceKey(opts),
 		SourceTables: cloneTableReferences(opts.SourceTables),
+		LoadSchema:   cloneTableFields(opts.LoadSchema),
 		TargetDataset: strings.TrimSpace(opts.TargetDataset),
 		TargetTable: strings.TrimSpace(opts.TargetTable),
 		CreateDisposition: normalizeCreateDisposition(opts.CreateDisposition),
@@ -347,6 +351,21 @@ func (s *jobService) run(jobID, projectID string) {
 		copyStats, copyErr = s.copyExecutor(&jobSnapshot)
 	}
 
+	var loadStats jobStatistics
+	var loadErr error
+	if jobType == "load" && s.loadExecutor != nil {
+		s.mu.Lock()
+		jr = s.jobsByProject[projectID][jobID]
+		if jr == nil {
+			s.mu.Unlock()
+			return
+		}
+		jobSnapshot := *jr
+		jobSnapshot.LoadSchema = cloneTableFields(jr.LoadSchema)
+		s.mu.Unlock()
+		loadStats, loadErr = s.loadExecutor(&jobSnapshot)
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	jr = s.jobsByProject[projectID][jobID]
@@ -366,8 +385,14 @@ func (s *jobService) run(jobID, projectID string) {
 		jr.ErrorReason = "invalid"
 		jr.ErrorMessage = copyErr.Error()
 		jr.Errors = []jobError{{Reason: "invalid", Message: copyErr.Error(), Location: "configuration.copy"}}
+	} else if loadErr != nil {
+		jr.ErrorReason = "invalid"
+		jr.ErrorMessage = loadErr.Error()
+		jr.Errors = []jobError{{Reason: "invalid", Message: loadErr.Error(), Location: "configuration.load"}}
 	} else if jobType == "copy" && s.copyExecutor != nil {
 		jr.Statistics = copyStats
+	} else if jobType == "load" && s.loadExecutor != nil {
+		jr.Statistics = loadStats
 	} else {
 		applyExecutorResult(jr)
 	}

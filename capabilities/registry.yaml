@@ -96,14 +96,14 @@ capabilities:
     fidelity: medium
     tests:
       - unit/server/jobs_request_id_idempotency
-    reason: requestId behavior implemented for jobs insert subset
+    reason: requestId behavior implemented for jobs.insert and queries endpoint with TTL-based replay window
   rest.jobs.executors.query_load_extract_copy:
     status: partial
     fidelity: medium
     tests:
       - unit/server/jobs_executor_type_and_statistics
       - unit/server/jobs_copy_real_destination_data
-    reason: query, load and extract remain simulated; copy jobs now materialize real destination rows in the in-memory catalog and preserve basic table shape
+    reason: query and extract remain simulated; copy jobs materialize destination rows and load jobs now materialize destination table schema in the in-memory catalog
   rest.jobs.errors.detailed:
     status: supported
     fidelity: medium
@@ -155,7 +155,7 @@ capabilities:
       - unit/server/information_schema_priority_tables_columns
       - unit/server/information_schema_priority_jobs
       - unit/server/information_schema_priority_partitions
-    reason: basic SCHEMATA, SCHEMATA_OPTIONS, TABLES, COLUMNS, JOBS and PARTITIONS query emulation is backed by the live in-memory catalog; broader semantic parity is still pending
+    reason: basic SCHEMATA, SCHEMATA_OPTIONS, TABLES, COLUMNS, JOBS, PARTITIONS, ROUTINES and MODELS query emulation is backed by the live in-memory catalog; broader semantic parity is still pending
   console.ui.resource_forms.basic:
     status: partial
     fidelity: medium

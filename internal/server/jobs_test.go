@@ -332,6 +332,80 @@ func TestCopyJobCreatesReadableDestinationTable(t *testing.T) {
 	}
 }
 
+func TestLoadJobMaterializesDestinationTableSchema(t *testing.T) {
+	s := newTestServer()
+	body := `{"configuration":{"load":{"destinationTable":{"projectId":"p1","datasetId":"analytics","tableId":"events_loaded"},"schema":{"fields":[{"name":"event_id","type":"INT64"},{"name":"event_name","type":"STRING"}]},"writeDisposition":"WRITE_TRUNCATE"}}}`
+	req := httptest.NewRequest(http.MethodPost, "/bigquery/v2/projects/p1/jobs", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	res := httptest.NewRecorder()
+	s.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d", res.Code)
+	}
+
+	var created map[string]any
+	if err := json.NewDecoder(res.Body).Decode(&created); err != nil {
+		t.Fatalf("decode created load job: %v", err)
+	}
+	jobID := created["jobReference"].(map[string]any)["jobId"].(string)
+
+	time.Sleep(220 * time.Millisecond)
+
+	jobReq := httptest.NewRequest(http.MethodGet, "/bigquery/v2/projects/p1/jobs/"+jobID, nil)
+	jobRes := httptest.NewRecorder()
+	s.Handler().ServeHTTP(jobRes, jobReq)
+	if jobRes.Code != http.StatusOK {
+		t.Fatalf("expected 200 loading job, got %d", jobRes.Code)
+	}
+
+	var jobOut map[string]any
+	if err := json.NewDecoder(jobRes.Body).Decode(&jobOut); err != nil {
+		t.Fatalf("decode loaded job: %v", err)
+	}
+	stats := jobOut["statistics"].(map[string]any)
+	sim := stats["simulation"].(map[string]any)
+	if sim["enabled"] != false {
+		t.Fatalf("expected simulation disabled for load materialization")
+	}
+	if sim["executor"] != "load" {
+		t.Fatalf("expected load executor, got %v", sim["executor"])
+	}
+
+	tableReq := httptest.NewRequest(http.MethodGet, "/bigquery/v2/projects/p1/datasets/analytics/tables/events_loaded", nil)
+	tableRes := httptest.NewRecorder()
+	s.Handler().ServeHTTP(tableRes, tableReq)
+	if tableRes.Code != http.StatusOK {
+		t.Fatalf("expected 200 for loaded table, got %d", tableRes.Code)
+	}
+
+	var tableOut map[string]any
+	if err := json.NewDecoder(tableRes.Body).Decode(&tableOut); err != nil {
+		t.Fatalf("decode loaded table: %v", err)
+	}
+	fields := tableOut["schema"].(map[string]any)["fields"].([]any)
+	if len(fields) != 2 {
+		t.Fatalf("expected 2 schema fields, got %d", len(fields))
+	}
+	first := fields[0].(map[string]any)
+	if first["name"] != "event_id" || first["type"] != "INT64" {
+		t.Fatalf("unexpected first field: %v", first)
+	}
+
+	dataReq := httptest.NewRequest(http.MethodGet, "/bigquery/v2/projects/p1/tabledata/analytics/events_loaded/data", nil)
+	dataRes := httptest.NewRecorder()
+	s.Handler().ServeHTTP(dataRes, dataReq)
+	if dataRes.Code != http.StatusOK {
+		t.Fatalf("expected 200 for loaded table data, got %d", dataRes.Code)
+	}
+	var dataOut map[string]any
+	if err := json.NewDecoder(dataRes.Body).Decode(&dataOut); err != nil {
+		t.Fatalf("decode loaded table data: %v", err)
+	}
+	if dataOut["totalRows"] != "0" {
+		t.Fatalf("expected totalRows 0 for schema-only load, got %v", dataOut["totalRows"])
+	}
+}
+
 func TestJobsSyncQuerySupportsInformationSchemaTables(t *testing.T) {
 	s := newTestServer()
 	body := `{"query":"SELECT * FROM p1.analytics.INFORMATION_SCHEMA.TABLES"}`
@@ -415,6 +489,44 @@ func TestJobsSyncQuerySupportsInformationSchemaPartitions(t *testing.T) {
 	partitionID := firstRow[3].(map[string]any)["v"]
 	if partitionID != "__UNPARTITIONED__" {
 		t.Fatalf("expected __UNPARTITIONED__ partition id, got %v", partitionID)
+	}
+}
+
+func TestJobsSyncQuerySupportsInformationSchemaRoutinesAndModels(t *testing.T) {
+	s := newTestServer()
+
+	routinesReq := httptest.NewRequest(http.MethodPost, "/bigquery/v2/projects/p1/queries", strings.NewReader(`{"query":"SELECT * FROM p1.analytics.INFORMATION_SCHEMA.ROUTINES"}`))
+	routinesReq.Header.Set("Content-Type", "application/json")
+	routinesRes := httptest.NewRecorder()
+	s.Handler().ServeHTTP(routinesRes, routinesReq)
+	if routinesRes.Code != http.StatusOK {
+		t.Fatalf("expected 200 for routines query, got %d", routinesRes.Code)
+	}
+
+	var routinesOut map[string]any
+	if err := json.NewDecoder(routinesRes.Body).Decode(&routinesOut); err != nil {
+		t.Fatalf("decode routines response: %v", err)
+	}
+	routinesFields := routinesOut["schema"].(map[string]any)["fields"].([]any)
+	if len(routinesFields) < 4 {
+		t.Fatalf("expected routines schema fields, got %v", routinesFields)
+	}
+
+	modelsReq := httptest.NewRequest(http.MethodPost, "/bigquery/v2/projects/p1/queries", strings.NewReader(`{"query":"SELECT * FROM p1.analytics.INFORMATION_SCHEMA.MODELS"}`))
+	modelsReq.Header.Set("Content-Type", "application/json")
+	modelsRes := httptest.NewRecorder()
+	s.Handler().ServeHTTP(modelsRes, modelsReq)
+	if modelsRes.Code != http.StatusOK {
+		t.Fatalf("expected 200 for models query, got %d", modelsRes.Code)
+	}
+
+	var modelsOut map[string]any
+	if err := json.NewDecoder(modelsRes.Body).Decode(&modelsOut); err != nil {
+		t.Fatalf("decode models response: %v", err)
+	}
+	modelsFields := modelsOut["schema"].(map[string]any)["fields"].([]any)
+	if len(modelsFields) < 4 {
+		t.Fatalf("expected models schema fields, got %v", modelsFields)
 	}
 }
 
@@ -531,6 +643,73 @@ func TestJobsSyncQuery(t *testing.T) {
 	s.Handler().ServeHTTP(altRes, altReq)
 	if altRes.Code != http.StatusOK {
 		t.Fatalf("expected 200 for alt route, got %d", altRes.Code)
+	}
+}
+
+func TestJobsQueryRequestIDFromQueryParamIsIdempotentAndKeepsUserEmail(t *testing.T) {
+	s := newTestServer()
+	body := `{"query":"SELECT 1 AS one", "requestId":"body-ignored"}`
+
+	firstReq := httptest.NewRequest(http.MethodPost, "/bigquery/v2/projects/p1/queries?requestId=req_q_1&userEmail=owner@example.com", strings.NewReader(body))
+	firstReq.Header.Set("Content-Type", "application/json")
+	firstRes := httptest.NewRecorder()
+	s.Handler().ServeHTTP(firstRes, firstReq)
+	if firstRes.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", firstRes.Code)
+	}
+
+	secondReq := httptest.NewRequest(http.MethodPost, "/bigquery/v2/projects/p1/queries?requestId=req_q_1&userEmail=owner@example.com", strings.NewReader(body))
+	secondReq.Header.Set("Content-Type", "application/json")
+	secondRes := httptest.NewRecorder()
+	s.Handler().ServeHTTP(secondRes, secondReq)
+	if secondRes.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", secondRes.Code)
+	}
+
+	var firstOut map[string]any
+	if err := json.NewDecoder(firstRes.Body).Decode(&firstOut); err != nil {
+		t.Fatalf("decode first query response: %v", err)
+	}
+	var secondOut map[string]any
+	if err := json.NewDecoder(secondRes.Body).Decode(&secondOut); err != nil {
+		t.Fatalf("decode second query response: %v", err)
+	}
+
+	firstJobID := firstOut["jobReference"].(map[string]any)["jobId"].(string)
+	secondJobID := secondOut["jobReference"].(map[string]any)["jobId"].(string)
+	if firstJobID != secondJobID {
+		t.Fatalf("expected same job ID for same requestId, got %s and %s", firstJobID, secondJobID)
+	}
+
+	jobsReq := httptest.NewRequest(http.MethodPost, "/bigquery/v2/projects/p1/queries", strings.NewReader(`{"query":"SELECT * FROM p1.INFORMATION_SCHEMA.JOBS"}`))
+	jobsReq.Header.Set("Content-Type", "application/json")
+	jobsRes := httptest.NewRecorder()
+	s.Handler().ServeHTTP(jobsRes, jobsReq)
+	if jobsRes.Code != http.StatusOK {
+		t.Fatalf("expected 200 querying INFORMATION_SCHEMA.JOBS, got %d", jobsRes.Code)
+	}
+
+	var jobsOut map[string]any
+	if err := json.NewDecoder(jobsRes.Body).Decode(&jobsOut); err != nil {
+		t.Fatalf("decode jobs response: %v", err)
+	}
+	rows, ok := jobsOut["rows"].([]any)
+	if !ok || len(rows) == 0 {
+		t.Fatalf("expected jobs rows")
+	}
+
+	found := false
+	for _, raw := range rows {
+		cells := raw.(map[string]any)["f"].([]any)
+		jobID := cells[1].(map[string]any)["v"]
+		userEmail := cells[4].(map[string]any)["v"]
+		if jobID == firstJobID && userEmail == "owner@example.com" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected job %s with owner@example.com in INFORMATION_SCHEMA.JOBS", firstJobID)
 	}
 }
 
