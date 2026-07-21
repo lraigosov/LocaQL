@@ -317,8 +317,14 @@ body[data-theme="dark"] .section-head h2 {
 
 #updateDatasetForm #datasetMetaDatasetId,
 #updateDatasetForm #datasetFriendlyNameInput,
-#updateDatasetForm #datasetLocationInput {
+#updateDatasetForm #datasetLocationInput,
+#updateDatasetForm #datasetLabelsInput {
   grid-column: 1 / -1;
+}
+
+#updateDatasetForm #datasetLabelsInput {
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 0.8rem;
 }
 
 #updateDatasetForm button {
@@ -811,6 +817,27 @@ body[data-theme="dark"] .list li {
 .table-actions button {
   padding: 7px 10px;
   border-radius: 10px;
+}
+
+.table-meta-form {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.table-meta-form input,
+.table-meta-form textarea {
+  grid-column: 1 / -1;
+}
+
+.table-meta-form button {
+  grid-column: 1 / -1;
+}
+
+#tableLabelsInput {
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 0.8rem;
 }
 
 #deleteTableBtn {

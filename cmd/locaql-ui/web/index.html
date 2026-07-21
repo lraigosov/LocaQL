@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/web/styles.css?v=9">
+  <link rel="stylesheet" href="/web/styles.css?v=10">
 </head>
 <body>
   <header class="studio-appbar">
@@ -81,6 +81,7 @@
           <input id="datasetMetaDatasetId" placeholder="dataset id" />
           <input id="datasetFriendlyNameInput" placeholder="friendly name" />
           <input id="datasetLocationInput" placeholder="location" />
+          <textarea id="datasetLabelsInput" placeholder="labels (JSON: {'k':'v'})" rows="2"></textarea>
           <button type="submit">Save Dataset</button>
           <button id="deleteDatasetBtn" type="button">Delete Dataset</button>
         </form>
@@ -237,6 +238,10 @@
               <input id="tableDescriptionInput" placeholder="description" />
               <button type="submit">Save Meta</button>
             </form>
+            <div class="compact-form table-meta-form">
+              <textarea id="tableLabelsInput" placeholder="labels (JSON: {'key':'val'})" rows="2"></textarea>
+              <button id="updateTableLabelsBtn" type="button">Save Labels</button>
+            </div>
             <pre id="tableInfoLabels" class="code-block small">{}</pre>
           </div>
 
@@ -304,6 +309,6 @@
     </section>
   </main>
 
-  <script src="/web/app.js?v=13" type="module"></script>
+  <script src="/web/app.js?v=14" type="module"></script>
 </body>
 </html>
