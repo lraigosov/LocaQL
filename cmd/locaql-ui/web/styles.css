@@ -168,12 +168,14 @@ body[data-theme="dark"] .studio-appbar {
 .studio-shell {
   min-height: 100vh;
   display: grid;
-  grid-template-columns: auto 320px minmax(0, 1fr);
+  grid-template-columns: auto auto minmax(0, 1fr);
   gap: 12px;
   padding: 12px;
 }
 
 .studio-sidebar {
+  width: clamp(300px, 26vw, 460px);
+  min-width: 300px;
   border: 1px solid var(--line);
   background: linear-gradient(180deg, rgba(255, 255, 255, 0.96), rgba(248, 250, 255, 0.92));
   padding: 16px;
@@ -181,6 +183,7 @@ body[data-theme="dark"] .studio-appbar {
   top: 12px;
   height: calc(100vh - 24px);
   overflow: auto;
+  resize: horizontal;
   border-radius: 20px;
   box-shadow: 0 10px 30px rgba(25, 32, 58, 0.08);
 }
@@ -292,6 +295,34 @@ body[data-theme="dark"] .section-head h2 {
   margin-top: 10px;
   display: flex;
   gap: 8px;
+}
+
+.studio-sidebar .compact-form {
+  flex-wrap: wrap;
+}
+
+.studio-sidebar .compact-form input {
+  min-width: 0;
+}
+
+.studio-sidebar .compact-form button {
+  white-space: nowrap;
+}
+
+#updateDatasetForm {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+#updateDatasetForm #datasetMetaDatasetId,
+#updateDatasetForm #datasetFriendlyNameInput,
+#updateDatasetForm #datasetLocationInput {
+  grid-column: 1 / -1;
+}
+
+#updateDatasetForm button {
+  width: 100%;
 }
 
 .sidebar-list {
@@ -814,6 +845,9 @@ body[data-theme="dark"] .list li {
     position: relative;
     top: 0;
     height: auto;
+    width: auto;
+    min-width: 0;
+    resize: none;
   }
 
   .workspace-topbar,
@@ -890,6 +924,9 @@ body[data-theme="dark"] .result-table th {
   .studio-sidebar {
     position: static;
     height: auto;
+    width: auto;
+    min-width: 0;
+    resize: none;
   }
 
   .status-strip {
