@@ -22,6 +22,17 @@ type datasetInsert struct {
 	Labels       map[string]string
 }
 
+type datasetPatch struct {
+	ProjectID       string
+	DatasetID       string
+	FriendlyName    string
+	Location        string
+	Labels          map[string]string
+	HasFriendlyName bool
+	HasLocation     bool
+	HasLabels       bool
+}
+
 type datasetService struct {
 	mu       sync.RWMutex
 	defaults []string
@@ -127,6 +138,39 @@ func (s *datasetService) delete(projectID, datasetID string) bool {
 	delete(proj, datasetID)
 	s.versions[projectID]++
 	return true
+}
+
+func (s *datasetService) patch(input datasetPatch) (*datasetRecord, bool) {
+	projectID := strings.TrimSpace(input.ProjectID)
+	datasetID := strings.TrimSpace(input.DatasetID)
+	if projectID == "" || datasetID == "" {
+		return nil, false
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	proj := s.ensureProjectLocked(projectID)
+	item := proj[datasetID]
+	if item == nil {
+		return nil, false
+	}
+
+	if input.HasFriendlyName {
+		item.FriendlyName = strings.TrimSpace(input.FriendlyName)
+	}
+	if input.HasLocation {
+		item.Location = strings.TrimSpace(input.Location)
+	}
+	if input.HasLabels {
+		item.Labels = cloneLabels(input.Labels)
+	}
+
+	s.versions[projectID]++
+
+	cp := *item
+	cp.Labels = cloneLabels(cp.Labels)
+	return &cp, true
 }
 
 func (s *datasetService) exists(projectID, datasetID string) bool {
