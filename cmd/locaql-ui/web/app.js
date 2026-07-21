@@ -7,6 +7,7 @@ const saveQueryForm = document.getElementById("saveQueryForm");
 const savedQueryName = document.getElementById("savedQueryName");
 const runQueryForm = document.getElementById("runQueryForm");
 const queryText = document.getElementById("queryText");
+const mainTabs = document.getElementById("mainTabs");
 const queryRunStatus = document.getElementById("queryRunStatus");
 const queryResultsMeta = document.getElementById("queryResultsMeta");
 const queryResultsTable = document.getElementById("queryResultsTable");
@@ -31,6 +32,8 @@ const capabilitiesStatus = document.getElementById("capabilitiesStatus");
 const jobsStatus = document.getElementById("jobsStatus");
 const emulatorTarget = document.getElementById("emulatorTarget");
 const explorerTree = document.getElementById("explorerTree");
+const explorerSearchInput = document.getElementById("explorerSearchInput");
+const clearExplorerSearchBtn = document.getElementById("clearExplorerSearchBtn");
 const jobsList = document.getElementById("jobsList");
 const capabilitiesJson = document.getElementById("capabilitiesJson");
 const savedQueriesList = document.getElementById("savedQueriesList");
@@ -42,6 +45,9 @@ let jobsPageToken = "";
 let jobsNextPageToken = "";
 let jobsPageHistory = [];
 let lastJobsCount = 0;
+let explorerFilterText = "";
+let explorerDatasetsCache = [];
+let explorerTablesCache = new Map();
 
 const savedQueriesStorageKey = "locaql.savedQueries";
 const themeStorageKey = "locaql.theme";
@@ -122,39 +128,72 @@ async function loadCapabilities() {
 
 async function loadDatasets(projectId) {
   const data = await fetchJson(`/api/bigquery/v2/projects/${encodeURIComponent(projectId)}/datasets?maxResults=50`);
-  const rows = data.datasets || [];
-  await renderExplorerTree(projectId, rows);
+  explorerDatasetsCache = data.datasets || [];
+  explorerTablesCache = new Map();
+
+  await Promise.all(explorerDatasetsCache.map(async (ds) => {
+    const dsRef = ds.datasetReference || {};
+    const datasetId = dsRef.datasetId || "";
+    if (!datasetId) {
+      return;
+    }
+    try {
+      const tablesResp = await fetchJson(`/api/bigquery/v2/projects/${encodeURIComponent(projectId)}/datasets/${encodeURIComponent(datasetId)}/tables?maxResults=50`);
+      explorerTablesCache.set(datasetId, tablesResp.tables || []);
+    } catch (_) {
+      explorerTablesCache.set(datasetId, []);
+    }
+  }));
+
+  await renderExplorerTree(projectId);
 }
 
-async function renderExplorerTree(projectId, datasets) {
+function matchExplorerFilter(value, term) {
+  return String(value || "").toLowerCase().includes(term);
+}
+
+async function renderExplorerTree(projectId) {
   explorerTree.innerHTML = "";
+  const searchTerm = explorerFilterText.trim().toLowerCase();
+  const projectMatches = searchTerm ? matchExplorerFilter(projectId, searchTerm) : true;
+
   const projectNode = document.createElement("div");
   projectNode.className = "node project";
   projectNode.textContent = `Project: ${projectId}`;
   explorerTree.appendChild(projectNode);
 
-  for (const ds of datasets) {
+  let visibleNodes = 0;
+
+  for (const ds of explorerDatasetsCache) {
     const dsRef = ds.datasetReference || {};
     const datasetId = dsRef.datasetId || "";
+    const tables = explorerTablesCache.get(datasetId) || [];
+    const datasetMatches = searchTerm ? matchExplorerFilter(datasetId, searchTerm) : true;
+
+    let filteredTables = tables;
+    if (searchTerm && !projectMatches && !datasetMatches) {
+      filteredTables = tables.filter((t) => {
+        const tRef = t.tableReference || {};
+        const tableId = tRef.tableId || "";
+        return matchExplorerFilter(tableId, searchTerm);
+      });
+    }
+
+    if (searchTerm && !projectMatches && !datasetMatches && filteredTables.length === 0) {
+      continue;
+    }
 
     const datasetNode = document.createElement("div");
     datasetNode.className = "node dataset";
     datasetNode.textContent = `Dataset: ${datasetId}`;
     explorerTree.appendChild(datasetNode);
+    visibleNodes++;
 
     if (!datasetId) {
       continue;
     }
 
-    let tables = [];
-    try {
-      const tablesResp = await fetchJson(`/api/bigquery/v2/projects/${encodeURIComponent(projectId)}/datasets/${encodeURIComponent(datasetId)}/tables?maxResults=20`);
-      tables = tablesResp.tables || [];
-    } catch (_) {
-      tables = [];
-    }
-
-    for (const t of tables) {
+    for (const t of filteredTables) {
       const tRef = t.tableReference || {};
       const tableId = tRef.tableId || "";
       const tableNode = document.createElement("div");
@@ -166,11 +205,19 @@ async function renderExplorerTree(projectId, datasets) {
       tableNode.addEventListener("click", async () => {
         selectedDatasetId = datasetId;
         selectedTableId = tableId;
-        await renderExplorerTree(projectId, datasets);
+        await renderExplorerTree(projectId);
         await loadTablePreview(projectId, datasetId, tableId);
       });
       explorerTree.appendChild(tableNode);
+      visibleNodes++;
     }
+  }
+
+  if (visibleNodes === 0) {
+    const emptyNode = document.createElement("div");
+    emptyNode.className = "node dataset";
+    emptyNode.textContent = "No resources match your search.";
+    explorerTree.appendChild(emptyNode);
   }
 }
 
@@ -433,6 +480,35 @@ async function cancelSelectedJob() {
   }
 }
 
+async function saveQueryShortcut() {
+  const name = savedQueryName.value.trim() || `query-${Date.now()}`;
+  const sql = queryText.value.trim();
+  if (!sql) {
+    queryRunStatus.textContent = "query required";
+    return;
+  }
+
+  const items = getSavedQueries().filter((q) => q.name !== name);
+  items.unshift({ name, sql, savedAt: Date.now() });
+  setSavedQueries(items.slice(0, 20));
+  savedQueryName.value = "";
+  renderSavedQueries();
+  queryRunStatus.textContent = "query saved";
+}
+
+queryText.addEventListener("keydown", async (event) => {
+  if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+    event.preventDefault();
+    await runQueryJob();
+    return;
+  }
+
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") {
+    event.preventDefault();
+    await saveQueryShortcut();
+  }
+});
+
 async function refreshAll() {
   const projectId = getProjectId();
   try {
@@ -506,6 +582,17 @@ clearJobsFiltersBtn.addEventListener("click", async () => {
   resetJobsPaging();
   await loadJobs(getProjectId());
   await loadJobDetails(getProjectId(), selectedJobId);
+});
+
+explorerSearchInput.addEventListener("input", async () => {
+  explorerFilterText = explorerSearchInput.value || "";
+  await renderExplorerTree(getProjectId());
+});
+
+clearExplorerSearchBtn.addEventListener("click", async () => {
+  explorerFilterText = "";
+  explorerSearchInput.value = "";
+  await renderExplorerTree(getProjectId());
 });
 
 jobsNextBtn.addEventListener("click", async () => {
