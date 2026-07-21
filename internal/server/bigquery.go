@@ -1095,7 +1095,7 @@ func extractTableRefs(v any, defaultProjectID string) []tableReference {
 }
 
 var fromTablePattern = regexp.MustCompile("(?is)\\bfrom\\s+`?([a-zA-Z0-9_\\-\\.]+)`?")
-var informationSchemaPattern = regexp.MustCompile("(?is)(?:`?([a-zA-Z0-9_\\-]+)`?\\.)?(?:`?([a-zA-Z0-9_\\-]+)`?\\.)?information_schema\\.(schemata|tables|columns)")
+var informationSchemaPattern = regexp.MustCompile("(?is)(?:`?([a-zA-Z0-9_\\-]+)`?\\.)?(?:`?([a-zA-Z0-9_\\-]+)`?\\.)?information_schema\\.(schemata|tables|columns|jobs|partitions)")
 
 func (s *Server) simulateTableSelectQuery(projectID, queryText string) ([]map[string]string, [][]string, bool) {
 	matches := fromTablePattern.FindStringSubmatch(queryText)
@@ -1184,6 +1184,37 @@ func (s *Server) simulateInformationSchemaQuery(projectID, queryText, lower stri
 			}
 		}
 		return []map[string]string{{"name": "table_catalog", "type": "STRING"}, {"name": "table_schema", "type": "STRING"}, {"name": "table_name", "type": "STRING"}, {"name": "column_name", "type": "STRING"}, {"name": "ordinal_position", "type": "INT64"}, {"name": "data_type", "type": "STRING"}}, rows, true
+	case "jobs":
+		items, _, _ := s.jobs.list(targetProjectID, jobListFilters{AllUsers: true}, 0, 1000)
+		rows := make([][]string, 0, len(items))
+		for _, job := range items {
+			rows = append(rows, []string{
+				job.ProjectID,
+				job.JobID,
+				job.JobType,
+				string(job.State),
+				job.UserEmail,
+				strconv.FormatInt(job.CreatedAt.UnixMilli(), 10),
+				strconv.FormatInt(job.EndedAt.UnixMilli(), 10),
+			})
+		}
+		return []map[string]string{{"name": "project_id", "type": "STRING"}, {"name": "job_id", "type": "STRING"}, {"name": "job_type", "type": "STRING"}, {"name": "state", "type": "STRING"}, {"name": "user_email", "type": "STRING"}, {"name": "creation_time", "type": "INT64"}, {"name": "end_time", "type": "INT64"}}, rows, true
+	case "partitions":
+		rows := [][]string{}
+		for _, ds := range datasets {
+			if !filterDataset(ds.DatasetID) {
+				continue
+			}
+			tables, _, _ := s.tables.list(targetProjectID, ds.DatasetID, 0, 1000)
+			for _, table := range tables {
+				_, tableRows, ok := s.tables.getData(targetProjectID, ds.DatasetID, table.TableID)
+				if !ok {
+					continue
+				}
+				rows = append(rows, []string{targetProjectID, ds.DatasetID, table.TableID, "__UNPARTITIONED__", strconv.Itoa(len(tableRows))})
+			}
+		}
+		return []map[string]string{{"name": "table_catalog", "type": "STRING"}, {"name": "table_schema", "type": "STRING"}, {"name": "table_name", "type": "STRING"}, {"name": "partition_id", "type": "STRING"}, {"name": "total_rows", "type": "INT64"}}, rows, true
 	default:
 		return nil, nil, false
 	}

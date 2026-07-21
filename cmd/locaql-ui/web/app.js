@@ -11,6 +11,8 @@ const refreshBtn = document.getElementById("refreshBtn");
 const loadProjectBtn = document.getElementById("loadProjectBtn");
 const themeToggle = document.getElementById("themeToggle");
 const createDatasetForm = document.getElementById("createDatasetForm");
+const createTableForm = document.getElementById("createTableForm");
+const updateTableMetaForm = document.getElementById("updateTableMetaForm");
 const saveQueryForm = document.getElementById("saveQueryForm");
 const savedQueryName = document.getElementById("savedQueryName");
 const runQueryForm = document.getElementById("runQueryForm");
@@ -54,6 +56,8 @@ const tableInfoETag = document.getElementById("tableInfoETag");
 const tableInfoCreated = document.getElementById("tableInfoCreated");
 const tableInfoUpdated = document.getElementById("tableInfoUpdated");
 const tableInfoLabels = document.getElementById("tableInfoLabels");
+const tableFriendlyNameInput = document.getElementById("tableFriendlyNameInput");
+const tableDescriptionInput = document.getElementById("tableDescriptionInput");
 const tableSchemaList = document.getElementById("tableSchemaList");
 const tablePreviewMeta = document.getElementById("tablePreviewMeta");
 const tablePreviewTable = document.getElementById("tablePreviewTable");
@@ -126,6 +130,14 @@ function updateProjectChip() {
   }
 }
 
+function syncCreateTableDatasetInput() {
+  const datasetInput = document.getElementById("newTableDatasetId");
+  if (!datasetInput) {
+    return;
+  }
+  datasetInput.value = selectedDatasetId || datasetInput.value || "analytics";
+}
+
 function hasSelectedTable() {
   return Boolean(selectedDatasetId && selectedTableId);
 }
@@ -149,6 +161,7 @@ function updateTableActionState(statusText) {
 async function selectTable(projectId, datasetId, tableId) {
   selectedDatasetId = datasetId;
   selectedTableId = tableId;
+  syncCreateTableDatasetInput();
   if (breadcrumbDatasetChip) {
     breadcrumbDatasetChip.textContent = datasetId;
   }
@@ -580,6 +593,12 @@ async function loadTableDetails(projectId, datasetId, tableId) {
     tableInfoUpdated.textContent = formatEpochMillis(tableMeta.lastModifiedTime);
     tableInfoLabels.textContent = JSON.stringify(tableMeta.labels || {}, null, 2);
     tableDetailsJson.textContent = JSON.stringify(tableMeta, null, 2);
+    if (tableFriendlyNameInput) {
+      tableFriendlyNameInput.value = tableMeta.friendlyName || "";
+    }
+    if (tableDescriptionInput) {
+      tableDescriptionInput.value = tableMeta.description || "";
+    }
 
     const schemaFields = (((tableMeta.schema || {}).fields) || []).map((f) => ({
       name: f.name || "field",
@@ -648,6 +667,12 @@ async function loadTableDetails(projectId, datasetId, tableId) {
     tableInfoCreated.textContent = "-";
     tableInfoUpdated.textContent = "-";
     tableInfoLabels.textContent = "{}";
+    if (tableFriendlyNameInput) {
+      tableFriendlyNameInput.value = "";
+    }
+    if (tableDescriptionInput) {
+      tableDescriptionInput.value = "";
+    }
     tableSchemaList.innerHTML = "";
     const li = document.createElement("li");
     li.className = "schema-item";
@@ -741,6 +766,29 @@ async function deleteSelectedTable() {
   } catch (err) {
     updateTableActionState("delete failed");
     alert(`Delete table failed: ${err.message}`);
+  }
+}
+
+async function updateSelectedTableMetadata() {
+  if (!hasSelectedTable()) {
+    return;
+  }
+  const projectId = getProjectId();
+  try {
+    await fetchJson(`/api/bigquery/v2/projects/${encodeURIComponent(projectId)}/datasets/${encodeURIComponent(selectedDatasetId)}/tables/${encodeURIComponent(selectedTableId)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        friendlyName: tableFriendlyNameInput ? tableFriendlyNameInput.value.trim() : "",
+        description: tableDescriptionInput ? tableDescriptionInput.value.trim() : "",
+      }),
+    });
+    updateTableActionState(`table metadata saved: ${selectedDatasetId}.${selectedTableId}`);
+    await loadTableDetails(projectId, selectedDatasetId, selectedTableId);
+    await renderExplorerTree(projectId);
+  } catch (err) {
+    updateTableActionState("table metadata update failed");
+    alert(`Update table metadata failed: ${err.message}`);
   }
 }
 
@@ -1323,6 +1371,40 @@ createDatasetForm.addEventListener("submit", async (event) => {
   }
 });
 
+if (createTableForm) {
+  createTableForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const projectId = getProjectId();
+    const datasetId = document.getElementById("newTableDatasetId").value.trim() || selectedDatasetId || "analytics";
+    const tableId = document.getElementById("newTableId").value.trim();
+    if (!datasetId || !tableId) {
+      return;
+    }
+
+    try {
+      await fetchJson(`/api/bigquery/v2/projects/${encodeURIComponent(projectId)}/datasets/${encodeURIComponent(datasetId)}/tables`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ tableReference: { tableId } }),
+      });
+      document.getElementById("newTableDatasetId").value = datasetId;
+      document.getElementById("newTableId").value = "";
+      selectedDatasetId = datasetId;
+      await refreshAll();
+      await selectTable(projectId, datasetId, tableId);
+    } catch (err) {
+      alert(`Create table failed: ${err.message}`);
+    }
+  });
+}
+
+if (updateTableMetaForm) {
+  updateTableMetaForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    await updateSelectedTableMetadata();
+  });
+}
+
 if (mainTabs) {
   mainTabs.addEventListener("click", (e) => {
     const tab = e.target.closest(".tab");
@@ -1414,6 +1496,7 @@ jobsPageHint.textContent = "page: start";
 const initialTheme = localStorage.getItem(themeStorageKey) || "light";
 applyTheme(initialTheme);
 updateProjectChip();
+syncCreateTableDatasetInput();
 updateTableActionState();
 if (jobsHistoryHint) {
   jobsHistoryHint.textContent = "Scope: personal jobs in current project";
