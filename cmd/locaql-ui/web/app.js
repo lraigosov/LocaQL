@@ -49,15 +49,21 @@ const emulatorTarget = document.getElementById("emulatorTarget");
 const explorerTree = document.getElementById("explorerTree");
 const explorerSearchInput = document.getElementById("explorerSearchInput");
 const clearExplorerSearchBtn = document.getElementById("clearExplorerSearchBtn");
+const explorerCapabilityFilter = document.getElementById("explorerCapabilityFilter");
 const datasetMetaDatasetId = document.getElementById("datasetMetaDatasetId");
 const datasetFriendlyNameInput = document.getElementById("datasetFriendlyNameInput");
 const datasetLocationInput = document.getElementById("datasetLocationInput");
 const datasetLabelsInput = document.getElementById("datasetLabelsInput");
 const datasetSummaryStatus = document.getElementById("datasetSummaryStatus");
+const datasetSummaryCapabilityNote = document.getElementById("datasetSummaryCapabilityNote");
 const datasetSummaryId = document.getElementById("datasetSummaryId");
 const datasetSummaryFriendlyName = document.getElementById("datasetSummaryFriendlyName");
 const datasetSummaryLocation = document.getElementById("datasetSummaryLocation");
 const datasetSummaryTables = document.getElementById("datasetSummaryTables");
+const datasetSummaryActionStatus = document.getElementById("datasetSummaryActionStatus");
+const datasetQueryBtn = document.getElementById("datasetQueryBtn");
+const datasetListTablesBtn = document.getElementById("datasetListTablesBtn");
+const datasetCopyIdBtn = document.getElementById("datasetCopyIdBtn");
 const datasetSummaryLabels = document.getElementById("datasetSummaryLabels");
 const breadcrumbDatasetChip = document.getElementById("breadcrumbDatasetChip");
 const breadcrumbTableChip = document.getElementById("breadcrumbTableChip");
@@ -95,12 +101,23 @@ let jobsNextPageToken = "";
 let jobsPageHistory = [];
 let lastJobsCount = 0;
 let explorerFilterText = "";
+let explorerCapabilityFilterText = "all";
 let explorerDatasetsCache = [];
 let explorerTablesCache = new Map();
 let explorerCollapsedDatasets = new Set();
+let capabilityCounts = { supported: 0, partial: 0, unsupported: 0 };
+let capabilityStatusByKey = new Map();
+
+const capabilityFilterOptionLabels = {
+  all: "Capabilities: All",
+  supported: "Only SUPPORTED",
+  partial: "Only PARTIAL",
+  unsupported: "Only UNSUPPORTED",
+};
 
 const savedQueriesStorageKey = "locaql.savedQueries";
 const themeStorageKey = "locaql.theme";
+const explorerCapabilityFilterStorageKey = "locaql.explorer.capabilityFilter";
 
 async function fetchJson(path, options) {
   const res = await fetch(path, options);
@@ -199,6 +216,169 @@ function syncDatasetSummary(activeDatasetId, datasetMeta) {
   if (datasetSummaryLabels) {
     datasetSummaryLabels.textContent = JSON.stringify((datasetMeta && datasetMeta.labels) || {}, null, 2);
   }
+  if (datasetSummaryCapabilityNote) {
+    datasetSummaryCapabilityNote.textContent = `Capability signal: ${capabilityCounts.supported} supported / ${capabilityCounts.partial} partial / ${capabilityCounts.unsupported} unsupported`;
+  }
+  if (datasetSummaryActionStatus) {
+    datasetSummaryActionStatus.textContent = datasetId ? "actions ready" : "actions disabled";
+  }
+  if (datasetQueryBtn) datasetQueryBtn.disabled = !datasetId;
+  if (datasetListTablesBtn) datasetListTablesBtn.disabled = !datasetId;
+  if (datasetCopyIdBtn) datasetCopyIdBtn.disabled = !datasetId;
+}
+
+function combineCapabilityStatus(keys) {
+  const statuses = keys
+    .map((k) => {
+      const entry = capabilityStatusByKey.get(k);
+      return entry && entry.status ? String(entry.status).toLowerCase() : "";
+    })
+    .filter(Boolean);
+
+  if (!statuses.length) {
+    return "partial";
+  }
+  if (statuses.includes("unsupported")) {
+    return "unsupported";
+  }
+  if (statuses.includes("partial")) {
+    return "partial";
+  }
+  if (statuses.every((s) => s === "supported")) {
+    return "supported";
+  }
+  return "partial";
+}
+
+function matchesCapabilityFilter(status) {
+  return explorerCapabilityFilterText === "all" || status === explorerCapabilityFilterText;
+}
+
+function updateExplorerCapabilityFilterOptions() {
+  if (!explorerCapabilityFilter) {
+    return;
+  }
+
+  // Until capabilities are loaded, keep static labels to avoid misleading counts.
+  if (capabilityStatusByKey.size === 0) {
+    for (const option of explorerCapabilityFilter.options) {
+      const base = capabilityFilterOptionLabels[option.value] || option.textContent;
+      option.textContent = base;
+    }
+    return;
+  }
+
+  const searchTerm = explorerFilterText.trim().toLowerCase();
+  const projectId = getProjectId();
+  const projectMatches = searchTerm ? matchExplorerFilter(projectId, searchTerm) : true;
+  const counts = { supported: 0, partial: 0, unsupported: 0 };
+  let contextCount = 0;
+
+  for (const ds of explorerDatasetsCache) {
+    const dsRef = ds.datasetReference || {};
+    const datasetId = dsRef.datasetId || "";
+    const tables = explorerTablesCache.get(datasetId) || [];
+    const datasetMatches = searchTerm ? matchExplorerFilter(datasetId, searchTerm) : true;
+
+    let filteredTables = tables;
+    if (searchTerm && !projectMatches && !datasetMatches) {
+      filteredTables = tables.filter((t) => {
+        const tRef = t.tableReference || {};
+        const tableId = tRef.tableId || "";
+        return matchExplorerFilter(tableId, searchTerm);
+      });
+    }
+
+    const routineSearchMatch = !searchTerm || matchExplorerFilter("routines", searchTerm);
+    const modelSearchMatch = !searchTerm || matchExplorerFilter("models", searchTerm);
+    const hasVisibleChildren = filteredTables.length > 0 || routineSearchMatch || modelSearchMatch;
+    const visibleBySearch = !searchTerm || projectMatches || datasetMatches || hasVisibleChildren;
+    if (!visibleBySearch) {
+      continue;
+    }
+
+    const isDatasetDirectMatch = !searchTerm || projectMatches || datasetMatches;
+
+    const datasetStatus = combineCapabilityStatus([
+      "rest.datasets.get",
+      "rest.datasets.patch",
+      "console.ui.resource_forms.basic",
+    ]);
+    if (isDatasetDirectMatch) {
+      counts[datasetStatus] = (counts[datasetStatus] || 0) + 1;
+    } else if (hasVisibleChildren) {
+      contextCount += 1;
+    }
+
+    const tableStatus = combineCapabilityStatus([
+      "rest.tables.get",
+      "rest.tabledata.list.pagination",
+      "console.ui.table_details.preview_schema_metadata",
+    ]);
+    counts[tableStatus] = (counts[tableStatus] || 0) + filteredTables.length;
+
+    if (routineSearchMatch) {
+      counts.unsupported += 1;
+    }
+    if (modelSearchMatch) {
+      counts.unsupported += 1;
+    }
+  }
+
+  for (const option of explorerCapabilityFilter.options) {
+    const value = option.value;
+    if (value === "all") {
+      const total = counts.supported + counts.partial + counts.unsupported;
+      option.textContent = `${capabilityFilterOptionLabels.all} (${total}) · CONTEXT (${contextCount})`;
+      continue;
+    }
+    const base = capabilityFilterOptionLabels[value] || option.textContent;
+    option.textContent = `${base} (${counts[value] || 0})`;
+  }
+}
+
+function statusBadgeLabel(status) {
+  if (status === "supported") return "SUPPORTED";
+  if (status === "unsupported") return "UNSUPPORTED";
+  if (status === "context") return "CONTEXT";
+  return "PARTIAL";
+}
+
+function buildCapabilityBadge(status, titleText) {
+  const badge = document.createElement("span");
+  badge.className = `cap-badge cap-${status}`;
+  badge.textContent = statusBadgeLabel(status);
+  if (titleText) {
+    badge.title = titleText;
+  }
+  return badge;
+}
+
+async function copyDatasetId() {
+  if (!selectedDatasetId) return;
+  if (datasetSummaryActionStatus) datasetSummaryActionStatus.textContent = "copying dataset id";
+  try {
+    await navigator.clipboard.writeText(selectedDatasetId);
+    if (datasetSummaryActionStatus) datasetSummaryActionStatus.textContent = "dataset id copied";
+  } catch (_) {
+    if (datasetSummaryActionStatus) datasetSummaryActionStatus.textContent = "copy unavailable in this browser";
+  }
+}
+
+function listSelectedDatasetTables() {
+  if (!selectedDatasetId) return;
+  const projectId = getProjectId();
+  queryText.value = `SELECT table_name\nFROM \`${projectId}.${selectedDatasetId}.INFORMATION_SCHEMA.TABLES\`\nORDER BY table_name\nLIMIT 200;`;
+  setActiveMainTab("query-workspace");
+  if (datasetSummaryActionStatus) datasetSummaryActionStatus.textContent = "table listing query drafted";
+}
+
+function querySelectedDataset() {
+  if (!selectedDatasetId) return;
+  const projectId = getProjectId();
+  queryText.value = `SELECT *\nFROM \`${projectId}.${selectedDatasetId}.__TABLES_SUMMARY__\`\nLIMIT 100;`;
+  setActiveMainTab("query-workspace");
+  if (datasetSummaryActionStatus) datasetSummaryActionStatus.textContent = "dataset query drafted";
 }
 
 async function selectDataset(projectId, datasetId) {
@@ -468,10 +648,15 @@ async function loadHealth() {
 async function loadCapabilities() {
   const caps = await fetchJson("/api/_emulator/capabilities");
   const entries = Object.entries(caps.capabilities || {});
+  capabilityStatusByKey = new Map(entries);
   const supported = entries.filter(([, v]) => v.status === "supported").length;
   const partial = entries.filter(([, v]) => v.status === "partial").length;
+  const unsupported = entries.filter(([, v]) => v.status === "unsupported").length;
+  capabilityCounts = { supported, partial, unsupported };
   capabilitiesStatus.textContent = `${supported} supported / ${partial} partial`;
   capabilitiesJson.textContent = JSON.stringify(caps, null, 2);
+  await renderExplorerTree(getProjectId());
+  syncDatasetSummary(selectedDatasetId, explorerDatasetsCache.find((ds) => (ds.datasetReference || {}).datasetId === selectedDatasetId));
 }
 
 async function loadDatasets(projectId) {
@@ -502,6 +687,7 @@ function matchExplorerFilter(value, term) {
 
 async function renderExplorerTree(projectId) {
   explorerTree.innerHTML = "";
+  updateExplorerCapabilityFilterOptions();
   const searchTerm = explorerFilterText.trim().toLowerCase();
   const projectMatches = searchTerm ? matchExplorerFilter(projectId, searchTerm) : true;
   const allTablesCount = Array.from(explorerTablesCache.values()).reduce((sum, tables) => sum + tables.length, 0);
@@ -518,6 +704,11 @@ async function renderExplorerTree(projectId) {
     const datasetId = dsRef.datasetId || "";
     const tables = explorerTablesCache.get(datasetId) || [];
     const datasetMatches = searchTerm ? matchExplorerFilter(datasetId, searchTerm) : true;
+    const datasetStatus = combineCapabilityStatus([
+      "rest.datasets.get",
+      "rest.datasets.patch",
+      "console.ui.resource_forms.basic",
+    ]);
 
     let filteredTables = tables;
     if (searchTerm && !projectMatches && !datasetMatches) {
@@ -528,7 +719,28 @@ async function renderExplorerTree(projectId) {
       });
     }
 
-    if (searchTerm && !projectMatches && !datasetMatches && filteredTables.length === 0) {
+    const filteredTableEntries = filteredTables
+      .map((t) => {
+        const tRef = t.tableReference || {};
+        const tableId = tRef.tableId || "";
+        const status = combineCapabilityStatus([
+          "rest.tables.get",
+          "rest.tabledata.list.pagination",
+          "console.ui.table_details.preview_schema_metadata",
+        ]);
+        return { table: t, tableId, status };
+      })
+      .filter((entry) => matchesCapabilityFilter(entry.status));
+
+    const routineSearchMatch = !searchTerm || matchExplorerFilter("routines", searchTerm);
+    const modelSearchMatch = !searchTerm || matchExplorerFilter("models", searchTerm);
+    const routineVisible = routineSearchMatch && matchesCapabilityFilter("unsupported");
+    const modelVisible = modelSearchMatch && matchesCapabilityFilter("unsupported");
+
+    const hasVisibleChildren = filteredTableEntries.length > 0 || routineVisible || modelVisible;
+    const visibleBySearch = !searchTerm || projectMatches || datasetMatches || hasVisibleChildren;
+    const visibleByCapability = matchesCapabilityFilter(datasetStatus) || hasVisibleChildren;
+    if (!visibleBySearch || !visibleByCapability) {
       continue;
     }
 
@@ -544,9 +756,17 @@ async function renderExplorerTree(projectId) {
     datasetTitle.className = "dataset-title";
     datasetTitle.textContent = `Dataset: ${datasetId}`;
 
+    const datasetBadgeStatus = matchesCapabilityFilter(datasetStatus) || explorerCapabilityFilterText === "all"
+      ? datasetStatus
+      : "context";
+    const datasetBadgeTitle = datasetBadgeStatus === "context"
+      ? "Dataset shown as parent container for matching child resources"
+      : "Dataset capabilities";
+    datasetTitle.appendChild(buildCapabilityBadge(datasetBadgeStatus, datasetBadgeTitle));
+
     const datasetMeta = document.createElement("span");
     datasetMeta.className = "dataset-meta";
-    datasetMeta.textContent = `${filteredTables.length}/${tables.length} tables`;
+    datasetMeta.textContent = `${filteredTableEntries.length}/${tables.length} tables`;
 
     datasetHeader.appendChild(datasetTitle);
     datasetHeader.appendChild(datasetMeta);
@@ -582,22 +802,27 @@ async function renderExplorerTree(projectId) {
       tableGroup.classList.add("collapsed");
     }
 
-    const datasetShouldAutoOpen = searchTerm && filteredTables.length > 0;
+    const datasetShouldAutoOpen = searchTerm && hasVisibleChildren;
     if (datasetShouldAutoOpen) {
       explorerCollapsedDatasets.delete(datasetId);
       tableGroup.classList.remove("collapsed");
       datasetHeader.setAttribute("aria-expanded", "true");
     }
 
-    for (const t of filteredTables) {
-      const tRef = t.tableReference || {};
-      const tableId = tRef.tableId || "";
+    for (const entry of filteredTableEntries) {
+      const t = entry.table;
+      const tableId = entry.tableId;
       const tableNode = document.createElement("div");
       tableNode.className = "node table";
       if (datasetId === selectedDatasetId && tableId === selectedTableId) {
         tableNode.classList.add("active");
       }
-      tableNode.textContent = tableId;
+      const tableName = document.createElement("span");
+      tableName.className = "node-label";
+      tableName.textContent = tableId;
+      tableNode.appendChild(tableName);
+
+      tableNode.appendChild(buildCapabilityBadge(entry.status, "Table capabilities"));
 
       tableNode.addEventListener("click", async () => {
         await selectTable(projectId, datasetId, tableId);
@@ -608,18 +833,30 @@ async function renderExplorerTree(projectId) {
     }
 
     // Routines placeholder
-    const routineNode = document.createElement("div");
-    routineNode.className = "node table meta-text";
-    routineNode.style.fontStyle = "italic";
-    routineNode.textContent = "Routines (not supported)";
-    tableGroup.appendChild(routineNode);
+    if (routineVisible) {
+      const routineNode = document.createElement("div");
+      routineNode.className = "node table meta-text";
+      routineNode.style.fontStyle = "italic";
+      const routineLabel = document.createElement("span");
+      routineLabel.className = "node-label";
+      routineLabel.textContent = "Routines";
+      routineNode.appendChild(routineLabel);
+      routineNode.appendChild(buildCapabilityBadge("unsupported", "Backend routine resources are not implemented"));
+      tableGroup.appendChild(routineNode);
+    }
 
     // Models placeholder
-    const modelNode = document.createElement("div");
-    modelNode.className = "node table meta-text";
-    modelNode.style.fontStyle = "italic";
-    modelNode.textContent = "Models (not supported)";
-    tableGroup.appendChild(modelNode);
+    if (modelVisible) {
+      const modelNode = document.createElement("div");
+      modelNode.className = "node table meta-text";
+      modelNode.style.fontStyle = "italic";
+      const modelLabel = document.createElement("span");
+      modelLabel.className = "node-label";
+      modelLabel.textContent = "Models";
+      modelNode.appendChild(modelLabel);
+      modelNode.appendChild(buildCapabilityBadge("unsupported", "Backend model resources are not implemented"));
+      tableGroup.appendChild(modelNode);
+    }
 
     datasetSection.appendChild(tableGroup);
     explorerTree.appendChild(datasetSection);
@@ -1420,6 +1657,14 @@ clearExplorerSearchBtn.addEventListener("click", async () => {
   await renderExplorerTree(getProjectId());
 });
 
+if (explorerCapabilityFilter) {
+  explorerCapabilityFilter.addEventListener("change", async () => {
+    explorerCapabilityFilterText = explorerCapabilityFilter.value || "all";
+    localStorage.setItem(explorerCapabilityFilterStorageKey, explorerCapabilityFilterText);
+    await renderExplorerTree(getProjectId());
+  });
+}
+
 jobsNextBtn.addEventListener("click", async () => {
   if (!jobsNextPageToken) {
     return;
@@ -1676,6 +1921,18 @@ if (deleteTableBtn) {
   deleteTableBtn.addEventListener("click", deleteSelectedTable);
 }
 
+if (datasetCopyIdBtn) {
+  datasetCopyIdBtn.addEventListener("click", copyDatasetId);
+}
+
+if (datasetListTablesBtn) {
+  datasetListTablesBtn.addEventListener("click", listSelectedDatasetTables);
+}
+
+if (datasetQueryBtn) {
+  datasetQueryBtn.addEventListener("click", querySelectedDataset);
+}
+
 updateSelectedJobHint();
 jobDetailsJson.textContent = "{}";
 jobsPrevBtn.disabled = true;
@@ -1683,6 +1940,11 @@ jobsNextBtn.disabled = true;
 jobsPageHint.textContent = "page: start";
 const initialTheme = localStorage.getItem(themeStorageKey) || "light";
 applyTheme(initialTheme);
+if (explorerCapabilityFilter) {
+  const storedFilter = localStorage.getItem(explorerCapabilityFilterStorageKey) || "all";
+  explorerCapabilityFilterText = storedFilter;
+  explorerCapabilityFilter.value = storedFilter;
+}
 updateProjectChip();
 syncCreateTableDatasetInput();
 syncDatasetMetaInputs();

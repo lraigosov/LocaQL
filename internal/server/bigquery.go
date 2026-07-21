@@ -700,6 +700,7 @@ func (s *Server) insertJob(w http.ResponseWriter, r *http.Request, projectID str
 	targetDataset := ""
 	targetTable := ""
 	sourceTables := []tableReference(nil)
+	loadSchema := []tableField(nil)
 	createDisposition := ""
 	writeDisposition := ""
 	priority := "INTERACTIVE"
@@ -719,6 +720,13 @@ func (s *Server) insertJob(w http.ResponseWriter, r *http.Request, projectID str
 						if loadCfg, ok := loadRaw.(map[string]any); ok {
 							dest := extractTableRef(loadCfg["destinationTable"], projectID)
 							targetDataset, targetTable = dest.DatasetID, dest.TableID
+							loadSchema = parseTableSchemaFields(loadCfg["schema"])
+							if value, ok := loadCfg["createDisposition"].(string); ok {
+								createDisposition = value
+							}
+							if value, ok := loadCfg["writeDisposition"].(string); ok {
+								writeDisposition = value
+							}
 						}
 					}
 					if _, ok := conf["extract"]; ok {
@@ -772,6 +780,7 @@ func (s *Server) insertJob(w http.ResponseWriter, r *http.Request, projectID str
 		JobType:       jobType,
 		Priority:      priority,
 		SourceTables:  sourceTables,
+		LoadSchema:    loadSchema,
 		CreateDisposition: createDisposition,
 		WriteDisposition:  writeDisposition,
 		TargetDataset: targetDataset,
@@ -862,9 +871,19 @@ func (s *Server) handleJobsQuery(w http.ResponseWriter, r *http.Request, project
 
 	// For now, we reuse jobs.insert logic by creating a job and immediately waiting/polling for results
 	// In a real implementation, we would wait up to TimeoutMs
+	requestID := strings.TrimSpace(r.URL.Query().Get("requestId"))
+	if requestID == "" {
+		requestID = strings.TrimSpace(payload.RequestId)
+	}
+	userEmail := strings.TrimSpace(r.URL.Query().Get("userEmail"))
+	if userEmail == "" {
+		userEmail = strings.TrimSpace(r.Header.Get("X-User-Email"))
+	}
+
 	insertOpts := jobInsertOptions{
 		ProjectID: projectID,
-		RequestID: payload.RequestId,
+		RequestID: requestID,
+		UserEmail: userEmail,
 		QueryText: payload.Query,
 		JobType:   "query",
 		Priority:  payload.Priority,
@@ -1094,8 +1113,41 @@ func extractTableRefs(v any, defaultProjectID string) []tableReference {
 	return out
 }
 
+func parseTableSchemaFields(v any) []tableField {
+	obj, ok := v.(map[string]any)
+	if !ok {
+		return nil
+	}
+	rawFields, ok := obj["fields"].([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]tableField, 0, len(rawFields))
+	for _, raw := range rawFields {
+		fieldObj, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		name, _ := fieldObj["name"].(string)
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		typ, _ := fieldObj["type"].(string)
+		typ = strings.ToUpper(strings.TrimSpace(typ))
+		if typ == "" {
+			typ = "STRING"
+		}
+		out = append(out, tableField{Name: name, Type: typ})
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 var fromTablePattern = regexp.MustCompile("(?is)\\bfrom\\s+`?([a-zA-Z0-9_\\-\\.]+)`?")
-var informationSchemaPattern = regexp.MustCompile("(?is)(?:`?([a-zA-Z0-9_\\-]+)`?\\.)?(?:`?([a-zA-Z0-9_\\-]+)`?\\.)?information_schema\\.(schemata_options|schemata|tables|columns|jobs|partitions)")
+var informationSchemaPattern = regexp.MustCompile("(?is)(?:`?([a-zA-Z0-9_\\-]+)`?\\.)?(?:`?([a-zA-Z0-9_\\-]+)`?\\.)?information_schema\\.(schemata_options|schemata|tables|columns|jobs|partitions|routines|models)")
 
 func (s *Server) simulateTableSelectQuery(projectID, queryText string) ([]map[string]string, [][]string, bool) {
 	matches := fromTablePattern.FindStringSubmatch(queryText)
@@ -1234,6 +1286,12 @@ func (s *Server) simulateInformationSchemaQuery(projectID, queryText, lower stri
 			}
 		}
 		return []map[string]string{{"name": "table_catalog", "type": "STRING"}, {"name": "table_schema", "type": "STRING"}, {"name": "table_name", "type": "STRING"}, {"name": "partition_id", "type": "STRING"}, {"name": "total_rows", "type": "INT64"}}, rows, true
+	case "routines":
+		rows := [][]string{}
+		return []map[string]string{{"name": "routine_catalog", "type": "STRING"}, {"name": "routine_schema", "type": "STRING"}, {"name": "routine_name", "type": "STRING"}, {"name": "routine_type", "type": "STRING"}}, rows, true
+	case "models":
+		rows := [][]string{}
+		return []map[string]string{{"name": "model_catalog", "type": "STRING"}, {"name": "model_schema", "type": "STRING"}, {"name": "model_name", "type": "STRING"}, {"name": "model_type", "type": "STRING"}}, rows, true
 	default:
 		return nil, nil, false
 	}
@@ -1276,6 +1334,33 @@ func (s *Server) executeCopyJob(job *jobRecord) (jobStatistics, error) {
 		return jobStatistics{Executor: "copy", Simulated: false}, err
 	}
 	return jobStatistics{Executor: "copy", Simulated: false, TotalSlotMs: 30, ProcessedBytes: int64(outputRows * 128), OutputRows: int64(outputRows)}, nil
+}
+
+func (s *Server) executeLoadJob(job *jobRecord) (jobStatistics, error) {
+	if strings.TrimSpace(job.TargetDataset) == "" || strings.TrimSpace(job.TargetTable) == "" {
+		return jobStatistics{Executor: "load", Simulated: false}, fmt.Errorf("destinationTable is required")
+	}
+	if !s.datasets.exists(job.ProjectID, job.TargetDataset) {
+		return jobStatistics{Executor: "load", Simulated: false}, fmt.Errorf("destination dataset not found")
+	}
+
+	schema := cloneTableFields(job.LoadSchema)
+	if len(schema) == 0 {
+		schema = []tableField{{Name: "col_1", Type: "STRING"}}
+	}
+
+	outputRows, err := s.tables.upsertCopyDestination(
+		tableReference{ProjectID: job.ProjectID, DatasetID: job.TargetDataset, TableID: job.TargetTable},
+		schema,
+		[][]string{},
+		job.CreateDisposition,
+		job.WriteDisposition,
+	)
+	if err != nil {
+		return jobStatistics{Executor: "load", Simulated: false}, err
+	}
+
+	return jobStatistics{Executor: "load", Simulated: false, TotalSlotMs: 55, ProcessedBytes: 1024, OutputRows: int64(outputRows)}, nil
 }
 
 func parsePagination(r *http.Request, defaultSize, maxSize int) (start, size int) {

@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/web/styles.css?v=10">
+  <link rel="stylesheet" href="/web/styles.css?v=16">
 </head>
 <body>
   <header class="studio-appbar">
@@ -73,6 +73,20 @@
           <input id="explorerSearchInput" placeholder="search dataset/table" />
           <button id="clearExplorerSearchBtn" type="button">Clear</button>
         </div>
+        <div class="compact-form">
+          <select id="explorerCapabilityFilter" aria-label="Explorer capability filter">
+            <option value="all">Capabilities: All</option>
+            <option value="supported">Only SUPPORTED</option>
+            <option value="partial">Only PARTIAL</option>
+            <option value="unsupported">Only UNSUPPORTED</option>
+          </select>
+        </div>
+        <div class="cap-legend" aria-label="capability legend">
+          <span class="cap-badge cap-supported">SUPPORTED</span>
+          <span class="cap-badge cap-partial">PARTIAL</span>
+          <span class="cap-badge cap-unsupported">UNSUPPORTED</span>
+          <span class="cap-badge cap-context">CONTEXT</span>
+        </div>
         <form id="createDatasetForm" class="compact-form">
           <input id="newDatasetId" placeholder="new dataset id" required />
           <button type="submit">Create</button>
@@ -95,6 +109,7 @@
             <h2>Selected Dataset</h2>
             <span id="datasetSummaryStatus" class="meta-text">none</span>
           </div>
+          <p id="datasetSummaryCapabilityNote" class="meta-text">Capability signal: loading...</p>
           <div class="dataset-summary-grid">
             <article class="dataset-summary-item">
               <h3>ID</h3>
@@ -113,6 +128,12 @@
               <p id="datasetSummaryTables">0</p>
             </article>
           </div>
+          <div class="row-actions dataset-summary-actions">
+            <button id="datasetQueryBtn" type="button">Query Dataset</button>
+            <button id="datasetListTablesBtn" type="button">List Tables</button>
+            <button id="datasetCopyIdBtn" type="button">Copy Dataset ID</button>
+          </div>
+          <span id="datasetSummaryActionStatus" class="meta-text">actions idle</span>
           <pre id="datasetSummaryLabels" class="code-block small">{}</pre>
         </section>
         <div id="explorerTree" class="tree"></div>
@@ -334,6 +355,6 @@
     </section>
   </main>
 
-  <script src="/web/app.js?v=14" type="module"></script>
+  <script src="/web/app.js?v=21" type="module"></script>
 </body>
 </html>
