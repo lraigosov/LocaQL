@@ -1,4 +1,12 @@
 const projectInput = document.getElementById("projectId");
+const navCollapseBtn = document.getElementById("navCollapseBtn");
+const projectSelectorBtn = document.getElementById("projectSelectorBtn");
+const globalSearchInput = document.getElementById("globalSearchInput");
+const appbarSearchBtn = document.getElementById("appbarSearchBtn");
+const appbarStarredBtn = document.getElementById("appbarStarredBtn");
+const appbarThemeBtn = document.getElementById("appbarThemeBtn");
+const appbarMoreBtn = document.getElementById("appbarMoreBtn");
+const railIcons = Array.from(document.querySelectorAll(".rail-icon"));
 const refreshBtn = document.getElementById("refreshBtn");
 const loadProjectBtn = document.getElementById("loadProjectBtn");
 const themeToggle = document.getElementById("themeToggle");
@@ -14,6 +22,9 @@ const queryResultsTable = document.getElementById("queryResultsTable");
 const queryResultsJson = document.getElementById("queryResultsJson");
 const queryResultsStats = document.getElementById("queryResultsStats");
 const resultTabs = document.getElementById("resultTabs");
+const tableDetailsTabs = document.getElementById("tableDetailsTabs");
+const jobsHistoryTabs = document.getElementById("jobsHistoryTabs");
+const jobsHistoryHint = document.getElementById("jobsHistoryHint");
 const refreshJobBtn = document.getElementById("refreshJobBtn");
 const cancelJobBtn = document.getElementById("cancelJobBtn");
 const selectedJobHint = document.getElementById("selectedJobHint");
@@ -34,6 +45,23 @@ const emulatorTarget = document.getElementById("emulatorTarget");
 const explorerTree = document.getElementById("explorerTree");
 const explorerSearchInput = document.getElementById("explorerSearchInput");
 const clearExplorerSearchBtn = document.getElementById("clearExplorerSearchBtn");
+const breadcrumbDatasetChip = document.getElementById("breadcrumbDatasetChip");
+const breadcrumbTableChip = document.getElementById("breadcrumbTableChip");
+const tableDetailsMeta = document.getElementById("tableDetailsMeta");
+const tableInfoName = document.getElementById("tableInfoName");
+const tableInfoDescription = document.getElementById("tableInfoDescription");
+const tableInfoETag = document.getElementById("tableInfoETag");
+const tableInfoCreated = document.getElementById("tableInfoCreated");
+const tableInfoUpdated = document.getElementById("tableInfoUpdated");
+const tableInfoLabels = document.getElementById("tableInfoLabels");
+const tableSchemaList = document.getElementById("tableSchemaList");
+const tablePreviewMeta = document.getElementById("tablePreviewMeta");
+const tablePreviewTable = document.getElementById("tablePreviewTable");
+const tableDetailsJson = document.getElementById("tableDetailsJson");
+const queryTableBtn = document.getElementById("queryTableBtn");
+const copyTableBtn = document.getElementById("copyTableBtn");
+const deleteTableBtn = document.getElementById("deleteTableBtn");
+const tableActionStatus = document.getElementById("tableActionStatus");
 const jobsList = document.getElementById("jobsList");
 const capabilitiesJson = document.getElementById("capabilitiesJson");
 const savedQueriesList = document.getElementById("savedQueriesList");
@@ -51,6 +79,7 @@ let lastJobsCount = 0;
 let explorerFilterText = "";
 let explorerDatasetsCache = [];
 let explorerTablesCache = new Map();
+let explorerCollapsedDatasets = new Set();
 
 const savedQueriesStorageKey = "locaql.savedQueries";
 const themeStorageKey = "locaql.theme";
@@ -81,6 +110,77 @@ function renderList(target, items, formatter) {
 
 function getProjectId() {
   return projectInput.value.trim() || "p1";
+}
+
+function formatEpochMillis(value) {
+  const ms = Number(value || 0);
+  if (!Number.isFinite(ms) || ms <= 0) {
+    return "-";
+  }
+  return new Date(ms).toLocaleString();
+}
+
+function updateProjectChip() {
+  if (projectSelectorBtn) {
+    projectSelectorBtn.textContent = getProjectId();
+  }
+}
+
+function hasSelectedTable() {
+  return Boolean(selectedDatasetId && selectedTableId);
+}
+
+function updateTableActionState(statusText) {
+  const enabled = hasSelectedTable();
+  if (queryTableBtn) queryTableBtn.disabled = !enabled;
+  if (copyTableBtn) copyTableBtn.disabled = !enabled;
+  if (deleteTableBtn) deleteTableBtn.disabled = !enabled;
+  if (tableActionStatus) {
+    if (statusText) {
+      tableActionStatus.textContent = statusText;
+    } else {
+      tableActionStatus.textContent = enabled
+        ? `${selectedDatasetId}.${selectedTableId} selected`
+        : "select a table to enable actions";
+    }
+  }
+}
+
+async function selectTable(projectId, datasetId, tableId) {
+  selectedDatasetId = datasetId;
+  selectedTableId = tableId;
+  if (breadcrumbDatasetChip) {
+    breadcrumbDatasetChip.textContent = datasetId;
+  }
+  if (breadcrumbTableChip) {
+    breadcrumbTableChip.textContent = tableId || "Table";
+  }
+  await renderExplorerTree(projectId);
+  await Promise.all([
+    loadTablePreview(projectId, datasetId, tableId),
+    loadTableDetails(projectId, datasetId, tableId),
+  ]);
+  updateTableActionState();
+}
+
+function inferValueType(value) {
+  const raw = String(value ?? "").trim();
+  if (raw === "" || raw.toLowerCase() === "null") return "STRING";
+  if (/^(true|false)$/i.test(raw)) return "BOOL";
+  if (/^-?\d+$/.test(raw)) return "INT64";
+  if (/^-?\d+\.\d+$/.test(raw)) return "FLOAT64";
+  if (!Number.isNaN(Date.parse(raw)) && /\d{4}-\d{2}-\d{2}/.test(raw)) return "TIMESTAMP";
+  return "STRING";
+}
+
+function inferColumnType(values) {
+  const types = new Set(values.map(inferValueType));
+  if (types.size === 1) {
+    return Array.from(types)[0];
+  }
+  if (types.has("STRING")) return "STRING";
+  if (types.has("FLOAT64") && types.has("INT64")) return "FLOAT64";
+  return "STRING";
 }
 
 function normalizeSavedQuery(item) {
@@ -312,10 +412,11 @@ async function renderExplorerTree(projectId) {
   explorerTree.innerHTML = "";
   const searchTerm = explorerFilterText.trim().toLowerCase();
   const projectMatches = searchTerm ? matchExplorerFilter(projectId, searchTerm) : true;
+  const allTablesCount = Array.from(explorerTablesCache.values()).reduce((sum, tables) => sum + tables.length, 0);
 
   const projectNode = document.createElement("div");
   projectNode.className = "node project";
-  projectNode.textContent = `Project: ${projectId}`;
+  projectNode.textContent = `Project: ${projectId} • ${explorerDatasetsCache.length} datasets • ${allTablesCount} tables`;
   explorerTree.appendChild(projectNode);
 
   let visibleNodes = 0;
@@ -339,14 +440,60 @@ async function renderExplorerTree(projectId) {
       continue;
     }
 
-    const datasetNode = document.createElement("div");
-    datasetNode.className = "node dataset";
-    datasetNode.textContent = `Dataset: ${datasetId}`;
-    explorerTree.appendChild(datasetNode);
+    const datasetSection = document.createElement("div");
+    datasetSection.className = "dataset-section";
+
+    const datasetHeader = document.createElement("button");
+    datasetHeader.type = "button";
+    datasetHeader.className = "node dataset dataset-header";
+    datasetHeader.setAttribute("aria-expanded", explorerCollapsedDatasets.has(datasetId) ? "false" : "true");
+
+    const datasetTitle = document.createElement("span");
+    datasetTitle.className = "dataset-title";
+    datasetTitle.textContent = `Dataset: ${datasetId}`;
+
+    const datasetMeta = document.createElement("span");
+    datasetMeta.className = "dataset-meta";
+    datasetMeta.textContent = `${filteredTables.length}/${tables.length} tables`;
+
+    datasetHeader.appendChild(datasetTitle);
+    datasetHeader.appendChild(datasetMeta);
+
+    if (datasetId === selectedDatasetId && !selectedTableId) {
+      datasetHeader.classList.add("active");
+    }
+
+    datasetHeader.addEventListener("click", async () => {
+      if (explorerCollapsedDatasets.has(datasetId)) {
+        explorerCollapsedDatasets.delete(datasetId);
+      } else {
+        explorerCollapsedDatasets.add(datasetId);
+      }
+      await renderExplorerTree(projectId);
+    });
+
+    datasetSection.appendChild(datasetHeader);
     visibleNodes++;
 
     if (!datasetId) {
       continue;
+    }
+
+    if (datasetId === selectedDatasetId && breadcrumbDatasetChip) {
+      breadcrumbDatasetChip.textContent = datasetId;
+    }
+
+    const tableGroup = document.createElement("div");
+    tableGroup.className = "dataset-tables";
+    if (explorerCollapsedDatasets.has(datasetId)) {
+      tableGroup.classList.add("collapsed");
+    }
+
+    const datasetShouldAutoOpen = searchTerm && filteredTables.length > 0;
+    if (datasetShouldAutoOpen) {
+      explorerCollapsedDatasets.delete(datasetId);
+      tableGroup.classList.remove("collapsed");
+      datasetHeader.setAttribute("aria-expanded", "true");
     }
 
     for (const t of filteredTables) {
@@ -357,16 +504,18 @@ async function renderExplorerTree(projectId) {
       if (datasetId === selectedDatasetId && tableId === selectedTableId) {
         tableNode.classList.add("active");
       }
-      tableNode.textContent = `Table: ${tableId}`;
+      tableNode.textContent = tableId;
+
       tableNode.addEventListener("click", async () => {
-        selectedDatasetId = datasetId;
-        selectedTableId = tableId;
-        await renderExplorerTree(projectId);
-        await loadTablePreview(projectId, datasetId, tableId);
+        await selectTable(projectId, datasetId, tableId);
       });
-      explorerTree.appendChild(tableNode);
+
+      tableGroup.appendChild(tableNode);
       visibleNodes++;
     }
+
+    datasetSection.appendChild(tableGroup);
+    explorerTree.appendChild(datasetSection);
   }
 
   if (visibleNodes === 0) {
@@ -377,8 +526,232 @@ async function renderExplorerTree(projectId) {
   }
 }
 
+function renderTableData(target, columns, rows) {
+  target.innerHTML = "";
+  if (!columns.length) {
+    columns = ["result"];
+  }
+
+  const thead = document.createElement("thead");
+  const headRow = document.createElement("tr");
+  for (const col of columns) {
+    const th = document.createElement("th");
+    th.textContent = col;
+    headRow.appendChild(th);
+  }
+  thead.appendChild(headRow);
+
+  const tbody = document.createElement("tbody");
+  if (!rows.length) {
+    const tr = document.createElement("tr");
+    const td = document.createElement("td");
+    td.colSpan = columns.length;
+    td.textContent = "No rows";
+    tr.appendChild(td);
+    tbody.appendChild(tr);
+  } else {
+    for (const row of rows) {
+      const tr = document.createElement("tr");
+      for (const value of row) {
+        const td = document.createElement("td");
+        td.textContent = value;
+        tr.appendChild(td);
+      }
+      tbody.appendChild(tr);
+    }
+  }
+
+  target.appendChild(thead);
+  target.appendChild(tbody);
+}
+
+async function loadTableDetails(projectId, datasetId, tableId) {
+  try {
+    const [tableMeta, preview] = await Promise.all([
+      fetchJson(`/api/bigquery/v2/projects/${encodeURIComponent(projectId)}/datasets/${encodeURIComponent(datasetId)}/tables/${encodeURIComponent(tableId)}`),
+      fetchJson(`/api/bigquery/v2/projects/${encodeURIComponent(projectId)}/tabledata/${encodeURIComponent(datasetId)}/${encodeURIComponent(tableId)}/data?maxResults=15`),
+    ]);
+
+    tableDetailsMeta.textContent = `${projectId}:${datasetId}.${tableId}`;
+    tableInfoName.textContent = tableMeta.id || `${projectId}:${datasetId}.${tableId}`;
+    tableInfoDescription.textContent = tableMeta.description || "No description";
+    tableInfoETag.textContent = tableMeta.etag || "-";
+    tableInfoCreated.textContent = formatEpochMillis(tableMeta.creationTime);
+    tableInfoUpdated.textContent = formatEpochMillis(tableMeta.lastModifiedTime);
+    tableInfoLabels.textContent = JSON.stringify(tableMeta.labels || {}, null, 2);
+    tableDetailsJson.textContent = JSON.stringify(tableMeta, null, 2);
+
+    const schemaFields = (((tableMeta.schema || {}).fields) || []).map((f) => ({
+      name: f.name || "field",
+      type: f.type || "STRING",
+      mode: f.mode || "NULLABLE",
+      description: f.description || "",
+    }));
+
+    const rows = (preview.rows || []).map((r) => (r.f || []).map((cell) => String(cell.v ?? "")));
+    const inferredColumns = rows.length > 0 ? rows[0].map((_, idx) => `col_${idx + 1}`) : [];
+    const schemaColumns = schemaFields.map((f) => f.name);
+    const columns = schemaColumns.length ? schemaColumns : inferredColumns;
+
+    tableSchemaList.innerHTML = "";
+    if (!columns.length) {
+      const li = document.createElement("li");
+      li.className = "schema-item";
+      li.textContent = "No schema available from emulator for this table.";
+      tableSchemaList.appendChild(li);
+    } else {
+      const resolvedSchema = schemaFields.length
+        ? schemaFields
+        : columns.map((name, idx) => {
+          const values = rows.map((r) => r[idx]);
+          return { name, type: inferColumnType(values), mode: "NULLABLE", description: "Inferred from preview" };
+        });
+
+      for (const field of resolvedSchema) {
+        const li = document.createElement("li");
+        li.className = "schema-item";
+
+        const head = document.createElement("div");
+        head.className = "schema-item-head";
+
+        const name = document.createElement("span");
+        name.className = "schema-name";
+        name.textContent = field.name;
+
+        const type = document.createElement("span");
+        type.className = "schema-type";
+        type.textContent = `${field.type} · ${field.mode}`;
+
+        head.appendChild(name);
+        head.appendChild(type);
+        li.appendChild(head);
+
+        if (field.description) {
+          const desc = document.createElement("p");
+          desc.className = "meta-text";
+          desc.textContent = field.description;
+          li.appendChild(desc);
+        }
+
+        tableSchemaList.appendChild(li);
+      }
+    }
+
+    renderTableData(tablePreviewTable, columns, rows);
+    tablePreviewMeta.textContent = `preview rows: ${rows.length}`;
+    updateTableActionState();
+  } catch (err) {
+    tableDetailsMeta.textContent = "table details unavailable";
+    tableInfoName.textContent = "-";
+    tableInfoDescription.textContent = "-";
+    tableInfoETag.textContent = "-";
+    tableInfoCreated.textContent = "-";
+    tableInfoUpdated.textContent = "-";
+    tableInfoLabels.textContent = "{}";
+    tableSchemaList.innerHTML = "";
+    const li = document.createElement("li");
+    li.className = "schema-item";
+    li.textContent = err.message;
+    tableSchemaList.appendChild(li);
+    renderTableData(tablePreviewTable, ["error"], [[err.message]]);
+    tablePreviewMeta.textContent = "preview unavailable";
+    tableDetailsJson.textContent = JSON.stringify({ error: err.message }, null, 2);
+    updateTableActionState("table details unavailable");
+  }
+}
+
+async function querySelectedTable() {
+  if (!hasSelectedTable()) {
+    return;
+  }
+  const projectId = getProjectId();
+  queryText.value = `SELECT *\nFROM \`${projectId}.${selectedDatasetId}.${selectedTableId}\`\nLIMIT 100;`;
+  setActiveMainTab("query-workspace");
+  queryRunStatus.textContent = `query drafted for ${selectedDatasetId}.${selectedTableId}`;
+}
+
+async function copySelectedTable() {
+  if (!hasSelectedTable()) {
+    return;
+  }
+  const projectId = getProjectId();
+  const destDataset = window.prompt("Destination dataset ID", selectedDatasetId);
+  if (!destDataset) {
+    return;
+  }
+  const defaultTarget = `${selectedTableId}_copy`;
+  const destTable = window.prompt("Destination table ID", defaultTarget);
+  if (!destTable) {
+    return;
+  }
+
+  try {
+    const payload = {
+      configuration: {
+        copy: {
+          sourceTable: {
+            projectId,
+            datasetId: selectedDatasetId,
+            tableId: selectedTableId,
+          },
+          destinationTable: {
+            projectId,
+            datasetId: destDataset,
+            tableId: destTable,
+          },
+          writeDisposition: "WRITE_EMPTY",
+        },
+      },
+    };
+
+    const created = await fetchJson(`/api/bigquery/v2/projects/${encodeURIComponent(projectId)}/jobs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const ref = created.jobReference || created.job?.jobReference || {};
+    const jobId = ref.jobId || "unknown";
+    updateTableActionState(`copy job submitted: ${jobId}`);
+    setActiveMainTab("jobs-explorer");
+    await loadJobs(projectId);
+  } catch (err) {
+    updateTableActionState("copy failed");
+    alert(`Copy table failed: ${err.message}`);
+  }
+}
+
+async function deleteSelectedTable() {
+  if (!hasSelectedTable()) {
+    return;
+  }
+  const projectId = getProjectId();
+  const full = `${selectedDatasetId}.${selectedTableId}`;
+  const ok = window.confirm(`Delete table ${full}?`);
+  if (!ok) {
+    return;
+  }
+
+  try {
+    await fetchJson(`/api/bigquery/v2/projects/${encodeURIComponent(projectId)}/datasets/${encodeURIComponent(selectedDatasetId)}/tables/${encodeURIComponent(selectedTableId)}`, {
+      method: "DELETE",
+    });
+    updateTableActionState(`table deleted: ${full}`);
+    selectedTableId = "";
+    await refreshAll();
+  } catch (err) {
+    updateTableActionState("delete failed");
+    alert(`Delete table failed: ${err.message}`);
+  }
+}
+
 async function loadTablePreview(projectId, datasetId, tableId) {
   try {
+    if (breadcrumbDatasetChip) {
+      breadcrumbDatasetChip.textContent = datasetId;
+    }
+    if (breadcrumbTableChip) {
+      breadcrumbTableChip.textContent = tableId;
+    }
     const res = await fetchJson(`/api/bigquery/v2/projects/${encodeURIComponent(projectId)}/tabledata/${encodeURIComponent(datasetId)}/${encodeURIComponent(tableId)}/data?maxResults=25`);
     const rows = (res.rows || []).map((r) => (r.f || []).map((cell) => String(cell.v ?? "")));
     const cols = rows.length > 0 ? rows[0].map((_, idx) => `col_${idx + 1}`) : ["empty"];
@@ -467,42 +840,7 @@ async function loadJobDetails(projectId, jobId) {
 }
 
 function renderResultsGrid(columns, rows) {
-  queryResultsTable.innerHTML = "";
-  if (!columns.length) {
-    columns = ["result"];
-  }
-
-  const thead = document.createElement("thead");
-  const headRow = document.createElement("tr");
-  for (const col of columns) {
-    const th = document.createElement("th");
-    th.textContent = col;
-    headRow.appendChild(th);
-  }
-  thead.appendChild(headRow);
-
-  const tbody = document.createElement("tbody");
-  if (!rows.length) {
-    const tr = document.createElement("tr");
-    const td = document.createElement("td");
-    td.colSpan = columns.length;
-    td.textContent = "No rows";
-    tr.appendChild(td);
-    tbody.appendChild(tr);
-  } else {
-    for (const row of rows) {
-      const tr = document.createElement("tr");
-      for (const value of row) {
-        const td = document.createElement("td");
-        td.textContent = value;
-        tr.appendChild(td);
-      }
-      tbody.appendChild(tr);
-    }
-  }
-
-  queryResultsTable.appendChild(thead);
-  queryResultsTable.appendChild(tbody);
+  renderTableData(queryResultsTable, columns, rows);
 }
 
 async function loadQueryResults(projectId, jobId) {
@@ -701,6 +1039,7 @@ queryText.addEventListener("keydown", async (event) => {
 
 async function refreshAll() {
   const projectId = getProjectId();
+  updateProjectChip();
   try {
     await Promise.all([
       loadConfig(),
@@ -713,6 +1052,12 @@ async function refreshAll() {
       loadJobDetails(projectId, selectedJobId),
       loadQueryResults(projectId, selectedJobId),
     ]);
+    if (selectedDatasetId && selectedTableId) {
+      await Promise.all([
+        loadTablePreview(projectId, selectedDatasetId, selectedTableId),
+        loadTableDetails(projectId, selectedDatasetId, selectedTableId),
+      ]);
+    }
   } catch (err) {
     healthStatus.textContent = "error";
     healthStatus.className = "metric status-warn";
@@ -721,10 +1066,127 @@ async function refreshAll() {
   }
 }
 
+function setActiveMainTab(targetId) {
+  if (!mainTabs) {
+    return;
+  }
+  const tab = mainTabs.querySelector(`.tab[data-target="${targetId}"]`);
+  if (!tab) {
+    return;
+  }
+
+  mainTabs.querySelectorAll(".tab").forEach((t) => t.classList.remove("active"));
+  tab.classList.add("active");
+
+  ["query-workspace", "query-results-panel", "table-details-panel", "jobs-explorer", "details-section", "capabilities-view"].forEach((id) => {
+    const section = document.getElementById(id);
+    if (!section) {
+      return;
+    }
+
+    let show = false;
+    if (id === targetId) show = true;
+    if (targetId === "query-workspace" && (id === "query-results-panel" || id === "table-details-panel")) show = true;
+    if (targetId === "jobs-explorer" && id === "details-section") show = true;
+
+    section.style.display = show ? "block" : "none";
+  });
+}
+
+function setActiveRail(nav) {
+  railIcons.forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.nav === nav);
+  });
+}
+
 function resetJobsPaging() {
   jobsPageToken = "";
   jobsNextPageToken = "";
   jobsPageHistory = [];
+}
+
+if (navCollapseBtn) {
+  navCollapseBtn.addEventListener("click", () => {
+    document.body.classList.toggle("nav-collapsed");
+  });
+}
+
+if (projectSelectorBtn && projectInput) {
+  projectSelectorBtn.addEventListener("click", () => {
+    projectInput.focus();
+    projectInput.select();
+  });
+}
+
+if (appbarSearchBtn) {
+  appbarSearchBtn.addEventListener("click", () => {
+    globalSearchInput.focus();
+    setActiveRail("search");
+  });
+}
+
+if (appbarStarredBtn) {
+  appbarStarredBtn.addEventListener("click", () => {
+    savedQueryName.focus();
+    queryRunStatus.textContent = "saved queries panel ready";
+  });
+}
+
+if (appbarThemeBtn) {
+  appbarThemeBtn.addEventListener("click", () => {
+    const next = currentTheme() === "dark" ? "light" : "dark";
+    applyTheme(next);
+  });
+}
+
+if (appbarMoreBtn) {
+  appbarMoreBtn.addEventListener("click", () => {
+    setActiveMainTab("capabilities-view");
+    setActiveRail("studio");
+  });
+}
+
+for (const btn of railIcons) {
+  btn.addEventListener("click", async () => {
+    const nav = btn.dataset.nav || "studio";
+    setActiveRail(nav);
+
+    if (nav === "studio") {
+      setActiveMainTab("query-workspace");
+      return;
+    }
+    if (nav === "search") {
+      setActiveMainTab("query-workspace");
+      globalSearchInput.focus();
+      return;
+    }
+    if (nav === "jobs") {
+      setActiveMainTab("jobs-explorer");
+      await loadJobs(getProjectId());
+      return;
+    }
+    if (nav === "history") {
+      allUsersToggle.checked = true;
+      setActiveMainTab("jobs-explorer");
+      await loadJobs(getProjectId());
+      return;
+    }
+    if (nav === "settings") {
+      const next = currentTheme() === "dark" ? "light" : "dark";
+      applyTheme(next);
+    }
+  });
+}
+
+if (globalSearchInput) {
+  globalSearchInput.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      explorerSearchInput.value = globalSearchInput.value;
+      explorerFilterText = globalSearchInput.value || "";
+      renderExplorerTree(getProjectId());
+    }
+  });
 }
 
 refreshBtn.addEventListener("click", refreshAll);
@@ -865,31 +1327,12 @@ if (mainTabs) {
   mainTabs.addEventListener("click", (e) => {
     const tab = e.target.closest(".tab");
     if (!tab) return;
-
-    // Update active tab UI
-    mainTabs.querySelectorAll(".tab").forEach((t) => t.classList.remove("active"));
-    tab.classList.add("active");
-
-    // Hide all sections and show targeted one
     const targetId = tab.getAttribute("data-target");
-    ["query-workspace", "query-results-panel", "jobs-explorer", "details-section", "capabilities-view"].forEach((id) => {
-      const section = document.getElementById(id);
-      if (!section) return;
-      
-      let show = false;
-      if (id === targetId) show = true;
-      if (targetId === "query-workspace" && id === "query-results-panel") show = true;
-      if (targetId === "jobs-explorer" && id === "details-section") show = true;
-
-      section.style.display = show ? "block" : "none";
-    });
+    setActiveMainTab(targetId);
   });
 
   // Default view
-  ["jobs-explorer", "details-section", "capabilities-view"].forEach(id => {
-    const el = document.getElementById(id);
-    if (el) el.style.display = "none";
-  });
+  setActiveMainTab("query-workspace");
 }
 
 if (resultTabs) {
@@ -910,6 +1353,59 @@ if (resultTabs) {
   });
 }
 
+if (tableDetailsTabs) {
+  tableDetailsTabs.addEventListener("click", (e) => {
+    const tab = e.target.closest(".tab");
+    if (!tab) return;
+
+    tableDetailsTabs.querySelectorAll(".tab").forEach((t) => t.classList.remove("active"));
+    tab.classList.add("active");
+
+    const targetId = tab.getAttribute("data-target");
+    ["table-overview-view", "table-schema-view", "table-preview-view", "table-json-view"].forEach((id) => {
+      const el = document.getElementById(id);
+      if (el) {
+        el.style.display = id === targetId ? "block" : "none";
+      }
+    });
+  });
+}
+
+if (jobsHistoryTabs) {
+  jobsHistoryTabs.addEventListener("click", async (e) => {
+    const tab = e.target.closest(".tab");
+    if (!tab) return;
+
+    jobsHistoryTabs.querySelectorAll(".tab").forEach((t) => t.classList.remove("active"));
+    tab.classList.add("active");
+
+    const target = tab.getAttribute("data-target");
+    const projectHistory = target === "project-history";
+    allUsersToggle.checked = projectHistory;
+    jobsStateFilter.value = projectHistory ? "" : jobsStateFilter.value;
+    if (jobsHistoryHint) {
+      jobsHistoryHint.textContent = projectHistory
+        ? "Scope: all users in current project"
+        : "Scope: personal jobs in current project";
+    }
+    resetJobsPaging();
+    await loadJobs(getProjectId());
+    await loadJobDetails(getProjectId(), selectedJobId);
+  });
+}
+
+if (queryTableBtn) {
+  queryTableBtn.addEventListener("click", querySelectedTable);
+}
+
+if (copyTableBtn) {
+  copyTableBtn.addEventListener("click", copySelectedTable);
+}
+
+if (deleteTableBtn) {
+  deleteTableBtn.addEventListener("click", deleteSelectedTable);
+}
+
 updateSelectedJobHint();
 jobDetailsJson.textContent = "{}";
 jobsPrevBtn.disabled = true;
@@ -917,6 +1413,11 @@ jobsNextBtn.disabled = true;
 jobsPageHint.textContent = "page: start";
 const initialTheme = localStorage.getItem(themeStorageKey) || "light";
 applyTheme(initialTheme);
+updateProjectChip();
+updateTableActionState();
+if (jobsHistoryHint) {
+  jobsHistoryHint.textContent = "Scope: personal jobs in current project";
+}
 loadQueryFromURL();
 renderSavedQueries();
 refreshAll();
