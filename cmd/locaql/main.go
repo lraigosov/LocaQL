@@ -1,17 +1,20 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/lraigosov/LocaQL/internal/capabilities"
 	"github.com/lraigosov/LocaQL/internal/conformance"
 	"github.com/lraigosov/LocaQL/internal/server"
+	"github.com/lraigosov/LocaQL/internal/workspace"
 )
 
 func main() {
@@ -33,10 +36,217 @@ func main() {
 		if err := runConformance(os.Args[2:]); err != nil {
 			log.Fatal(err)
 		}
+	case "workspace":
+		if err := runWorkspace(os.Args[2:]); err != nil {
+			log.Fatal(err)
+		}
 	default:
 		printUsage()
 		os.Exit(2)
 	}
+}
+
+func runWorkspace(args []string) error {
+	if len(args) == 0 {
+		return errors.New("workspace subcommand is required (supported: validate, plan, diff, apply)")
+	}
+
+	switch args[0] {
+	case "validate":
+		return runWorkspaceValidate(args[1:])
+	case "plan":
+		return runWorkspacePlan(args[1:])
+	case "diff":
+		return runWorkspaceDiff(args[1:])
+	case "apply":
+		return runWorkspaceApply(args[1:])
+	default:
+		return fmt.Errorf("unsupported workspace subcommand: %s", args[0])
+	}
+}
+
+func runWorkspacePlan(args []string) error {
+	fs := flag.NewFlagSet("workspace plan", flag.ContinueOnError)
+	path := fs.String("path", ".", "workspace root path")
+	jsonOutput := fs.Bool("json", false, "print plan as json")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	plan, err := workspace.BuildPlan(*path)
+	if err != nil {
+		return err
+	}
+
+	if *jsonOutput {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(plan)
+	}
+
+	fmt.Printf("Workspace: %s\n", plan.Validation.Root)
+	fmt.Printf("Valid: %t\n", plan.Validation.IsValid())
+	fmt.Printf("Files tracked: %d\n", len(plan.Files))
+	fmt.Printf("Required missing: %d\n", len(plan.Validation.MissingRequired))
+	if len(plan.Validation.MissingRequired) > 0 {
+		fmt.Printf("Missing required: %s\n", strings.Join(plan.Validation.MissingRequired, ", "))
+	}
+	if len(plan.Validation.MissingRecommended) > 0 {
+		fmt.Printf("Missing recommended: %s\n", strings.Join(plan.Validation.MissingRecommended, ", "))
+	}
+	if !plan.Validation.IsValid() {
+		return errors.New("workspace planning failed: required structure is incomplete")
+	}
+	return nil
+}
+
+func runWorkspaceDiff(args []string) error {
+	fs := flag.NewFlagSet("workspace diff", flag.ContinueOnError)
+	source := fs.String("source", ".", "source workspace root")
+	target := fs.String("target", "", "target workspace root")
+	jsonOutput := fs.Bool("json", false, "print diff as json")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if strings.TrimSpace(*target) == "" {
+		return errors.New("target is required")
+	}
+
+	diffRes, err := workspace.Diff(*source, *target)
+	if err != nil {
+		return err
+	}
+
+	if *jsonOutput {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(diffRes)
+	}
+
+	fmt.Printf("Source: %s\n", diffRes.SourceRoot)
+	fmt.Printf("Target: %s\n", diffRes.TargetRoot)
+	fmt.Printf("Only in source: %d\n", len(diffRes.OnlyInSource))
+	fmt.Printf("Only in target: %d\n", len(diffRes.OnlyInTarget))
+	fmt.Printf("Changed: %d\n", len(diffRes.Changed))
+	return nil
+}
+
+func runWorkspaceApply(args []string) error {
+	fs := flag.NewFlagSet("workspace apply", flag.ContinueOnError)
+	source := fs.String("source", ".", "source workspace root")
+	target := fs.String("target", "", "target workspace root")
+	dryRun := fs.Bool("dry-run", true, "show actions without mutating target")
+	deleteMissing := fs.Bool("delete-missing", false, "delete target files that are not present in source")
+	confirmDelete := fs.String("confirm-delete", "", "required value DELETE when using --delete-missing with mutating apply")
+	manifestOut := fs.String("manifest-out", "", "optional path to write apply result as json")
+	jsonOutput := fs.Bool("json", false, "print apply result as json")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if strings.TrimSpace(*target) == "" {
+		return errors.New("target is required")
+	}
+	if !*dryRun && *deleteMissing && strings.TrimSpace(*confirmDelete) != "DELETE" {
+		return errors.New("delete-missing requires --confirm-delete=DELETE for mutating apply")
+	}
+
+	opts := workspace.ApplyOptions{DeleteMissing: *deleteMissing}
+	if *dryRun {
+		applyRes, err := workspace.BuildApplyDryRunWithOptions(*source, *target, opts)
+		if err != nil {
+			return err
+		}
+		result := workspace.ApplyResult{
+			SourceRoot: applyRes.SourceRoot,
+			TargetRoot: applyRes.TargetRoot,
+			Applied:    false,
+			Actions:    applyRes.Actions,
+		}
+		if err := emitWorkspaceApplyResult(result, *jsonOutput, *manifestOut); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	result, err := workspace.Apply(*source, *target, opts)
+	if err != nil {
+		return err
+	}
+	return emitWorkspaceApplyResult(result, *jsonOutput, *manifestOut)
+}
+
+func emitWorkspaceApplyResult(result workspace.ApplyResult, jsonOutput bool, manifestOut string) error {
+	if jsonOutput {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(result); err != nil {
+			return err
+		}
+	} else {
+		fmt.Printf("Source: %s\n", result.SourceRoot)
+		fmt.Printf("Target: %s\n", result.TargetRoot)
+		fmt.Printf("Applied: %t\n", result.Applied)
+		fmt.Printf("Actions: %d\n", len(result.Actions))
+		for _, action := range result.Actions {
+			fmt.Printf("- %s %s\n", action.Action, action.Path)
+		}
+	}
+
+	if strings.TrimSpace(manifestOut) != "" {
+		abs, err := filepath.Abs(manifestOut)
+		if err != nil {
+			return err
+		}
+		if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+			return err
+		}
+		b, err := json.MarshalIndent(result, "", "  ")
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(abs, append(b, '\n'), 0o644); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func runWorkspaceValidate(args []string) error {
+	fs := flag.NewFlagSet("workspace validate", flag.ContinueOnError)
+	path := fs.String("path", ".", "workspace root path")
+	jsonOutput := fs.Bool("json", false, "print validation report as json")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	res, err := workspace.Validate(*path)
+	if err != nil {
+		return err
+	}
+
+	if *jsonOutput {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(res); err != nil {
+			return err
+		}
+	} else {
+		fmt.Printf("Workspace: %s\n", res.Root)
+		fmt.Printf("Required missing: %d\n", len(res.MissingRequired))
+		fmt.Printf("Recommended missing: %d\n", len(res.MissingRecommended))
+		if len(res.MissingRequired) > 0 {
+			fmt.Printf("Missing required: %s\n", strings.Join(res.MissingRequired, ", "))
+		}
+		if len(res.MissingRecommended) > 0 {
+			fmt.Printf("Missing recommended: %s\n", strings.Join(res.MissingRecommended, ", "))
+		}
+	}
+
+	if !res.IsValid() {
+		return errors.New("workspace validation failed")
+	}
+	return nil
 }
 
 func runStart(args []string) error {
@@ -118,4 +328,8 @@ func printUsage() {
 	fmt.Println("  locaql start [--addr :9050] [--capabilities capabilities/registry.yaml]")
 	fmt.Println("  locaql capabilities [--capabilities capabilities/registry.yaml]")
 	fmt.Println("  locaql conformance [--base-url http://localhost:9050] [--cases test/conformance/cases/foundation.yaml]")
+	fmt.Println("  locaql workspace validate [--path .] [--json]")
+	fmt.Println("  locaql workspace plan [--path .] [--json]")
+	fmt.Println("  locaql workspace diff [--source .] --target <path> [--json]")
+	fmt.Println("  locaql workspace apply [--source .] --target <path> [--dry-run=true] [--delete-missing=false] [--confirm-delete DELETE] [--manifest-out path] [--json]")
 }

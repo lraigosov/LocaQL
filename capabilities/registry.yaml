@@ -19,6 +19,12 @@ capabilities:
     fidelity: medium
     tests:
       - unit/server/datasets_delete
+  rest.datasets.patch:
+    status: partial
+    fidelity: medium
+    tests:
+      - unit/server/datasets_patch
+    reason: partial update for friendlyName, location and labels is supported
   rest.jobs.query:
     status: supported
     fidelity: high
@@ -34,6 +40,31 @@ capabilities:
     fidelity: medium
     tests:
       - conformance/pagination/rest_tables_list_pagination
+  rest.tables.get:
+    status: supported
+    fidelity: medium
+    tests:
+      - unit/server/tables_get
+  rest.tables.insert:
+    status: supported
+    fidelity: medium
+    tests:
+      - unit/server/tables_insert
+  rest.tables.delete:
+    status: supported
+    fidelity: medium
+    tests:
+      - unit/server/tables_delete
+  rest.tables.patch:
+    status: supported
+    fidelity: medium
+    tests:
+      - unit/server/tables_patch
+  rest.tables.update:
+    status: supported
+    fidelity: medium
+    tests:
+      - unit/server/tables_update
   rest.jobs.list.pagination:
     status: supported
     fidelity: medium
@@ -65,13 +96,20 @@ capabilities:
     fidelity: medium
     tests:
       - unit/server/jobs_request_id_idempotency
-    reason: requestId behavior implemented for jobs insert subset
+    reason: requestId behavior implemented for jobs.insert and queries endpoint with TTL-based replay window
   rest.jobs.executors.query_load_extract_copy:
     status: partial
     fidelity: medium
     tests:
       - unit/server/jobs_executor_type_and_statistics
-    reason: simulated executors implemented with synthetic statistics
+      - unit/server/jobs_copy_real_destination_data
+    reason: query and extract remain simulated; copy jobs materialize destination rows and load jobs now materialize destination table schema in the in-memory catalog
+  rest.jobs.errors.detailed:
+    status: supported
+    fidelity: medium
+    tests:
+      - unit/server/jobs_detailed_errors
+    reason: jobs support errorResult and secondary errors list for parity with BigQuery contract
   rest.jobs.persistence.restart:
     status: partial
     fidelity: medium
@@ -110,6 +148,18 @@ capabilities:
     fidelity: medium
     tests:
       - conformance/pagination/rest_tabledata_list_pagination
+  sql.information_schema.priority:
+    status: partial
+    fidelity: medium
+    tests:
+      - unit/server/information_schema_priority_tables_columns
+      - unit/server/information_schema_priority_jobs
+      - unit/server/information_schema_priority_partitions
+    reason: basic SCHEMATA, SCHEMATA_OPTIONS, TABLES, COLUMNS, JOBS, PARTITIONS, ROUTINES and MODELS query emulation is backed by the live in-memory catalog; broader semantic parity is still pending
+  console.ui.resource_forms.basic:
+    status: partial
+    fidelity: medium
+    reason: explorer supports validated dataset create/update/delete with labels, basic table creation, table metadata editing, table labels editing and a selected-dataset summary panel against emulator REST endpoints
   emulator.health:
     status: supported
     fidelity: high
@@ -132,3 +182,83 @@ capabilities:
       - unit/ui/proxy_rewrite
       - unit/ui/config_endpoint
     reason: standalone UI service proxies emulator APIs and adapts views using capabilities
+  console.ui.shortcuts:
+    status: partial
+    fidelity: medium
+    reason: keyboard shortcuts for run and save are available in SQL editor with local bindings
+  console.ui.explorer.search:
+    status: partial
+    fidelity: medium
+    reason: explorer supports local search by project, dataset and table names over cached resources
+  console.ui.saved_queries.versioning:
+    status: partial
+    fidelity: medium
+    reason: saved queries keep local version history per query name and allow navigating versions
+  console.ui.saved_queries.import_export:
+    status: partial
+    fidelity: medium
+    reason: saved queries can be exported and imported as JSON in local console
+  console.ui.saved_queries.share_link:
+    status: partial
+    fidelity: medium
+    reason: saved query text can be shared via local URL query parameter
+  console.ui.table_details.preview_schema_metadata:
+    status: partial
+    fidelity: medium
+    reason: selecting a table opens metadata, schema, preview rows, labels editor and raw JSON details backed by tables.get and tabledata.list
+  console.ui.navigation.menus_functional:
+    status: partial
+    fidelity: medium
+    reason: appbar and side navigation actions are wired to emulator-backed views for search, jobs, history and capabilities
+  console.ui.explorer.placeholders.routines_models:
+    status: partial
+    fidelity: low
+    reason: explorer renders explicit placeholders for routines and models to expose unsupported catalog categories without pretending backend parity
+  console.ui.table_actions.query_copy_delete:
+    status: partial
+    fidelity: medium
+    reason: table details panel provides query draft, copy job submission and delete table actions through emulator endpoints
+  console.ui.jobs.history_tabs:
+    status: partial
+    fidelity: medium
+    reason: jobs explorer supports explicit personal and project history tabs mapped to allUsers behavior
+  workspace.validate.structure:
+    status: supported
+    fidelity: medium
+    tests:
+      - unit/workspace/validate_required_structure
+      - unit/cli/workspace_validate
+    reason: CLI command `locaql workspace validate` checks required and recommended portable workspace layout
+  workspace.plan:
+    status: supported
+    fidelity: medium
+    tests:
+      - unit/workspace/build_plan
+      - unit/cli/workspace_plan
+    reason: CLI command `locaql workspace plan` produces deterministic workspace inventory from portable artifact roots
+  workspace.diff:
+    status: supported
+    fidelity: medium
+    tests:
+      - unit/workspace/diff_source_target
+      - unit/cli/workspace_diff
+    reason: CLI command `locaql workspace diff` compares source and target workspaces using file path, size and content hash
+  workspace.apply.dry_run:
+    status: supported
+    fidelity: medium
+    tests:
+      - unit/workspace/apply_dry_run_actions
+      - unit/cli/workspace_apply_dry_run
+    reason: CLI command `locaql workspace apply --dry-run=true` returns planned mkdir, copy, update and optional delete actions without mutating target
+  workspace.apply.mutate:
+    status: supported
+    fidelity: medium
+    tests:
+      - unit/workspace/apply_mutates_target
+      - unit/cli/workspace_apply_mutating
+      - unit/cli/workspace_apply_delete_confirmation
+    reason: CLI command `locaql workspace apply --dry-run=false` mutates target with guarded delete support (`--delete-missing` + `--confirm-delete=DELETE`) and optional manifest output
+  security.iam.policies:
+    status: unsupported
+    fidelity: none
+    reason: IAM and policy enforcement are cloud control-plane concerns and are intentionally out of emulator scope

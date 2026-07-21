@@ -25,7 +25,14 @@ type jobRecord struct {
 	JobID           string
 	ParentJobID     string
 	JobType         string
+	Priority        string // INTERACTIVE or BATCH
 	ResourceKey     string
+	SourceTables    []tableReference
+	LoadSchema      []tableField
+	TargetDataset   string
+	TargetTable     string
+	CreateDisposition string
+	WriteDisposition  string
 	State           jobState
 	RequestID       string
 	UserEmail       string
@@ -38,6 +45,13 @@ type jobRecord struct {
 	CancelRequested bool
 	ErrorReason     string
 	ErrorMessage    string
+	Errors          []jobError // Secondary errors
+}
+
+type jobError struct {
+	Reason   string `json:"reason"`
+	Message  string `json:"message"`
+	Location string `json:"location,omitempty"`
 }
 
 type jobStatistics struct {
@@ -60,6 +74,11 @@ type jobInsertOptions struct {
 	UserEmail     string
 	QueryText     string
 	JobType       string
+	Priority      string
+	SourceTables   []tableReference
+	LoadSchema      []tableField
+	CreateDisposition string
+	WriteDisposition  string
 	TargetDataset string
 	TargetTable   string
 	IsScript      bool
@@ -75,25 +94,27 @@ type jobListFilters struct {
 }
 
 type jobService struct {
-	mu              sync.RWMutex
-	jobsByProject   map[string]map[string]*jobRecord
-	requestIDIndex  map[string]map[string]requestIDRecord
-	projectVersions map[string]int
-	requestIDTTL    time.Duration
-	maxConcurrent   int
-	runSlots        chan struct{}
-	maxStorageWrite int
+	mu                sync.RWMutex
+	jobsByProject     map[string]map[string]*jobRecord
+	requestIDIndex    map[string]map[string]requestIDRecord
+	projectVersions   map[string]int
+	requestIDTTL      time.Duration
+	maxConcurrent     int
+	runSlots          chan struct{}
+	maxStorageWrite   int
 	storageWriteSlots chan struct{}
-	resourceSlots   map[string]chan struct{}
-	persistencePath string
-	counter         int64
+	resourceSlots     map[string]chan struct{}
+	persistencePath   string
+	copyExecutor      func(*jobRecord) (jobStatistics, error)
+	loadExecutor      func(*jobRecord) (jobStatistics, error)
+	counter           int64
 }
 
 type jobServiceSnapshot struct {
 	Counter         int64                                 `json:"counter"`
 	JobsByProject   map[string]map[string]*jobRecord      `json:"jobs_by_project"`
 	RequestIDIndex  map[string]map[string]requestIDRecord `json:"request_id_index"`
-	ProjectVersions map[string]int                         `json:"project_versions"`
+	ProjectVersions map[string]int                        `json:"project_versions"`
 }
 
 func newJobService() *jobService {
@@ -184,7 +205,14 @@ func (s *jobService) insert(opts jobInsertOptions) (*jobRecord, bool) {
 		JobID:       jobID,
 		ParentJobID: opts.ParentJobID,
 		JobType:     normalizeJobType(opts),
+		Priority:    normalizePriority(opts.Priority),
 		ResourceKey: buildResourceKey(opts),
+		SourceTables: cloneTableReferences(opts.SourceTables),
+		LoadSchema:   cloneTableFields(opts.LoadSchema),
+		TargetDataset: strings.TrimSpace(opts.TargetDataset),
+		TargetTable: strings.TrimSpace(opts.TargetTable),
+		CreateDisposition: normalizeCreateDisposition(opts.CreateDisposition),
+		WriteDisposition: normalizeWriteDisposition(opts.WriteDisposition),
 		State:       jobStatePending,
 		RequestID:   requestID,
 		UserEmail:   opts.UserEmail,
@@ -237,6 +265,19 @@ func (s *jobService) insertScriptWithChildren(opts jobInsertOptions) (*jobRecord
 }
 
 func (s *jobService) run(jobID, projectID string) {
+	s.mu.RLock()
+	jrForPriority := s.jobsByProject[projectID][jobID]
+	priority := ""
+	if jrForPriority != nil {
+		priority = jrForPriority.Priority
+	}
+	s.mu.RUnlock()
+
+	// Batch jobs wait a bit longer to simulate lower priority
+	if priority == "BATCH" {
+		time.Sleep(200 * time.Millisecond)
+	}
+
 	releaseSlot := func() {}
 	if s.runSlots != nil {
 		s.runSlots <- struct{}{}
@@ -295,6 +336,36 @@ func (s *jobService) run(jobID, projectID string) {
 	d := executorDuration(jr.JobType)
 	time.Sleep(d)
 
+	var copyStats jobStatistics
+	var copyErr error
+	if jobType == "copy" && s.copyExecutor != nil {
+		s.mu.Lock()
+		jr = s.jobsByProject[projectID][jobID]
+		if jr == nil {
+			s.mu.Unlock()
+			return
+		}
+		jobSnapshot := *jr
+		jobSnapshot.SourceTables = cloneTableReferences(jr.SourceTables)
+		s.mu.Unlock()
+		copyStats, copyErr = s.copyExecutor(&jobSnapshot)
+	}
+
+	var loadStats jobStatistics
+	var loadErr error
+	if jobType == "load" && s.loadExecutor != nil {
+		s.mu.Lock()
+		jr = s.jobsByProject[projectID][jobID]
+		if jr == nil {
+			s.mu.Unlock()
+			return
+		}
+		jobSnapshot := *jr
+		jobSnapshot.LoadSchema = cloneTableFields(jr.LoadSchema)
+		s.mu.Unlock()
+		loadStats, loadErr = s.loadExecutor(&jobSnapshot)
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	jr = s.jobsByProject[projectID][jobID]
@@ -310,7 +381,21 @@ func (s *jobService) run(jobID, projectID string) {
 		_ = s.persistLocked()
 		return
 	}
-	applyExecutorResult(jr)
+	if copyErr != nil {
+		jr.ErrorReason = "invalid"
+		jr.ErrorMessage = copyErr.Error()
+		jr.Errors = []jobError{{Reason: "invalid", Message: copyErr.Error(), Location: "configuration.copy"}}
+	} else if loadErr != nil {
+		jr.ErrorReason = "invalid"
+		jr.ErrorMessage = loadErr.Error()
+		jr.Errors = []jobError{{Reason: "invalid", Message: loadErr.Error(), Location: "configuration.load"}}
+	} else if jobType == "copy" && s.copyExecutor != nil {
+		jr.Statistics = copyStats
+	} else if jobType == "load" && s.loadExecutor != nil {
+		jr.Statistics = loadStats
+	} else {
+		applyExecutorResult(jr)
+	}
 	jr.State = jobStateDone
 	jr.EndedAt = time.Now().UTC()
 	s.projectVersions[projectID]++
@@ -503,6 +588,9 @@ func renderJobResource(j *jobRecord) map[string]any {
 			"message": j.ErrorMessage,
 		}
 	}
+	if len(j.Errors) > 0 {
+		status["errors"] = j.Errors
+	}
 
 	stats := map[string]any{
 		"totalSlotMs":    j.Statistics.TotalSlotMs,
@@ -514,7 +602,7 @@ func renderJobResource(j *jobRecord) map[string]any {
 		},
 	}
 
-	return map[string]any{
+	res := map[string]any{
 		"kind": "bigquery#job",
 		"id":   fmt.Sprintf("%s:%s", j.ProjectID, j.JobID),
 		"jobReference": map[string]string{
@@ -527,6 +615,25 @@ func renderJobResource(j *jobRecord) map[string]any {
 		"statistics":  stats,
 		"status":      status,
 	}
+
+	// For query jobs, include priority if set
+	if j.JobType == "query" || j.JobType == "script" {
+		res["configuration"] = map[string]any{
+			"query": map[string]any{
+				"priority": j.Priority,
+			},
+		}
+	}
+
+	return res
+}
+
+func normalizePriority(p string) string {
+	p = strings.ToUpper(strings.TrimSpace(p))
+	if p == "BATCH" {
+		return "BATCH"
+	}
+	return "INTERACTIVE"
 }
 
 func normalizeJobType(opts jobInsertOptions) string {
@@ -540,6 +647,15 @@ func normalizeJobType(opts jobInsertOptions) string {
 	default:
 		return "query"
 	}
+}
+
+func cloneTableReferences(refs []tableReference) []tableReference {
+	if len(refs) == 0 {
+		return nil
+	}
+	out := make([]tableReference, len(refs))
+	copy(out, refs)
+	return out
 }
 
 func newSimulatedStatistics(jobType string) jobStatistics {
@@ -562,6 +678,15 @@ func executorDuration(jobType string) time.Duration {
 }
 
 func applyExecutorResult(j *jobRecord) {
+	if strings.Contains(strings.ToUpper(j.QueryText), "FORCE_ERROR") {
+		j.ErrorReason = "invalid"
+		j.ErrorMessage = "Simulated forced error from query text"
+		j.Errors = []jobError{
+			{Reason: "invalid", Message: "Simulated forced error from query text", Location: "query"},
+			{Reason: "secondary", Message: "Additional error detail", Location: "execution"},
+		}
+		return
+	}
 	switch j.JobType {
 	case "load":
 		j.Statistics.TotalSlotMs = 75
