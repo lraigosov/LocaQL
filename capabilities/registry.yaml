@@ -71,7 +71,13 @@ capabilities:
     fidelity: medium
     tests:
       - unit/server/jobs_executor_type_and_statistics
-    reason: simulated executors implemented with synthetic statistics
+    reason: simulated executors implemented with synthetic statistics; support for BATCH vs INTERACTIVE priority simulation added
+  rest.jobs.errors.detailed:
+    status: supported
+    fidelity: medium
+    tests:
+      - unit/server/jobs_detailed_errors
+    reason: jobs support errorResult and secondary errors list for parity with BigQuery contract
   rest.jobs.persistence.restart:
     status: partial
     fidelity: medium

@@ -700,3 +700,58 @@ func TestJobServiceConcurrentReadsDuringWrites(t *testing.T) {
 		t.Fatalf("reader did not finish in time")
 	}
 }
+func TestJobPriorityAndErrors(t *testing.T) {
+	s := newTestServer()
+
+	// 1. Test BATCH priority simulation (ensure it completes)
+	batchBody := `{"configuration":{"query":{"query":"SELECT 1", "priority":"BATCH"}}}`
+	reqB := httptest.NewRequest(http.MethodPost, "/bigquery/v2/projects/p1/jobs", strings.NewReader(batchBody))
+	reqB.Header.Set("Content-Type", "application/json")
+	resB := httptest.NewRecorder()
+	s.Handler().ServeHTTP(resB, reqB)
+	if resB.Code != http.StatusCreated {
+		t.Fatalf("batch job creation failed: %d", resB.Code)
+	}
+	var outB map[string]any
+	json.NewDecoder(resB.Body).Decode(&outB)
+	conf := outB["configuration"].(map[string]any)
+	qConf := conf["query"].(map[string]any)
+	if qConf["priority"] != "BATCH" {
+		t.Fatalf("expected priority BATCH, got %v", qConf["priority"])
+	}
+
+	// 2. Test Detailed Errors via FORCE_ERROR
+	errBody := `{"configuration":{"query":{"query":"SELECT * FROM table FORCE_ERROR"}}}`
+	reqE := httptest.NewRequest(http.MethodPost, "/bigquery/v2/projects/p1/jobs", strings.NewReader(errBody))
+	reqE.Header.Set("Content-Type", "application/json")
+	resE := httptest.NewRecorder()
+	s.Handler().ServeHTTP(resE, reqE)
+	
+	var outE map[string]any
+	json.NewDecoder(resE.Body).Decode(&outE)
+	jobRef := outE["jobReference"].(map[string]any)
+	jobID := jobRef["jobId"].(string)
+
+	// Wait for job to finish with error
+	deadline := time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) {
+		getReq := httptest.NewRequest(http.MethodGet, "/bigquery/v2/projects/p1/jobs/"+jobID, nil)
+		getRes := httptest.NewRecorder()
+		s.Handler().ServeHTTP(getRes, getReq)
+		var got map[string]any
+		json.NewDecoder(getRes.Body).Decode(&got)
+		status := got["status"].(map[string]any)
+		if status["state"] == "DONE" {
+			if status["errorResult"] == nil {
+				t.Fatalf("expected errorResult for FORCE_ERROR query")
+			}
+			errs, ok := status["errors"].([]any)
+			if !ok || len(errs) < 1 {
+				t.Fatalf("expected at least 1 secondary error, got %v", errs)
+			}
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("job did not finish with error in time")
+}

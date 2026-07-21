@@ -314,6 +314,7 @@ func (s *Server) insertJob(w http.ResponseWriter, r *http.Request, projectID str
 	jobType := "query"
 	targetDataset := ""
 	targetTable := ""
+	priority := "INTERACTIVE"
 	if r.Body != nil {
 		body, _ := io.ReadAll(r.Body)
 		if len(body) > 0 {
@@ -330,6 +331,11 @@ func (s *Server) insertJob(w http.ResponseWriter, r *http.Request, projectID str
 			var raw map[string]any
 			if err := json.Unmarshal(body, &raw); err == nil {
 				if conf, ok := raw["configuration"].(map[string]any); ok {
+					if qCfg, ok := conf["query"].(map[string]any); ok {
+						if p, ok := qCfg["priority"].(string); ok {
+							priority = p
+						}
+					}
 					if loadRaw, ok := conf["load"]; ok {
 						jobType = "load"
 						if loadCfg, ok := loadRaw.(map[string]any); ok {
@@ -374,6 +380,7 @@ func (s *Server) insertJob(w http.ResponseWriter, r *http.Request, projectID str
 		UserEmail:     userEmail,
 		QueryText:     queryText,
 		JobType:       jobType,
+		Priority:      priority,
 		TargetDataset: targetDataset,
 		TargetTable:   targetTable,
 		IsScript:      isScript,
@@ -438,6 +445,7 @@ func (s *Server) handleJobsQuery(w http.ResponseWriter, r *http.Request, project
 		TimeoutMs  int    `json:"timeoutMs"`
 		DryRun     bool   `json:"dryRun"`
 		RequestId  string `json:"requestId"`
+		Priority   string `json:"priority"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 		writeError(w, http.StatusBadRequest, "Invalid request body", "invalid")
@@ -466,6 +474,7 @@ func (s *Server) handleJobsQuery(w http.ResponseWriter, r *http.Request, project
 		RequestID: payload.RequestId,
 		QueryText: payload.Query,
 		JobType:   "query",
+		Priority:  payload.Priority,
 	}
 
 	jr, created := s.jobs.insert(insertOpts)
