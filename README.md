@@ -9,6 +9,20 @@ This repository currently implements incremental scope from the master plan:
 - Simulated query/load/extract/copy executors with synthetic statistics.
 - Configurable worker limits and resource-level serialization for conflicting job mutations.
 
+## Table of Contents
+
+- [Requirements](#requirements)
+- [Quick Start (WSL)](#quick-start-wsl)
+- [Capability Registry](#capability-registry)
+- [Current Scope Matrix](#current-scope-matrix)
+- [Runtime Architecture](#runtime-architecture)
+- [Concurrency and Isolation Notes](#concurrency-and-isolation-notes)
+- [Job State Model](#job-state-model)
+- [Workspace Promotion Flow](#workspace-promotion-flow)
+- [Conformance Baseline](#conformance-baseline)
+- [Test](#test)
+- [LocaQL Console (Standalone UI)](#locaql-console-standalone-ui)
+
 ## Requirements
 
 - WSL distribution: `Ubuntu-24.04`
@@ -105,6 +119,22 @@ stateDiagram-v2
 	DONE --> [*]
 ```
 
+## Workspace Promotion Flow
+
+The `locaql workspace` subcommands move a portable workspace from validation to a promoted target without mutating anything until `apply` runs explicitly.
+
+```mermaid
+flowchart LR
+	Validate[workspace validate] --> Plan[workspace plan]
+	Plan --> Diff[workspace diff]
+	Diff --> DryRun["workspace apply --dry-run=true"]
+	DryRun --> Apply["workspace apply --dry-run=false"]
+	Apply --> Guard{"--delete-missing=true?"}
+	Guard -->|yes| Confirm["requires --confirm-delete=DELETE"]
+	Guard -->|no| Done[Target updated, deletes skipped]
+	Confirm --> Done
+```
+
 ## Conformance Baseline
 
 Run the foundation conformance suite and generate reports:
@@ -185,6 +215,18 @@ Open:
 
 - `http://localhost:9070`
 
+### Console Architecture
+
+The browser only ever talks to `locaql-ui`; the emulator is reached exclusively through the `/api` proxy, so the browser never opens a direct connection to `:9050`.
+
+```mermaid
+flowchart LR
+	Browser[Browser: LocaQL Studio] --> UIStatic[locaql-ui static app]
+	Browser --> UIConfig[locaql-ui /config endpoint]
+	Browser --> UIProxy[locaql-ui /api proxy]
+	UIProxy --> Emulator[LocaQL emulator REST API]
+```
+
 UI notes:
 
 - The UI is a separate service and does not access emulator internals directly.
@@ -194,7 +236,13 @@ UI notes:
 
 Current UI scope:
 
-- Health and capabilities dashboard.
-- Dataset listing and dataset create/update/delete management.
-- Query job submission from SQL input.
-- Job list with selection, detail refresh, and cancellation.
+- Studio-style layout with navigation, a resource Explorer, and a tabbed workspace (Query, Jobs, Capabilities).
+- Explorer with a hierarchical Project > Dataset > Table tree, local resource search, and capability-status badges (`SUPPORTED`, `PARTIAL`, `UNSUPPORTED`, `CONTEXT`) with a persisted filter and legend.
+- Explicit `Routines` and `Models` placeholders in the Explorer to expose catalog categories that are not backed by the emulator yet.
+- Dataset create/update/delete with labels editing, plus a selected-dataset summary panel (ID, friendly name, location, table count, labels) and quick actions to draft a dataset query, draft a table listing query, or copy the dataset ID.
+- Table creation and metadata patch (`friendlyName`, `description`, labels), with a table details panel offering Schema, Preview, and JSON tabs plus query, copy-job, and delete actions.
+- SQL editor with keyboard shortcuts (`Ctrl+Enter` to run, `Ctrl`/`Cmd+S` to save) and query submission as async jobs.
+- Query results panel with Table, JSON, and Execution Details tabs.
+- Jobs Explorer with personal/project history tabs, selection, detail refresh, and cancellation.
+- Saved Queries stored in the browser (`localStorage`) with local version history, JSON import/export, and shareable URL links.
+- Persistent Dark/Light theme toggle.
