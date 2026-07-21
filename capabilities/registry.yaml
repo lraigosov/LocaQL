@@ -132,3 +132,11 @@ capabilities:
       - unit/ui/proxy_rewrite
       - unit/ui/config_endpoint
     reason: standalone UI service proxies emulator APIs and adapts views using capabilities
+  console.ui.shortcuts:
+    status: partial
+    fidelity: medium
+    reason: keyboard shortcuts for run and save are available in SQL editor with local bindings
+  console.ui.explorer.search:
+    status: partial
+    fidelity: medium
+    reason: explorer supports local search by project, dataset and table names over cached resources

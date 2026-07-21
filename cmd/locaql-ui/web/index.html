@@ -38,6 +38,10 @@
         <div class="section-head">
           <h2>Explorer</h2>
         </div>
+        <div class="compact-form">
+          <input id="explorerSearchInput" placeholder="search dataset/table" />
+          <button id="clearExplorerSearchBtn" type="button">Clear</button>
+        </div>
         <form id="createDatasetForm" class="compact-form">
           <input id="newDatasetId" placeholder="new dataset id" required />
           <button type="submit">Create</button>
@@ -91,6 +95,7 @@
             <div class="row-actions">
               <button type="submit">Run Query Job</button>
             </div>
+            <span class="meta-text">Shortcuts: Ctrl/Cmd+Enter run query, Ctrl/Cmd+S save query.</span>
           </form>
         </article>
 
