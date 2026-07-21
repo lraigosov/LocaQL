@@ -25,6 +25,7 @@ type jobRecord struct {
 	JobID           string
 	ParentJobID     string
 	JobType         string
+	Priority        string // INTERACTIVE or BATCH
 	ResourceKey     string
 	State           jobState
 	RequestID       string
@@ -38,6 +39,13 @@ type jobRecord struct {
 	CancelRequested bool
 	ErrorReason     string
 	ErrorMessage    string
+	Errors          []jobError // Secondary errors
+}
+
+type jobError struct {
+	Reason   string `json:"reason"`
+	Message  string `json:"message"`
+	Location string `json:"location,omitempty"`
 }
 
 type jobStatistics struct {
@@ -60,6 +68,7 @@ type jobInsertOptions struct {
 	UserEmail     string
 	QueryText     string
 	JobType       string
+	Priority      string
 	TargetDataset string
 	TargetTable   string
 	IsScript      bool
@@ -184,6 +193,7 @@ func (s *jobService) insert(opts jobInsertOptions) (*jobRecord, bool) {
 		JobID:       jobID,
 		ParentJobID: opts.ParentJobID,
 		JobType:     normalizeJobType(opts),
+		Priority:    normalizePriority(opts.Priority),
 		ResourceKey: buildResourceKey(opts),
 		State:       jobStatePending,
 		RequestID:   requestID,
@@ -237,6 +247,19 @@ func (s *jobService) insertScriptWithChildren(opts jobInsertOptions) (*jobRecord
 }
 
 func (s *jobService) run(jobID, projectID string) {
+	s.mu.RLock()
+	jrForPriority := s.jobsByProject[projectID][jobID]
+	priority := ""
+	if jrForPriority != nil {
+		priority = jrForPriority.Priority
+	}
+	s.mu.RUnlock()
+
+	// Batch jobs wait a bit longer to simulate lower priority
+	if priority == "BATCH" {
+		time.Sleep(200 * time.Millisecond)
+	}
+
 	releaseSlot := func() {}
 	if s.runSlots != nil {
 		s.runSlots <- struct{}{}
@@ -503,6 +526,9 @@ func renderJobResource(j *jobRecord) map[string]any {
 			"message": j.ErrorMessage,
 		}
 	}
+	if len(j.Errors) > 0 {
+		status["errors"] = j.Errors
+	}
 
 	stats := map[string]any{
 		"totalSlotMs":    j.Statistics.TotalSlotMs,
@@ -514,7 +540,7 @@ func renderJobResource(j *jobRecord) map[string]any {
 		},
 	}
 
-	return map[string]any{
+	res := map[string]any{
 		"kind": "bigquery#job",
 		"id":   fmt.Sprintf("%s:%s", j.ProjectID, j.JobID),
 		"jobReference": map[string]string{
@@ -527,6 +553,25 @@ func renderJobResource(j *jobRecord) map[string]any {
 		"statistics":  stats,
 		"status":      status,
 	}
+
+	// For query jobs, include priority if set
+	if j.JobType == "query" || j.JobType == "script" {
+		res["configuration"] = map[string]any{
+			"query": map[string]any{
+				"priority": j.Priority,
+			},
+		}
+	}
+
+	return res
+}
+
+func normalizePriority(p string) string {
+	p = strings.ToUpper(strings.TrimSpace(p))
+	if p == "BATCH" {
+		return "BATCH"
+	}
+	return "INTERACTIVE"
 }
 
 func normalizeJobType(opts jobInsertOptions) string {
@@ -562,6 +607,15 @@ func executorDuration(jobType string) time.Duration {
 }
 
 func applyExecutorResult(j *jobRecord) {
+	if strings.Contains(strings.ToUpper(j.QueryText), "FORCE_ERROR") {
+		j.ErrorReason = "invalid"
+		j.ErrorMessage = "Simulated forced error from query text"
+		j.Errors = []jobError{
+			{Reason: "invalid", Message: "Simulated forced error from query text", Location: "query"},
+			{Reason: "secondary", Message: "Additional error detail", Location: "execution"},
+		}
+		return
+	}
 	switch j.JobType {
 	case "load":
 		j.Statistics.TotalSlotMs = 75
