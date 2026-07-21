@@ -245,7 +245,15 @@ capabilities:
     tests:
       - unit/workspace/apply_dry_run_actions
       - unit/cli/workspace_apply_dry_run
-    reason: CLI command `locaql workspace apply --dry-run=true` returns planned mkdir, copy and update actions without mutating target
+    reason: CLI command `locaql workspace apply --dry-run=true` returns planned mkdir, copy, update and optional delete actions without mutating target
+  workspace.apply.mutate:
+    status: supported
+    fidelity: medium
+    tests:
+      - unit/workspace/apply_mutates_target
+      - unit/cli/workspace_apply_mutating
+      - unit/cli/workspace_apply_delete_confirmation
+    reason: CLI command `locaql workspace apply --dry-run=false` mutates target with guarded delete support (`--delete-missing` + `--confirm-delete=DELETE`) and optional manifest output
   security.iam.policies:
     status: unsupported
     fidelity: none

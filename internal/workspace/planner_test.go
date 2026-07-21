@@ -60,6 +60,74 @@ func TestBuildApplyDryRunActions(t *testing.T) {
 	}
 }
 
+func TestBuildApplyDryRunWithDeleteMissing(t *testing.T) {
+	source := tempWorkspace(t)
+	target := tempWorkspace(t)
+
+	writeWorkspaceFile(t, target, "queries/legacy.sql", "SELECT 0")
+
+	res, err := BuildApplyDryRunWithOptions(source, target, ApplyOptions{DeleteMissing: true})
+	if err != nil {
+		t.Fatalf("build dry run with delete failed: %v", err)
+	}
+	foundDelete := false
+	for _, action := range res.Actions {
+		if action.Action == "delete" && action.Path == "queries/legacy.sql" {
+			foundDelete = true
+			break
+		}
+	}
+	if !foundDelete {
+		t.Fatalf("expected delete action for queries/legacy.sql")
+	}
+}
+
+func TestApplyMutatesTarget(t *testing.T) {
+	source := tempWorkspace(t)
+	target := tempWorkspace(t)
+
+	writeWorkspaceFile(t, source, "queries/new.sql", "SELECT 7")
+	writeWorkspaceFile(t, source, "schemas/model.json", "{\"v\":1}")
+	writeWorkspaceFile(t, target, "schemas/model.json", "{\"v\":0}")
+
+	res, err := Apply(source, target, ApplyOptions{})
+	if err != nil {
+		t.Fatalf("apply failed: %v", err)
+	}
+	if !res.Applied {
+		t.Fatalf("expected applied result")
+	}
+
+	b, err := os.ReadFile(filepath.Join(target, "queries", "new.sql"))
+	if err != nil {
+		t.Fatalf("expected copied file: %v", err)
+	}
+	if string(b) != "SELECT 7" {
+		t.Fatalf("unexpected copied content: %s", string(b))
+	}
+
+	b, err = os.ReadFile(filepath.Join(target, "schemas", "model.json"))
+	if err != nil {
+		t.Fatalf("expected updated file: %v", err)
+	}
+	if string(b) != "{\"v\":1}" {
+		t.Fatalf("unexpected updated content: %s", string(b))
+	}
+}
+
+func TestApplyMutatesTargetWithDeleteMissing(t *testing.T) {
+	source := tempWorkspace(t)
+	target := tempWorkspace(t)
+	writeWorkspaceFile(t, target, "queries/legacy.sql", "SELECT 0")
+
+	if _, err := Apply(source, target, ApplyOptions{DeleteMissing: true}); err != nil {
+		t.Fatalf("apply with delete failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(target, "queries", "legacy.sql")); !os.IsNotExist(err) {
+		t.Fatalf("expected legacy.sql deleted, stat err: %v", err)
+	}
+}
+
 func tempWorkspace(t *testing.T) string {
 	t.Helper()
 	root := t.TempDir()

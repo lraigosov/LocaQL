@@ -50,11 +50,59 @@ func TestRunWorkspaceApplyDryRun(t *testing.T) {
 	}
 }
 
-func TestRunWorkspaceApplyNonDryRunRejected(t *testing.T) {
+func TestRunWorkspaceApplyMutatingSuccess(t *testing.T) {
 	source := createWorkspaceRoot(t)
 	target := createWorkspaceRoot(t)
-	if err := runWorkspace([]string{"apply", "--source", source, "--target", target, "--dry-run=false"}); err == nil {
-		t.Fatalf("expected non dry-run apply rejection")
+	mustWriteFile(t, filepath.Join(source, "queries", "q.sql"), []byte("SELECT 1"))
+
+	if err := runWorkspace([]string{"apply", "--source", source, "--target", target, "--dry-run=false"}); err != nil {
+		t.Fatalf("expected mutating apply success, got: %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(target, "queries", "q.sql")); err != nil {
+		t.Fatalf("expected target file after apply, got: %v", err)
+	}
+}
+
+func TestRunWorkspaceApplyDeleteMissingRequiresConfirmation(t *testing.T) {
+	source := createWorkspaceRoot(t)
+	target := createWorkspaceRoot(t)
+	mustWriteFile(t, filepath.Join(target, "queries", "legacy.sql"), []byte("SELECT 0"))
+
+	if err := runWorkspace([]string{"apply", "--source", source, "--target", target, "--dry-run=false", "--delete-missing=true"}); err == nil {
+		t.Fatalf("expected delete-missing confirmation error")
+	}
+}
+
+func TestRunWorkspaceApplyDeleteMissingWithConfirmation(t *testing.T) {
+	source := createWorkspaceRoot(t)
+	target := createWorkspaceRoot(t)
+	mustWriteFile(t, filepath.Join(target, "queries", "legacy.sql"), []byte("SELECT 0"))
+
+	if err := runWorkspace([]string{"apply", "--source", source, "--target", target, "--dry-run=false", "--delete-missing=true", "--confirm-delete=DELETE"}); err != nil {
+		t.Fatalf("expected confirmed delete-missing apply success, got: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(target, "queries", "legacy.sql")); !os.IsNotExist(err) {
+		t.Fatalf("expected legacy.sql removed, got: %v", err)
+	}
+	
+}
+
+func TestRunWorkspaceApplyManifestOutput(t *testing.T) {
+	source := createWorkspaceRoot(t)
+	target := createWorkspaceRoot(t)
+	mustWriteFile(t, filepath.Join(source, "queries", "q.sql"), []byte("SELECT 1"))
+	manifestPath := filepath.Join(t.TempDir(), "apply-manifest.json")
+
+	if err := runWorkspace([]string{"apply", "--source", source, "--target", target, "--dry-run=true", "--manifest-out", manifestPath}); err != nil {
+		t.Fatalf("expected dry-run apply with manifest success, got: %v", err)
+	}
+	b, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatalf("expected manifest file, got: %v", err)
+	}
+	if len(b) == 0 {
+		t.Fatalf("expected non-empty manifest")
 	}
 }
 
