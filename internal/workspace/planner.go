@@ -53,6 +53,19 @@ type ApplyDryRunResult struct {
 	Actions    []ApplyAction
 }
 
+// ApplyOptions controls mutable apply behavior.
+type ApplyOptions struct {
+	DeleteMissing bool
+}
+
+// ApplyResult reports actions planned and executed.
+type ApplyResult struct {
+	SourceRoot string
+	TargetRoot string
+	Applied    bool
+	Actions    []ApplyAction
+}
+
 // BuildPlan validates the workspace and builds a deterministic file inventory.
 func BuildPlan(root string) (PlanResult, error) {
 	validation, err := Validate(root)
@@ -111,6 +124,15 @@ func Diff(sourceRoot, targetRoot string) (DiffResult, error) {
 
 // BuildApplyDryRun returns deterministic actions without mutating target.
 func BuildApplyDryRun(sourceRoot, targetRoot string) (ApplyDryRunResult, error) {
+	applyRes, err := BuildApplyDryRunWithOptions(sourceRoot, targetRoot, ApplyOptions{})
+	if err != nil {
+		return ApplyDryRunResult{}, err
+	}
+	return applyRes, nil
+}
+
+// BuildApplyDryRunWithOptions returns deterministic actions without mutating target.
+func BuildApplyDryRunWithOptions(sourceRoot, targetRoot string, opts ApplyOptions) (ApplyDryRunResult, error) {
 	diffRes, err := Diff(sourceRoot, targetRoot)
 	if err != nil {
 		return ApplyDryRunResult{}, err
@@ -140,8 +162,112 @@ func BuildApplyDryRun(sourceRoot, targetRoot string) (ApplyDryRunResult, error) 
 	for _, file := range diffRes.Changed {
 		result.Actions = append(result.Actions, ApplyAction{Action: "update", Path: file.Path})
 	}
+	if opts.DeleteMissing {
+		for _, file := range diffRes.OnlyInTarget {
+			result.Actions = append(result.Actions, ApplyAction{Action: "delete", Path: file.Path})
+		}
+	}
+
+	sort.Slice(result.Actions, func(i, j int) bool {
+		if result.Actions[i].Action == result.Actions[j].Action {
+			return result.Actions[i].Path < result.Actions[j].Path
+		}
+		return result.Actions[i].Action < result.Actions[j].Action
+	})
 
 	return result, nil
+}
+
+// Apply mutates target workspace to converge to source workspace.
+func Apply(sourceRoot, targetRoot string, opts ApplyOptions) (ApplyResult, error) {
+	plan, err := BuildApplyDryRunWithOptions(sourceRoot, targetRoot, opts)
+	if err != nil {
+		return ApplyResult{}, err
+	}
+
+	result := ApplyResult{
+		SourceRoot: plan.SourceRoot,
+		TargetRoot: plan.TargetRoot,
+		Applied:    true,
+		Actions:    plan.Actions,
+	}
+
+	for _, action := range plan.Actions {
+		switch action.Action {
+		case "mkdir":
+			abs, err := resolveWithin(result.TargetRoot, action.Path)
+			if err != nil {
+				return ApplyResult{}, err
+			}
+			if err := os.MkdirAll(abs, 0o755); err != nil {
+				return ApplyResult{}, err
+			}
+		case "copy", "update":
+			src, err := resolveWithin(result.SourceRoot, action.Path)
+			if err != nil {
+				return ApplyResult{}, err
+			}
+			dst, err := resolveWithin(result.TargetRoot, action.Path)
+			if err != nil {
+				return ApplyResult{}, err
+			}
+			if err := copyFile(src, dst); err != nil {
+				return ApplyResult{}, err
+			}
+		case "delete":
+			dst, err := resolveWithin(result.TargetRoot, action.Path)
+			if err != nil {
+				return ApplyResult{}, err
+			}
+			if err := os.Remove(dst); err != nil && !os.IsNotExist(err) {
+				return ApplyResult{}, err
+			}
+		}
+	}
+
+	return result, nil
+}
+
+func resolveWithin(root, rel string) (string, error) {
+	clean := filepath.Clean(filepath.FromSlash(strings.TrimSpace(rel)))
+	if clean == "." || clean == "" {
+		return root, nil
+	}
+	if strings.HasPrefix(clean, "..") || filepath.IsAbs(clean) {
+		return "", fmt.Errorf("invalid relative path: %s", rel)
+	}
+	return filepath.Join(root, clean), nil
+}
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = in.Close() }()
+
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	tmp := dst + ".tmp"
+	out, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := out.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 func scanWorkspaceFiles(root string) ([]FileEntry, error) {

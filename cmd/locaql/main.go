@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/lraigosov/LocaQL/internal/capabilities"
@@ -135,34 +136,79 @@ func runWorkspaceApply(args []string) error {
 	source := fs.String("source", ".", "source workspace root")
 	target := fs.String("target", "", "target workspace root")
 	dryRun := fs.Bool("dry-run", true, "show actions without mutating target")
-	jsonOutput := fs.Bool("json", false, "print dry-run plan as json")
+	deleteMissing := fs.Bool("delete-missing", false, "delete target files that are not present in source")
+	confirmDelete := fs.String("confirm-delete", "", "required value DELETE when using --delete-missing with mutating apply")
+	manifestOut := fs.String("manifest-out", "", "optional path to write apply result as json")
+	jsonOutput := fs.Bool("json", false, "print apply result as json")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if strings.TrimSpace(*target) == "" {
 		return errors.New("target is required")
 	}
-	if !*dryRun {
-		return errors.New("non dry-run apply is not enabled yet; use --dry-run=true")
+	if !*dryRun && *deleteMissing && strings.TrimSpace(*confirmDelete) != "DELETE" {
+		return errors.New("delete-missing requires --confirm-delete=DELETE for mutating apply")
 	}
 
-	applyRes, err := workspace.BuildApplyDryRun(*source, *target)
+	opts := workspace.ApplyOptions{DeleteMissing: *deleteMissing}
+	if *dryRun {
+		applyRes, err := workspace.BuildApplyDryRunWithOptions(*source, *target, opts)
+		if err != nil {
+			return err
+		}
+		result := workspace.ApplyResult{
+			SourceRoot: applyRes.SourceRoot,
+			TargetRoot: applyRes.TargetRoot,
+			Applied:    false,
+			Actions:    applyRes.Actions,
+		}
+		if err := emitWorkspaceApplyResult(result, *jsonOutput, *manifestOut); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	result, err := workspace.Apply(*source, *target, opts)
 	if err != nil {
 		return err
 	}
+	return emitWorkspaceApplyResult(result, *jsonOutput, *manifestOut)
+}
 
-	if *jsonOutput {
+func emitWorkspaceApplyResult(result workspace.ApplyResult, jsonOutput bool, manifestOut string) error {
+	if jsonOutput {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
-		return enc.Encode(applyRes)
+		if err := enc.Encode(result); err != nil {
+			return err
+		}
+	} else {
+		fmt.Printf("Source: %s\n", result.SourceRoot)
+		fmt.Printf("Target: %s\n", result.TargetRoot)
+		fmt.Printf("Applied: %t\n", result.Applied)
+		fmt.Printf("Actions: %d\n", len(result.Actions))
+		for _, action := range result.Actions {
+			fmt.Printf("- %s %s\n", action.Action, action.Path)
+		}
 	}
 
-	fmt.Printf("Source: %s\n", applyRes.SourceRoot)
-	fmt.Printf("Target: %s\n", applyRes.TargetRoot)
-	fmt.Printf("Dry-run actions: %d\n", len(applyRes.Actions))
-	for _, action := range applyRes.Actions {
-		fmt.Printf("- %s %s\n", action.Action, action.Path)
+	if strings.TrimSpace(manifestOut) != "" {
+		abs, err := filepath.Abs(manifestOut)
+		if err != nil {
+			return err
+		}
+		if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+			return err
+		}
+		b, err := json.MarshalIndent(result, "", "  ")
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(abs, append(b, '\n'), 0o644); err != nil {
+			return err
+		}
 	}
+
 	return nil
 }
 
@@ -285,5 +331,5 @@ func printUsage() {
 	fmt.Println("  locaql workspace validate [--path .] [--json]")
 	fmt.Println("  locaql workspace plan [--path .] [--json]")
 	fmt.Println("  locaql workspace diff [--source .] --target <path> [--json]")
-	fmt.Println("  locaql workspace apply [--source .] --target <path> [--dry-run=true] [--json]")
+	fmt.Println("  locaql workspace apply [--source .] --target <path> [--dry-run=true] [--delete-missing=false] [--confirm-delete DELETE] [--manifest-out path] [--json]")
 }
