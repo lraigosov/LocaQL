@@ -324,7 +324,11 @@ func (s *Server) handleTablesCollection(w http.ResponseWriter, r *http.Request, 
 func (s *Server) handleTableByID(w http.ResponseWriter, r *http.Request, projectID, datasetID, tableID string) {
 	switch r.Method {
 	case http.MethodGet:
-		s.getTable(w, projectID, datasetID, tableID)
+		s.getTable(w, r, projectID, datasetID, tableID)
+	case http.MethodPatch:
+		s.patchTable(w, r, projectID, datasetID, tableID)
+	case http.MethodPut:
+		s.updateTable(w, r, projectID, datasetID, tableID)
 	case http.MethodDelete:
 		s.deleteTable(w, projectID, datasetID, tableID)
 	default:
@@ -334,7 +338,11 @@ func (s *Server) handleTableByID(w http.ResponseWriter, r *http.Request, project
 
 func (s *Server) listTables(w http.ResponseWriter, r *http.Request, projectID, datasetID string) {
 	start, size := parsePagination(r, 2, 1000)
-	items, next := s.tables.list(projectID, datasetID, start, size)
+	items, next, version := s.tables.list(projectID, datasetID, start, size)
+
+	if s.checkETag(w, r, version) {
+		return
+	}
 
 	out := make([]map[string]any, 0, len(items))
 	for _, t := range items {
@@ -344,6 +352,7 @@ func (s *Server) listTables(w http.ResponseWriter, r *http.Request, projectID, d
 	resp := map[string]any{
 		"kind":   "bigquery#tableList",
 		"tables": out,
+		"etag":   fmt.Sprintf("\"v%d\"", version),
 	}
 	if next >= 0 {
 		resp["nextPageToken"] = encodePageToken(next)
@@ -358,22 +367,72 @@ func (s *Server) insertTable(w http.ResponseWriter, r *http.Request, projectID, 
 		}
 	}()
 
-	var payload struct {
-		TableReference struct {
-			TableID string `json:"tableId"`
-		} `json:"tableReference"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+	var raw map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
 		writeError(w, http.StatusBadRequest, "Invalid request body", "invalid")
 		return
 	}
-	tableID := strings.TrimSpace(payload.TableReference.TableID)
+
+	refRaw, ok := raw["tableReference"].(map[string]any)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "tableReference.tableId is required", "required")
+		return
+	}
+	tableID, _ := refRaw["tableId"].(string)
+	tableID = strings.TrimSpace(tableID)
 	if tableID == "" {
 		writeError(w, http.StatusBadRequest, "tableReference.tableId is required", "required")
 		return
 	}
 
-	item, created := s.tables.insert(tableInsert{ProjectID: projectID, DatasetID: datasetID, TableID: tableID})
+	friendlyName := ""
+	if v, ok := raw["friendlyName"]; ok {
+		str, ok := v.(string)
+		if !ok {
+			writeError(w, http.StatusBadRequest, "friendlyName must be a string", "invalid")
+			return
+		}
+		friendlyName = str
+	}
+	description := ""
+	if v, ok := raw["description"]; ok {
+		str, ok := v.(string)
+		if !ok {
+			writeError(w, http.StatusBadRequest, "description must be a string", "invalid")
+			return
+		}
+		description = str
+	}
+	labels := map[string]string(nil)
+	if v, ok := raw["labels"]; ok {
+		if v == nil {
+			labels = nil
+		} else {
+			obj, ok := v.(map[string]any)
+			if !ok {
+				writeError(w, http.StatusBadRequest, "labels must be an object", "invalid")
+				return
+			}
+			labels = make(map[string]string, len(obj))
+			for k, rv := range obj {
+				str, ok := rv.(string)
+				if !ok {
+					writeError(w, http.StatusBadRequest, "labels values must be strings", "invalid")
+					return
+				}
+				labels[k] = str
+			}
+		}
+	}
+
+	item, created := s.tables.insert(tableInsert{
+		ProjectID:    projectID,
+		DatasetID:    datasetID,
+		TableID:      tableID,
+		FriendlyName: friendlyName,
+		Description:  description,
+		Labels:       labels,
+	})
 	if !created {
 		writeError(w, http.StatusConflict, fmt.Sprintf("Already Exists: Table %s:%s.%s", projectID, datasetID, tableID), "duplicate")
 		return
@@ -382,12 +441,166 @@ func (s *Server) insertTable(w http.ResponseWriter, r *http.Request, projectID, 
 	writeJSON(w, http.StatusOK, renderTableResource(item))
 }
 
-func (s *Server) getTable(w http.ResponseWriter, projectID, datasetID, tableID string) {
-	item, ok := s.tables.get(projectID, datasetID, tableID)
+func (s *Server) getTable(w http.ResponseWriter, r *http.Request, projectID, datasetID, tableID string) {
+	item, ok, version := s.tables.get(projectID, datasetID, tableID)
 	if !ok {
 		writeError(w, http.StatusNotFound, fmt.Sprintf("Not found: Table %s:%s.%s", projectID, datasetID, tableID), "notFound")
 		return
 	}
+
+	if s.checkETag(w, r, version) {
+		return
+	}
+	writeJSON(w, http.StatusOK, renderTableResource(item))
+}
+
+func (s *Server) patchTable(w http.ResponseWriter, r *http.Request, projectID, datasetID, tableID string) {
+	defer func() {
+		if r.Body != nil {
+			_ = r.Body.Close()
+		}
+	}()
+
+	var raw map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid request body", "invalid")
+		return
+	}
+
+	patch := tablePatch{ProjectID: projectID, DatasetID: datasetID, TableID: tableID}
+	if v, ok := raw["friendlyName"]; ok {
+		str, ok := v.(string)
+		if !ok {
+			writeError(w, http.StatusBadRequest, "friendlyName must be a string", "invalid")
+			return
+		}
+		patch.HasFriendlyName = true
+		patch.FriendlyName = str
+	}
+	if v, ok := raw["description"]; ok {
+		str, ok := v.(string)
+		if !ok {
+			writeError(w, http.StatusBadRequest, "description must be a string", "invalid")
+			return
+		}
+		patch.HasDescription = true
+		patch.Description = str
+	}
+	if v, ok := raw["labels"]; ok {
+		patch.HasLabels = true
+		if v == nil {
+			patch.Labels = nil
+		} else {
+			obj, ok := v.(map[string]any)
+			if !ok {
+				writeError(w, http.StatusBadRequest, "labels must be an object", "invalid")
+				return
+			}
+			labels := make(map[string]string, len(obj))
+			for k, rv := range obj {
+				str, ok := rv.(string)
+				if !ok {
+					writeError(w, http.StatusBadRequest, "labels values must be strings", "invalid")
+					return
+				}
+				labels[k] = str
+			}
+			patch.Labels = labels
+		}
+	}
+
+	if !patch.HasFriendlyName && !patch.HasDescription && !patch.HasLabels {
+		writeError(w, http.StatusBadRequest, "at least one patchable field is required", "required")
+		return
+	}
+
+	item, ok := s.tables.patch(patch)
+	if !ok {
+		writeError(w, http.StatusNotFound, fmt.Sprintf("Not found: Table %s:%s.%s", projectID, datasetID, tableID), "notFound")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, renderTableResource(item))
+}
+
+func (s *Server) updateTable(w http.ResponseWriter, r *http.Request, projectID, datasetID, tableID string) {
+	defer func() {
+		if r.Body != nil {
+			_ = r.Body.Close()
+		}
+	}()
+
+	var raw map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid request body", "invalid")
+		return
+	}
+
+	if refRaw, ok := raw["tableReference"]; ok {
+		ref, ok := refRaw.(map[string]any)
+		if !ok {
+			writeError(w, http.StatusBadRequest, "tableReference must be an object", "invalid")
+			return
+		}
+		if tableVal, ok := ref["tableId"].(string); ok && strings.TrimSpace(tableVal) != "" && strings.TrimSpace(tableVal) != tableID {
+			writeError(w, http.StatusBadRequest, "tableReference.tableId does not match path", "invalid")
+			return
+		}
+	}
+
+	friendlyName := ""
+	if v, ok := raw["friendlyName"]; ok {
+		str, ok := v.(string)
+		if !ok {
+			writeError(w, http.StatusBadRequest, "friendlyName must be a string", "invalid")
+			return
+		}
+		friendlyName = str
+	}
+	description := ""
+	if v, ok := raw["description"]; ok {
+		str, ok := v.(string)
+		if !ok {
+			writeError(w, http.StatusBadRequest, "description must be a string", "invalid")
+			return
+		}
+		description = str
+	}
+	labels := map[string]string(nil)
+	if v, ok := raw["labels"]; ok {
+		if v == nil {
+			labels = nil
+		} else {
+			obj, ok := v.(map[string]any)
+			if !ok {
+				writeError(w, http.StatusBadRequest, "labels must be an object", "invalid")
+				return
+			}
+			labels = make(map[string]string, len(obj))
+			for k, rv := range obj {
+				str, ok := rv.(string)
+				if !ok {
+					writeError(w, http.StatusBadRequest, "labels values must be strings", "invalid")
+					return
+				}
+				labels[k] = str
+			}
+		}
+	}
+
+	item, ok := s.tables.update(tableUpdate{
+		ProjectID:    projectID,
+		DatasetID:    datasetID,
+		TableID:      tableID,
+		FriendlyName: friendlyName,
+		Description:  description,
+		Labels:       labels,
+	})
+	if !ok {
+		writeError(w, http.StatusNotFound, fmt.Sprintf("Not found: Table %s:%s.%s", projectID, datasetID, tableID), "notFound")
+		return
+	}
+
 	writeJSON(w, http.StatusOK, renderTableResource(item))
 }
 
@@ -400,7 +613,7 @@ func (s *Server) deleteTable(w http.ResponseWriter, projectID, datasetID, tableI
 }
 
 func renderTableResource(t *tableRecord) map[string]any {
-	return map[string]any{
+	resp := map[string]any{
 		"kind": "bigquery#table",
 		"id":   fmt.Sprintf("%s:%s.%s", t.ProjectID, t.DatasetID, t.TableID),
 		"tableReference": map[string]string{
@@ -408,7 +621,20 @@ func renderTableResource(t *tableRecord) map[string]any {
 			"datasetId": t.DatasetID,
 			"tableId":   t.TableID,
 		},
+		"etag":             fmt.Sprintf("\"v%d\"", t.Version),
+		"creationTime":     fmt.Sprintf("%d", t.CreatedAt.UnixMilli()),
+		"lastModifiedTime": fmt.Sprintf("%d", t.UpdatedAt.UnixMilli()),
 	}
+	if t.FriendlyName != "" {
+		resp["friendlyName"] = t.FriendlyName
+	}
+	if t.Description != "" {
+		resp["description"] = t.Description
+	}
+	if len(t.Labels) > 0 {
+		resp["labels"] = t.Labels
+	}
+	return resp
 }
 
 func (s *Server) listJobs(w http.ResponseWriter, r *http.Request, projectID string) {
