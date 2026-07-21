@@ -189,3 +189,19 @@ capabilities:
     status: partial
     fidelity: medium
     reason: saved query text can be shared via local URL query parameter
+  console.ui.table_details.preview_schema_metadata:
+    status: partial
+    fidelity: medium
+    reason: selecting a table opens metadata, schema, preview rows and raw JSON details backed by tables.get and tabledata.list
+  console.ui.navigation.menus_functional:
+    status: partial
+    fidelity: medium
+    reason: appbar and side navigation actions are wired to emulator-backed views for search, jobs, history and capabilities
+  console.ui.table_actions.query_copy_delete:
+    status: partial
+    fidelity: medium
+    reason: table details panel provides query draft, copy job submission and delete table actions through emulator endpoints
+  console.ui.jobs.history_tabs:
+    status: partial
+    fidelity: medium
+    reason: jobs explorer supports explicit personal and project history tabs mapped to allUsers behavior
