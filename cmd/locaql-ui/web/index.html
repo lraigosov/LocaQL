@@ -7,15 +7,46 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/web/styles.css">
+  <link rel="stylesheet" href="/web/styles.css?v=16">
 </head>
 <body>
+  <header class="studio-appbar">
+    <div class="appbar-left">
+      <button id="navCollapseBtn" type="button" class="icon-button" aria-label="Toggle navigation">☰</button>
+      <div class="appbar-brand">
+        <span class="appbar-brand-label">LocaQL</span>
+        <span class="appbar-brand-subtitle">Studio</span>
+      </div>
+      <div class="project-switcher">
+        <span class="project-switcher-label">Project</span>
+        <button id="projectSelectorBtn" type="button" class="project-chip" aria-label="Project selector">p1</button>
+      </div>
+    </div>
+    <div class="appbar-search">
+      <input id="globalSearchInput" placeholder="Buscar recursos, documentos o consultas" aria-label="Search" />
+    </div>
+    <div class="appbar-actions" aria-label="global actions">
+      <button id="appbarSearchBtn" type="button" class="icon-button" title="Search resources">⌕</button>
+      <button id="appbarStarredBtn" type="button" class="icon-button" title="Saved queries">★</button>
+      <button id="appbarThemeBtn" type="button" class="icon-button" title="Toggle theme">☀</button>
+      <button id="appbarMoreBtn" type="button" class="icon-button" title="Open capabilities">⋮</button>
+    </div>
+  </header>
+
   <main class="studio-shell">
+    <nav class="studio-rail" aria-label="navigation">
+      <button type="button" class="rail-icon active" data-nav="studio" title="Studio">▣</button>
+      <button type="button" class="rail-icon" data-nav="search" title="Search">⌕</button>
+      <button type="button" class="rail-icon" data-nav="jobs" title="Jobs">↻</button>
+      <button type="button" class="rail-icon" data-nav="history" title="History">☰</button>
+      <button type="button" class="rail-icon" data-nav="settings" title="Settings">⚙</button>
+    </nav>
+
     <aside class="studio-sidebar">
       <div class="brand">
-        <p class="brand-kicker">Local Analytics Studio</p>
+        <p class="brand-kicker">Local analytics workspace</p>
         <h1>LocaQL Studio</h1>
-        <p class="brand-note">Independent interface, not affiliated with Google.</p>
+        <p class="brand-note">A BigQuery-like shell for local development. No Google branding.</p>
       </div>
 
       <section class="sidebar-section">
@@ -38,10 +69,73 @@
         <div class="section-head">
           <h2>Explorer</h2>
         </div>
+        <div class="compact-form">
+          <input id="explorerSearchInput" placeholder="search dataset/table" />
+          <button id="clearExplorerSearchBtn" type="button">Clear</button>
+        </div>
+        <div class="compact-form">
+          <select id="explorerCapabilityFilter" aria-label="Explorer capability filter">
+            <option value="all">Capabilities: All</option>
+            <option value="supported">Only SUPPORTED</option>
+            <option value="partial">Only PARTIAL</option>
+            <option value="unsupported">Only UNSUPPORTED</option>
+          </select>
+        </div>
+        <div class="cap-legend" aria-label="capability legend">
+          <span class="cap-badge cap-supported">SUPPORTED</span>
+          <span class="cap-badge cap-partial">PARTIAL</span>
+          <span class="cap-badge cap-unsupported">UNSUPPORTED</span>
+          <span class="cap-badge cap-context">CONTEXT</span>
+        </div>
         <form id="createDatasetForm" class="compact-form">
           <input id="newDatasetId" placeholder="new dataset id" required />
           <button type="submit">Create</button>
         </form>
+        <form id="updateDatasetForm" class="compact-form">
+          <input id="datasetMetaDatasetId" placeholder="dataset id" />
+          <input id="datasetFriendlyNameInput" placeholder="friendly name" />
+          <input id="datasetLocationInput" placeholder="location" />
+          <textarea id="datasetLabelsInput" placeholder="labels (JSON: {'k':'v'})" rows="2"></textarea>
+          <button type="submit">Save Dataset</button>
+          <button id="deleteDatasetBtn" type="button">Delete Dataset</button>
+        </form>
+        <form id="createTableForm" class="compact-form">
+          <input id="newTableDatasetId" placeholder="dataset id" />
+          <input id="newTableId" placeholder="new table id" required />
+          <button type="submit">Add Table</button>
+        </form>
+        <section id="datasetSummaryCard" class="dataset-summary-card" aria-label="selected dataset summary">
+          <div class="section-head dataset-summary-head">
+            <h2>Selected Dataset</h2>
+            <span id="datasetSummaryStatus" class="meta-text">none</span>
+          </div>
+          <p id="datasetSummaryCapabilityNote" class="meta-text">Capability signal: loading...</p>
+          <div class="dataset-summary-grid">
+            <article class="dataset-summary-item">
+              <h3>ID</h3>
+              <p id="datasetSummaryId">-</p>
+            </article>
+            <article class="dataset-summary-item">
+              <h3>Friendly Name</h3>
+              <p id="datasetSummaryFriendlyName">-</p>
+            </article>
+            <article class="dataset-summary-item">
+              <h3>Location</h3>
+              <p id="datasetSummaryLocation">-</p>
+            </article>
+            <article class="dataset-summary-item">
+              <h3>Tables</h3>
+              <p id="datasetSummaryTables">0</p>
+            </article>
+          </div>
+          <div class="row-actions dataset-summary-actions">
+            <button id="datasetQueryBtn" type="button">Query Dataset</button>
+            <button id="datasetListTablesBtn" type="button">List Tables</button>
+            <button id="datasetCopyIdBtn" type="button">Copy Dataset ID</button>
+          </div>
+          <span id="datasetSummaryActionStatus" class="meta-text">actions idle</span>
+          <pre id="datasetSummaryLabels" class="code-block small">{}</pre>
+        </section>
         <div id="explorerTree" class="tree"></div>
       </section>
 
@@ -53,11 +147,39 @@
           <input id="savedQueryName" placeholder="query name" required />
           <button type="submit">Save</button>
         </form>
+        <div class="compact-form">
+          <button id="exportSavedQueriesBtn" type="button">Export</button>
+          <button id="importSavedQueriesBtn" type="button">Import</button>
+          <input id="savedQueriesImportInput" type="file" accept="application/json" hidden />
+        </div>
         <ul id="savedQueriesList" class="list sidebar-list"></ul>
       </section>
     </aside>
 
     <section class="studio-main">
+      <div class="resource-breadcrumbs" aria-label="resource breadcrumbs">
+        <span class="breadcrumb-chip">teamcore-data-jobs</span>
+        <span class="breadcrumb-sep">/</span>
+        <span class="breadcrumb-chip">Datasets</span>
+        <span class="breadcrumb-sep">/</span>
+        <span class="breadcrumb-chip active" id="breadcrumbDatasetChip">p1</span>
+        <span class="breadcrumb-sep">/</span>
+        <span class="breadcrumb-chip active" id="breadcrumbTableChip">Table</span>
+      </div>
+
+      <section class="workspace-topbar">
+        <div class="workspace-intro">
+          <p class="workspace-kicker">Query workspace</p>
+          <h2>Run SQL, inspect jobs, and browse catalog resources</h2>
+          <p>Designed to feel close to BigQuery Studio while staying independent and local.</p>
+        </div>
+        <div class="workspace-badges" aria-label="workspace status">
+          <span class="workspace-pill">Project p1</span>
+          <span class="workspace-pill">Emulator connected</span>
+          <span class="workspace-pill">Studio-style layout</span>
+        </div>
+      </section>
+
       <header class="studio-header">
         <div class="tabs" id="mainTabs">
           <span class="tab active" data-target="query-workspace">Query</span>
@@ -91,6 +213,7 @@
             <div class="row-actions">
               <button type="submit">Run Query Job</button>
             </div>
+            <span class="meta-text">Shortcuts: Ctrl/Cmd+Enter run query, Ctrl/Cmd+S save query.</span>
           </form>
         </article>
 
@@ -115,10 +238,84 @@
           </div>
         </article>
 
+        <article class="panel panel-wide" id="table-details-panel">
+          <div class="panel-head">
+            <h3>Table Details</h3>
+            <span id="tableDetailsMeta" class="meta-text">Select a table from Explorer</span>
+          </div>
+          <div class="row-actions table-actions" id="tableActionsRow">
+            <button id="queryTableBtn" type="button">Query Table</button>
+            <button id="copyTableBtn" type="button">Copy Table</button>
+            <button id="deleteTableBtn" type="button">Delete Table</button>
+            <span id="tableActionStatus" class="meta-text">select a table to enable actions</span>
+          </div>
+          <div class="tabs result-tabs" id="tableDetailsTabs">
+            <span class="tab active" data-target="table-overview-view">Overview</span>
+            <span class="tab" data-target="table-schema-view">Schema</span>
+            <span class="tab" data-target="table-preview-view">Preview</span>
+            <span class="tab" data-target="table-json-view">JSON</span>
+          </div>
+
+          <div id="table-overview-view" class="table-details-view">
+            <div class="details-grid">
+              <article class="detail-card">
+                <h4>Table</h4>
+                <p id="tableInfoName" class="detail-value">-</p>
+              </article>
+              <article class="detail-card">
+                <h4>Description</h4>
+                <p id="tableInfoDescription" class="detail-value">-</p>
+              </article>
+              <article class="detail-card">
+                <h4>ETag</h4>
+                <p id="tableInfoETag" class="detail-value">-</p>
+              </article>
+              <article class="detail-card">
+                <h4>Created</h4>
+                <p id="tableInfoCreated" class="detail-value">-</p>
+              </article>
+              <article class="detail-card">
+                <h4>Last Modified</h4>
+                <p id="tableInfoUpdated" class="detail-value">-</p>
+              </article>
+            </div>
+            <form id="updateTableMetaForm" class="compact-form table-meta-form">
+              <input id="tableFriendlyNameInput" placeholder="friendly name" />
+              <input id="tableDescriptionInput" placeholder="description" />
+              <button type="submit">Save Meta</button>
+            </form>
+            <div class="compact-form table-meta-form">
+              <textarea id="tableLabelsInput" placeholder="labels (JSON: {'key':'val'})" rows="2"></textarea>
+              <button id="updateTableLabelsBtn" type="button">Save Labels</button>
+            </div>
+            <pre id="tableInfoLabels" class="code-block small">{}</pre>
+          </div>
+
+          <div id="table-schema-view" class="table-details-view" style="display: none;">
+            <ul id="tableSchemaList" class="schema-list"></ul>
+          </div>
+
+          <div id="table-preview-view" class="table-details-view" style="display: none;">
+            <span id="tablePreviewMeta" class="meta-text">no preview yet</span>
+            <div class="table-wrap">
+              <table id="tablePreviewTable" class="result-table"></table>
+            </div>
+          </div>
+
+          <div id="table-json-view" class="table-details-view" style="display: none;">
+            <pre id="tableDetailsJson" class="code-block"></pre>
+          </div>
+        </article>
+
         <article class="panel jobs-panel" id="jobs-explorer">
           <div class="panel-head">
             <h3>Jobs Explorer</h3>
           </div>
+          <div class="tabs result-tabs" id="jobsHistoryTabs">
+            <span class="tab active" data-target="personal-history">Personal History</span>
+            <span class="tab" data-target="project-history">Project History</span>
+          </div>
+          <span id="jobsHistoryHint" class="meta-text">Scope: personal jobs in current project</span>
           <form id="jobsFilterForm" class="jobs-filter-form">
             <input id="jobsStateFilter" placeholder="state filter (e.g. DONE)" />
             <input id="jobsUserEmailFilter" placeholder="user email" />
@@ -158,6 +355,6 @@
     </section>
   </main>
 
-  <script src="/web/app.js" type="module"></script>
+  <script src="/web/app.js?v=21" type="module"></script>
 </body>
 </html>

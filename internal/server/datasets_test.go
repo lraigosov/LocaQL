@@ -110,3 +110,56 @@ func TestDatasetsListETag(t *testing.T) {
 		t.Fatalf("expected 200 after modification, got %d", res4.Code)
 	}
 }
+
+func TestDatasetsPatchPartialUpdate(t *testing.T) {
+	s := newTestServer()
+
+	createBody := `{"datasetReference":{"datasetId":"marketing"},"friendlyName":"Marketing","location":"US","labels":{"team":"growth"}}`
+	createReq := httptest.NewRequest(http.MethodPost, "/bigquery/v2/projects/p1/datasets", strings.NewReader(createBody))
+	createReq.Header.Set("Content-Type", "application/json")
+	createRes := httptest.NewRecorder()
+	s.Handler().ServeHTTP(createRes, createReq)
+	if createRes.Code != http.StatusOK {
+		t.Fatalf("expected 200 on create, got %d", createRes.Code)
+	}
+
+	patchBody := `{"friendlyName":"Marketing Analytics","labels":{"team":"analytics","owner":"data"}}`
+	patchReq := httptest.NewRequest(http.MethodPatch, "/bigquery/v2/projects/p1/datasets/marketing", strings.NewReader(patchBody))
+	patchReq.Header.Set("Content-Type", "application/json")
+	patchRes := httptest.NewRecorder()
+	s.Handler().ServeHTTP(patchRes, patchReq)
+	if patchRes.Code != http.StatusOK {
+		t.Fatalf("expected 200 on patch, got %d", patchRes.Code)
+	}
+
+	var patched map[string]any
+	if err := json.NewDecoder(patchRes.Body).Decode(&patched); err != nil {
+		t.Fatalf("decode patch response: %v", err)
+	}
+	if patched["friendlyName"] != "Marketing Analytics" {
+		t.Fatalf("expected friendlyName to be updated")
+	}
+	if patched["location"] != "US" {
+		t.Fatalf("expected location to remain unchanged")
+	}
+	labels, ok := patched["labels"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected labels in response")
+	}
+	if labels["team"] != "analytics" || labels["owner"] != "data" {
+		t.Fatalf("expected labels to be patched, got %#v", labels)
+	}
+}
+
+func TestDatasetsPatchNotFound(t *testing.T) {
+	s := newTestServer()
+
+	patchReq := httptest.NewRequest(http.MethodPatch, "/bigquery/v2/projects/p1/datasets/missing", strings.NewReader(`{"friendlyName":"x"}`))
+	patchReq.Header.Set("Content-Type", "application/json")
+	patchRes := httptest.NewRecorder()
+	s.Handler().ServeHTTP(patchRes, patchReq)
+
+	if patchRes.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", patchRes.Code)
+	}
+}
