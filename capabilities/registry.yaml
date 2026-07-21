@@ -159,7 +159,7 @@ capabilities:
   console.ui.resource_forms.basic:
     status: partial
     fidelity: medium
-    reason: explorer supports validated dataset create/update/delete, basic table creation and table metadata editing against emulator REST endpoints
+    reason: explorer supports validated dataset create/update/delete with labels, basic table creation, table metadata editing and table labels editing against emulator REST endpoints
   emulator.health:
     status: supported
     fidelity: high
@@ -205,11 +205,15 @@ capabilities:
   console.ui.table_details.preview_schema_metadata:
     status: partial
     fidelity: medium
-    reason: selecting a table opens metadata, schema, preview rows and raw JSON details backed by tables.get and tabledata.list
+    reason: selecting a table opens metadata, schema, preview rows, labels editor and raw JSON details backed by tables.get and tabledata.list
   console.ui.navigation.menus_functional:
     status: partial
     fidelity: medium
     reason: appbar and side navigation actions are wired to emulator-backed views for search, jobs, history and capabilities
+  console.ui.explorer.placeholders.routines_models:
+    status: partial
+    fidelity: low
+    reason: explorer renders explicit placeholders for routines and models to expose unsupported catalog categories without pretending backend parity
   console.ui.table_actions.query_copy_delete:
     status: partial
     fidelity: medium

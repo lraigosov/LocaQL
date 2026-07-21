@@ -52,6 +52,7 @@ const clearExplorerSearchBtn = document.getElementById("clearExplorerSearchBtn")
 const datasetMetaDatasetId = document.getElementById("datasetMetaDatasetId");
 const datasetFriendlyNameInput = document.getElementById("datasetFriendlyNameInput");
 const datasetLocationInput = document.getElementById("datasetLocationInput");
+const datasetLabelsInput = document.getElementById("datasetLabelsInput");
 const breadcrumbDatasetChip = document.getElementById("breadcrumbDatasetChip");
 const breadcrumbTableChip = document.getElementById("breadcrumbTableChip");
 const tableDetailsMeta = document.getElementById("tableDetailsMeta");
@@ -63,6 +64,8 @@ const tableInfoUpdated = document.getElementById("tableInfoUpdated");
 const tableInfoLabels = document.getElementById("tableInfoLabels");
 const tableFriendlyNameInput = document.getElementById("tableFriendlyNameInput");
 const tableDescriptionInput = document.getElementById("tableDescriptionInput");
+const tableLabelsInput = document.getElementById("tableLabelsInput");
+const updateTableLabelsBtn = document.getElementById("updateTableLabelsBtn");
 const tableSchemaList = document.getElementById("tableSchemaList");
 const tablePreviewMeta = document.getElementById("tablePreviewMeta");
 const tablePreviewTable = document.getElementById("tablePreviewTable");
@@ -162,6 +165,9 @@ function syncDatasetMetaInputs() {
   }
   if (datasetLocationInput) {
     datasetLocationInput.value = (match && match.location) || "";
+  }
+  if (datasetLabelsInput) {
+    datasetLabelsInput.value = match && match.labels ? JSON.stringify(match.labels) : "";
   }
 }
 
@@ -571,6 +577,20 @@ async function renderExplorerTree(projectId) {
       visibleNodes++;
     }
 
+    // Routines placeholder
+    const routineNode = document.createElement("div");
+    routineNode.className = "node table meta-text";
+    routineNode.style.fontStyle = "italic";
+    routineNode.textContent = "Routines (not supported)";
+    tableGroup.appendChild(routineNode);
+
+    // Models placeholder
+    const modelNode = document.createElement("div");
+    modelNode.className = "node table meta-text";
+    modelNode.style.fontStyle = "italic";
+    modelNode.textContent = "Models (not supported)";
+    tableGroup.appendChild(modelNode);
+
     datasetSection.appendChild(tableGroup);
     explorerTree.appendChild(datasetSection);
   }
@@ -642,6 +662,9 @@ async function loadTableDetails(projectId, datasetId, tableId) {
     }
     if (tableDescriptionInput) {
       tableDescriptionInput.value = tableMeta.description || "";
+    }
+    if (tableLabelsInput) {
+      tableLabelsInput.value = tableMeta.labels ? JSON.stringify(tableMeta.labels) : "";
     }
 
     const schemaFields = (((tableMeta.schema || {}).fields) || []).map((f) => ({
@@ -1425,12 +1448,23 @@ if (updateDatasetForm) {
     }
 
     try {
+      let labels = {};
+      if (datasetLabelsInput && datasetLabelsInput.value.trim()) {
+        try {
+          labels = JSON.parse(datasetLabelsInput.value.trim());
+        } catch (e) {
+          alert("Invalid labels JSON. Use format: {\"key\": \"value\"}");
+          return;
+        }
+      }
+
       await fetchJson(`/api/bigquery/v2/projects/${encodeURIComponent(projectId)}/datasets/${encodeURIComponent(datasetId)}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           friendlyName: datasetFriendlyNameInput ? datasetFriendlyNameInput.value.trim() : "",
           location: datasetLocationInput ? datasetLocationInput.value.trim() : "",
+          labels: labels,
         }),
       });
       selectedDatasetId = datasetId;
@@ -1500,6 +1534,32 @@ if (updateTableMetaForm) {
   updateTableMetaForm.addEventListener("submit", async (event) => {
     event.preventDefault();
     await updateSelectedTableMetadata();
+  });
+}
+
+if (updateTableLabelsBtn) {
+  updateTableLabelsBtn.addEventListener("click", async () => {
+    if (!hasSelectedTable()) return;
+    const projectId = getProjectId();
+    let labels = {};
+    if (tableLabelsInput && tableLabelsInput.value.trim()) {
+      try {
+        labels = JSON.parse(tableLabelsInput.value.trim());
+      } catch (e) {
+        alert("Invalid labels JSON. Use format: {\"key\": \"value\"}");
+        return;
+      }
+    }
+    try {
+      await fetchJson(`/api/bigquery/v2/projects/${encodeURIComponent(projectId)}/datasets/${encodeURIComponent(selectedDatasetId)}/tables/${encodeURIComponent(selectedTableId)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ labels }),
+      });
+      await loadTableDetails(projectId, selectedDatasetId, selectedTableId);
+    } catch (err) {
+      alert(`Update labels failed: ${err.message}`);
+    }
   });
 }
 
