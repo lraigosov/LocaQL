@@ -252,7 +252,7 @@ func TestRequestIDTTLAllowsNewJobAfterExpiration(t *testing.T) {
 
 func TestJobsExecutorTypeAndStatistics(t *testing.T) {
 	s := newTestServer()
-	body := `{"configuration":{"copy":{"sourceTables":[],"destinationTable":{}}}}`
+	body := `{"configuration":{"copy":{"sourceTable":{"projectId":"p1","datasetId":"analytics","tableId":"users"},"destinationTable":{"projectId":"p1","datasetId":"analytics","tableId":"users_copy"},"writeDisposition":"WRITE_TRUNCATE"}}}`
 	req := httptest.NewRequest(http.MethodPost, "/bigquery/v2/projects/p1/jobs", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	res := httptest.NewRecorder()
@@ -286,11 +286,74 @@ func TestJobsExecutorTypeAndStatistics(t *testing.T) {
 	}
 	stats := got["statistics"].(map[string]any)
 	sim := stats["simulation"].(map[string]any)
-	if sim["enabled"] != true {
-		t.Fatalf("expected simulation enabled")
+	if sim["enabled"] != false {
+		t.Fatalf("expected simulation disabled for real copy")
 	}
 	if sim["executor"] != "copy" {
 		t.Fatalf("expected copy executor, got %v", sim["executor"])
+	}
+	if stats["outputRows"] != float64(4) {
+		t.Fatalf("expected 4 copied rows, got %v", stats["outputRows"])
+	}
+}
+
+func TestCopyJobCreatesReadableDestinationTable(t *testing.T) {
+	s := newTestServer()
+	body := `{"configuration":{"copy":{"sourceTable":{"projectId":"p1","datasetId":"analytics","tableId":"daily_metrics"},"destinationTable":{"projectId":"p1","datasetId":"analytics","tableId":"daily_metrics_copy"},"writeDisposition":"WRITE_TRUNCATE"}}}`
+	req := httptest.NewRequest(http.MethodPost, "/bigquery/v2/projects/p1/jobs", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	res := httptest.NewRecorder()
+	s.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d", res.Code)
+	}
+
+	time.Sleep(160 * time.Millisecond)
+
+	dataReq := httptest.NewRequest(http.MethodGet, "/bigquery/v2/projects/p1/tabledata/analytics/daily_metrics_copy/data", nil)
+	dataRes := httptest.NewRecorder()
+	s.Handler().ServeHTTP(dataRes, dataReq)
+	if dataRes.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", dataRes.Code)
+	}
+
+	var out map[string]any
+	if err := json.NewDecoder(dataRes.Body).Decode(&out); err != nil {
+		t.Fatalf("decode table data: %v", err)
+	}
+	if out["totalRows"] != "4" {
+		t.Fatalf("expected totalRows 4, got %v", out["totalRows"])
+	}
+	rows := out["rows"].([]any)
+	first := rows[0].(map[string]any)["f"].([]any)
+	firstValue := first[0].(map[string]any)["v"]
+	if firstValue != "2026-07-18" {
+		t.Fatalf("expected copied first row from source table, got %v", firstValue)
+	}
+}
+
+func TestJobsSyncQuerySupportsInformationSchemaTables(t *testing.T) {
+	s := newTestServer()
+	body := `{"query":"SELECT * FROM p1.analytics.INFORMATION_SCHEMA.TABLES"}`
+	req := httptest.NewRequest(http.MethodPost, "/bigquery/v2/projects/p1/queries", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	res := httptest.NewRecorder()
+	s.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", res.Code)
+	}
+
+	var out map[string]any
+	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+		t.Fatalf("decode information schema response: %v", err)
+	}
+	rows, ok := out["rows"].([]any)
+	if !ok || len(rows) == 0 {
+		t.Fatalf("expected rows from INFORMATION_SCHEMA.TABLES")
+	}
+	fields := out["schema"].(map[string]any)["fields"].([]any)
+	if len(fields) < 4 {
+		t.Fatalf("expected information schema fields, got %v", fields)
 	}
 }
 

@@ -27,6 +27,11 @@ type jobRecord struct {
 	JobType         string
 	Priority        string // INTERACTIVE or BATCH
 	ResourceKey     string
+	SourceTables    []tableReference
+	TargetDataset   string
+	TargetTable     string
+	CreateDisposition string
+	WriteDisposition  string
 	State           jobState
 	RequestID       string
 	UserEmail       string
@@ -69,6 +74,9 @@ type jobInsertOptions struct {
 	QueryText     string
 	JobType       string
 	Priority      string
+	SourceTables   []tableReference
+	CreateDisposition string
+	WriteDisposition  string
 	TargetDataset string
 	TargetTable   string
 	IsScript      bool
@@ -95,6 +103,7 @@ type jobService struct {
 	storageWriteSlots chan struct{}
 	resourceSlots     map[string]chan struct{}
 	persistencePath   string
+	copyExecutor      func(*jobRecord) (jobStatistics, error)
 	counter           int64
 }
 
@@ -195,6 +204,11 @@ func (s *jobService) insert(opts jobInsertOptions) (*jobRecord, bool) {
 		JobType:     normalizeJobType(opts),
 		Priority:    normalizePriority(opts.Priority),
 		ResourceKey: buildResourceKey(opts),
+		SourceTables: cloneTableReferences(opts.SourceTables),
+		TargetDataset: strings.TrimSpace(opts.TargetDataset),
+		TargetTable: strings.TrimSpace(opts.TargetTable),
+		CreateDisposition: normalizeCreateDisposition(opts.CreateDisposition),
+		WriteDisposition: normalizeWriteDisposition(opts.WriteDisposition),
 		State:       jobStatePending,
 		RequestID:   requestID,
 		UserEmail:   opts.UserEmail,
@@ -318,6 +332,21 @@ func (s *jobService) run(jobID, projectID string) {
 	d := executorDuration(jr.JobType)
 	time.Sleep(d)
 
+	var copyStats jobStatistics
+	var copyErr error
+	if jobType == "copy" && s.copyExecutor != nil {
+		s.mu.Lock()
+		jr = s.jobsByProject[projectID][jobID]
+		if jr == nil {
+			s.mu.Unlock()
+			return
+		}
+		jobSnapshot := *jr
+		jobSnapshot.SourceTables = cloneTableReferences(jr.SourceTables)
+		s.mu.Unlock()
+		copyStats, copyErr = s.copyExecutor(&jobSnapshot)
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	jr = s.jobsByProject[projectID][jobID]
@@ -333,7 +362,15 @@ func (s *jobService) run(jobID, projectID string) {
 		_ = s.persistLocked()
 		return
 	}
-	applyExecutorResult(jr)
+	if copyErr != nil {
+		jr.ErrorReason = "invalid"
+		jr.ErrorMessage = copyErr.Error()
+		jr.Errors = []jobError{{Reason: "invalid", Message: copyErr.Error(), Location: "configuration.copy"}}
+	} else if jobType == "copy" && s.copyExecutor != nil {
+		jr.Statistics = copyStats
+	} else {
+		applyExecutorResult(jr)
+	}
 	jr.State = jobStateDone
 	jr.EndedAt = time.Now().UTC()
 	s.projectVersions[projectID]++
@@ -585,6 +622,15 @@ func normalizeJobType(opts jobInsertOptions) string {
 	default:
 		return "query"
 	}
+}
+
+func cloneTableReferences(refs []tableReference) []tableReference {
+	if len(refs) == 0 {
+		return nil
+	}
+	out := make([]tableReference, len(refs))
+	copy(out, refs)
+	return out
 }
 
 func newSimulatedStatistics(jobType string) jobStatistics {

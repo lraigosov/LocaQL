@@ -119,7 +119,7 @@ func TestJobsListPaginationWithOpaqueToken(t *testing.T) {
 
 func TestTableDataListPagination(t *testing.T) {
 	s := newTestServer()
-	req := httptest.NewRequest(http.MethodGet, "/bigquery/v2/projects/p1/tabledata/ds1/t1/data?startIndex=1&maxResults=2", nil)
+	req := httptest.NewRequest(http.MethodGet, "/bigquery/v2/projects/p1/tabledata/analytics/users/data?startIndex=1&maxResults=2", nil)
 	res := httptest.NewRecorder()
 
 	s.Handler().ServeHTTP(res, req)

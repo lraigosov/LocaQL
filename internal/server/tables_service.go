@@ -1,11 +1,23 @@
 package server
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 )
+
+type tableField struct {
+	Name string
+	Type string
+}
+
+type tableReference struct {
+	ProjectID string
+	DatasetID string
+	TableID   string
+}
 
 type tableRecord struct {
 	ProjectID    string
@@ -14,6 +26,8 @@ type tableRecord struct {
 	FriendlyName string
 	Description  string
 	Labels       map[string]string
+	Schema       []tableField
+	Rows         [][]string
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
 	Version      int
@@ -26,6 +40,8 @@ type tableInsert struct {
 	FriendlyName string
 	Description  string
 	Labels       map[string]string
+	Schema       []tableField
+	Rows         [][]string
 }
 
 type tablePatch struct {
@@ -135,14 +151,21 @@ func (s *tableService) insert(input tableInsert) (*tableRecord, bool) {
 		FriendlyName: strings.TrimSpace(input.FriendlyName),
 		Description:  strings.TrimSpace(input.Description),
 		Labels:       cloneLabels(input.Labels),
+		Schema:       cloneTableFields(input.Schema),
+		Rows:         cloneTableRows(input.Rows),
 		CreatedAt:    now,
 		UpdatedAt:    now,
 		Version:      1,
+	}
+	if len(t.Schema) == 0 && len(t.Rows) > 0 {
+		t.Schema = inferSchemaFromRows(t.Rows)
 	}
 	tables[tableID] = t
 	s.datasetVersions[s.datasetKey(projectID, datasetID)]++
 	cp := *t
 	cp.Labels = cloneLabels(cp.Labels)
+	cp.Schema = cloneTableFields(cp.Schema)
+	cp.Rows = cloneTableRows(cp.Rows)
 	return &cp, true
 }
 
@@ -192,6 +215,8 @@ func (s *tableService) patch(input tablePatch) (*tableRecord, bool) {
 
 	cp := *t
 	cp.Labels = cloneLabels(cp.Labels)
+	cp.Schema = cloneTableFields(cp.Schema)
+	cp.Rows = cloneTableRows(cp.Rows)
 	return &cp, true
 }
 
@@ -221,7 +246,79 @@ func (s *tableService) update(input tableUpdate) (*tableRecord, bool) {
 
 	cp := *t
 	cp.Labels = cloneLabels(cp.Labels)
+	cp.Schema = cloneTableFields(cp.Schema)
+	cp.Rows = cloneTableRows(cp.Rows)
 	return &cp, true
+}
+
+func (s *tableService) getData(projectID, datasetID, tableID string) ([]tableField, [][]string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tables := s.ensureDatasetLocked(projectID, datasetID)
+	t := tables[tableID]
+	if t == nil {
+		return nil, nil, false
+	}
+	return cloneTableFields(t.Schema), cloneTableRows(t.Rows), true
+}
+
+func (s *tableService) upsertCopyDestination(dest tableReference, schema []tableField, rows [][]string, createDisposition, writeDisposition string) (int, error) {
+	projectID := strings.TrimSpace(dest.ProjectID)
+	datasetID := strings.TrimSpace(dest.DatasetID)
+	tableID := strings.TrimSpace(dest.TableID)
+	if projectID == "" || datasetID == "" || tableID == "" {
+		return 0, fmt.Errorf("destinationTable is required")
+	}
+
+	createDisposition = normalizeCreateDisposition(createDisposition)
+	writeDisposition = normalizeWriteDisposition(writeDisposition)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tables := s.ensureDatasetLocked(projectID, datasetID)
+	existing := tables[tableID]
+	if existing == nil {
+		if createDisposition == "CREATE_NEVER" {
+			return 0, fmt.Errorf("destination table not found with CREATE_NEVER")
+		}
+		now := time.Now().UTC()
+		existing = &tableRecord{
+			ProjectID: projectID,
+			DatasetID: datasetID,
+			TableID:   tableID,
+			CreatedAt: now,
+			UpdatedAt: now,
+			Version:   1,
+		}
+		tables[tableID] = existing
+	} else {
+		if writeDisposition == "WRITE_EMPTY" && len(existing.Rows) > 0 {
+			return 0, fmt.Errorf("destination table is not empty")
+		}
+	}
+
+	if writeDisposition == "WRITE_APPEND" && len(existing.Schema) > 0 && len(schema) > 0 && !sameSchema(existing.Schema, schema) {
+		return 0, fmt.Errorf("source and destination schemas do not match for WRITE_APPEND")
+	}
+
+	if writeDisposition == "WRITE_APPEND" {
+		existing.Rows = append(cloneTableRows(existing.Rows), cloneTableRows(rows)...)
+		if len(existing.Schema) == 0 {
+			existing.Schema = cloneTableFields(schema)
+		}
+	} else {
+		existing.Schema = cloneTableFields(schema)
+		existing.Rows = cloneTableRows(rows)
+	}
+	if len(existing.Schema) == 0 && len(existing.Rows) > 0 {
+		existing.Schema = inferSchemaFromRows(existing.Rows)
+	}
+	existing.UpdatedAt = time.Now().UTC()
+	existing.Version++
+	s.datasetVersions[s.datasetKey(projectID, datasetID)]++
+	return len(rows), nil
 }
 
 func (s *tableService) ensureDatasetLocked(projectID, datasetID string) map[string]*tableRecord {
@@ -239,7 +336,17 @@ func (s *tableService) ensureDatasetLocked(projectID, datasetID string) map[stri
 	tables = make(map[string]*tableRecord)
 	now := time.Now().UTC()
 	for _, id := range s.defaults {
-		tables[id] = &tableRecord{ProjectID: projectID, DatasetID: datasetID, TableID: id, CreatedAt: now, UpdatedAt: now, Version: 1}
+		schema, rows := defaultTableData(id)
+		tables[id] = &tableRecord{
+			ProjectID: projectID,
+			DatasetID: datasetID,
+			TableID:   id,
+			Schema:    schema,
+			Rows:      rows,
+			CreatedAt: now,
+			UpdatedAt: now,
+			Version:   1,
+		}
 	}
 	proj[datasetID] = tables
 	key := s.datasetKey(projectID, datasetID)
@@ -251,4 +358,79 @@ func (s *tableService) ensureDatasetLocked(projectID, datasetID string) map[stri
 
 func (s *tableService) datasetKey(projectID, datasetID string) string {
 	return projectID + ":" + datasetID
+}
+
+func cloneTableFields(fields []tableField) []tableField {
+	if len(fields) == 0 {
+		return nil
+	}
+	out := make([]tableField, len(fields))
+	copy(out, fields)
+	return out
+}
+
+func cloneTableRows(rows [][]string) [][]string {
+	if len(rows) == 0 {
+		return nil
+	}
+	out := make([][]string, len(rows))
+	for i, row := range rows {
+		out[i] = append([]string(nil), row...)
+	}
+	return out
+}
+
+func inferSchemaFromRows(rows [][]string) []tableField {
+	if len(rows) == 0 {
+		return nil
+	}
+	width := len(rows[0])
+	fields := make([]tableField, 0, width)
+	for i := 0; i < width; i++ {
+		fields = append(fields, tableField{Name: fmt.Sprintf("col_%d", i+1), Type: "STRING"})
+	}
+	return fields
+}
+
+func sameSchema(left, right []tableField) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i].Name != right[i].Name || left[i].Type != right[i].Type {
+			return false
+		}
+	}
+	return true
+}
+
+func normalizeCreateDisposition(v string) string {
+	v = strings.ToUpper(strings.TrimSpace(v))
+	if v == "CREATE_NEVER" {
+		return "CREATE_NEVER"
+	}
+	return "CREATE_IF_NEEDED"
+}
+
+func normalizeWriteDisposition(v string) string {
+	v = strings.ToUpper(strings.TrimSpace(v))
+	switch v {
+	case "WRITE_TRUNCATE", "WRITE_APPEND":
+		return v
+	default:
+		return "WRITE_EMPTY"
+	}
+}
+
+func defaultTableData(tableID string) ([]tableField, [][]string) {
+	switch tableID {
+	case "daily_metrics":
+		return []tableField{{Name: "metric_date", Type: "DATE"}, {Name: "metric_name", Type: "STRING"}, {Name: "metric_value", Type: "INT64"}}, [][]string{{"2026-07-18", "signups", "12"}, {"2026-07-19", "signups", "15"}, {"2026-07-20", "signups", "11"}, {"2026-07-21", "signups", "19"}}
+	case "events":
+		return []tableField{{Name: "event_id", Type: "INT64"}, {Name: "event_name", Type: "STRING"}}, [][]string{{"1", "page_view"}, {"2", "checkout"}, {"3", "purchase"}, {"4", "refund"}}
+	case "users":
+		return []tableField{{Name: "user_id", Type: "INT64"}, {Name: "user_name", Type: "STRING"}}, [][]string{{"1", "alice"}, {"2", "bob"}, {"3", "carol"}, {"4", "dave"}}
+	default:
+		return []tableField{{Name: "col_1", Type: "STRING"}, {Name: "col_2", Type: "STRING"}}, [][]string{{"1", "alpha"}, {"2", "beta"}, {"3", "gamma"}, {"4", "delta"}}
+	}
 }

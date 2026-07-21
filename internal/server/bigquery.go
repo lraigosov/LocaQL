@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -624,6 +625,9 @@ func renderTableResource(t *tableRecord) map[string]any {
 		"etag":             fmt.Sprintf("\"v%d\"", t.Version),
 		"creationTime":     fmt.Sprintf("%d", t.CreatedAt.UnixMilli()),
 		"lastModifiedTime": fmt.Sprintf("%d", t.UpdatedAt.UnixMilli()),
+		"schema": map[string]any{
+			"fields": renderTableSchemaFields(t.Schema),
+		},
 	}
 	if t.FriendlyName != "" {
 		resp["friendlyName"] = t.FriendlyName
@@ -695,20 +699,13 @@ func (s *Server) insertJob(w http.ResponseWriter, r *http.Request, projectID str
 	jobType := "query"
 	targetDataset := ""
 	targetTable := ""
+	sourceTables := []tableReference(nil)
+	createDisposition := ""
+	writeDisposition := ""
 	priority := "INTERACTIVE"
 	if r.Body != nil {
 		body, _ := io.ReadAll(r.Body)
 		if len(body) > 0 {
-			extractTableRef := func(v any) (string, string) {
-				m, ok := v.(map[string]any)
-				if !ok {
-					return "", ""
-				}
-				datasetID, _ := m["datasetId"].(string)
-				tableID, _ := m["tableId"].(string)
-				return strings.TrimSpace(datasetID), strings.TrimSpace(tableID)
-			}
-
 			var raw map[string]any
 			if err := json.Unmarshal(body, &raw); err == nil {
 				if conf, ok := raw["configuration"].(map[string]any); ok {
@@ -720,7 +717,8 @@ func (s *Server) insertJob(w http.ResponseWriter, r *http.Request, projectID str
 					if loadRaw, ok := conf["load"]; ok {
 						jobType = "load"
 						if loadCfg, ok := loadRaw.(map[string]any); ok {
-							targetDataset, targetTable = extractTableRef(loadCfg["destinationTable"])
+							dest := extractTableRef(loadCfg["destinationTable"], projectID)
+							targetDataset, targetTable = dest.DatasetID, dest.TableID
 						}
 					}
 					if _, ok := conf["extract"]; ok {
@@ -729,7 +727,18 @@ func (s *Server) insertJob(w http.ResponseWriter, r *http.Request, projectID str
 					if copyRaw, ok := conf["copy"]; ok {
 						jobType = "copy"
 						if copyCfg, ok := copyRaw.(map[string]any); ok {
-							targetDataset, targetTable = extractTableRef(copyCfg["destinationTable"])
+							dest := extractTableRef(copyCfg["destinationTable"], projectID)
+							targetDataset, targetTable = dest.DatasetID, dest.TableID
+							sourceTables = append(sourceTables, extractTableRefs(copyCfg["sourceTables"], projectID)...)
+							if singleSource := extractTableRef(copyCfg["sourceTable"], projectID); singleSource.DatasetID != "" && singleSource.TableID != "" {
+								sourceTables = append(sourceTables, singleSource)
+							}
+							if value, ok := copyCfg["createDisposition"].(string); ok {
+								createDisposition = value
+							}
+							if value, ok := copyCfg["writeDisposition"].(string); ok {
+								writeDisposition = value
+							}
 						}
 					}
 				}
@@ -762,6 +771,9 @@ func (s *Server) insertJob(w http.ResponseWriter, r *http.Request, projectID str
 		QueryText:     queryText,
 		JobType:       jobType,
 		Priority:      priority,
+		SourceTables:  sourceTables,
+		CreateDisposition: createDisposition,
+		WriteDisposition:  writeDisposition,
 		TargetDataset: targetDataset,
 		TargetTable:   targetTable,
 		IsScript:      isScript,
@@ -914,7 +926,7 @@ func (s *Server) writeQueryResults(w http.ResponseWriter, r *http.Request, proje
 	}
 
 	start, size := parsePagination(r, 20, 1000)
-	schema, values := simulateQueryResultTable(j.QueryText)
+	schema, values := s.simulateQueryResultTable(projectID, j.QueryText)
 	end := clampEnd(start, size, len(values))
 
 	rows := make([]map[string]any, 0, end-start)
@@ -949,13 +961,19 @@ func (s *Server) writeQueryResults(w http.ResponseWriter, r *http.Request, proje
 	writeJSON(w, http.StatusOK, resp)
 }
 
-func simulateQueryResultTable(queryText string) ([]map[string]string, [][]string) {
+func (s *Server) simulateQueryResultTable(projectID, queryText string) ([]map[string]string, [][]string) {
 	trimmed := strings.TrimSpace(queryText)
 	if trimmed == "" {
 		return []map[string]string{{"name": "result", "type": "STRING"}}, [][]string{{"query job executed"}}
 	}
 
 	lower := strings.ToLower(trimmed)
+	if schema, rows, ok := s.simulateInformationSchemaQuery(projectID, trimmed, lower); ok {
+		return schema, rows
+	}
+	if schema, rows, ok := s.simulateTableSelectQuery(projectID, trimmed); ok {
+		return schema, rows
+	}
 	if strings.HasPrefix(lower, "select") && !strings.Contains(lower, " from ") {
 		expr := strings.TrimSpace(trimmed[len("select"):])
 		if expr == "" {
@@ -993,11 +1011,14 @@ func simulateQueryResultTable(queryText string) ([]map[string]string, [][]string
 }
 
 func (s *Server) listTableData(w http.ResponseWriter, r *http.Request, projectID, datasetID, tableID string) {
-	rows := []tableRow{
-		{Values: []string{"1", "alice"}},
-		{Values: []string{"2", "bob"}},
-		{Values: []string{"3", "carol"}},
-		{Values: []string{"4", "dave"}},
+	_, rawRows, ok := s.tables.getData(projectID, datasetID, tableID)
+	if !ok {
+		writeError(w, http.StatusNotFound, fmt.Sprintf("Not found: Table %s:%s.%s", projectID, datasetID, tableID), "notFound")
+		return
+	}
+	rows := make([]tableRow, 0, len(rawRows))
+	for _, raw := range rawRows {
+		rows = append(rows, tableRow{Values: append([]string(nil), raw...)})
 	}
 
 	start, size := parsePagination(r, 2, 100000)
@@ -1033,6 +1054,178 @@ func (s *Server) listTableData(w http.ResponseWriter, r *http.Request, projectID
 		resp["nextPageToken"] = encodePageToken(end)
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func renderTableSchemaFields(fields []tableField) []map[string]string {
+	out := make([]map[string]string, 0, len(fields))
+	for _, field := range fields {
+		out = append(out, map[string]string{"name": field.Name, "type": field.Type})
+	}
+	return out
+}
+
+func extractTableRef(v any, defaultProjectID string) tableReference {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return tableReference{}
+	}
+	projectID, _ := m["projectId"].(string)
+	datasetID, _ := m["datasetId"].(string)
+	tableID, _ := m["tableId"].(string)
+	projectID = strings.TrimSpace(projectID)
+	if projectID == "" {
+		projectID = strings.TrimSpace(defaultProjectID)
+	}
+	return tableReference{ProjectID: projectID, DatasetID: strings.TrimSpace(datasetID), TableID: strings.TrimSpace(tableID)}
+}
+
+func extractTableRefs(v any, defaultProjectID string) []tableReference {
+	list, ok := v.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]tableReference, 0, len(list))
+	for _, raw := range list {
+		ref := extractTableRef(raw, defaultProjectID)
+		if ref.DatasetID != "" && ref.TableID != "" {
+			out = append(out, ref)
+		}
+	}
+	return out
+}
+
+var fromTablePattern = regexp.MustCompile("(?is)\\bfrom\\s+`?([a-zA-Z0-9_\\-\\.]+)`?")
+var informationSchemaPattern = regexp.MustCompile("(?is)(?:`?([a-zA-Z0-9_\\-]+)`?\\.)?(?:`?([a-zA-Z0-9_\\-]+)`?\\.)?information_schema\\.(schemata|tables|columns)")
+
+func (s *Server) simulateTableSelectQuery(projectID, queryText string) ([]map[string]string, [][]string, bool) {
+	matches := fromTablePattern.FindStringSubmatch(queryText)
+	if len(matches) < 2 {
+		return nil, nil, false
+	}
+	parts := strings.Split(strings.TrimSpace(matches[1]), ".")
+	ref := tableReference{ProjectID: projectID}
+	switch len(parts) {
+	case 3:
+		ref.ProjectID, ref.DatasetID, ref.TableID = parts[0], parts[1], parts[2]
+	case 2:
+		ref.DatasetID, ref.TableID = parts[0], parts[1]
+	default:
+		return nil, nil, false
+	}
+	fields, rows, ok := s.tables.getData(ref.ProjectID, ref.DatasetID, ref.TableID)
+	if !ok {
+		return nil, nil, false
+	}
+	return renderTableSchemaFields(fields), rows, true
+}
+
+func (s *Server) simulateInformationSchemaQuery(projectID, queryText, lower string) ([]map[string]string, [][]string, bool) {
+	if !strings.Contains(lower, "information_schema.") {
+		return nil, nil, false
+	}
+	matches := informationSchemaPattern.FindStringSubmatch(queryText)
+	if len(matches) < 4 {
+		return nil, nil, false
+	}
+	targetProjectID := projectID
+	targetDatasetID := ""
+	if strings.TrimSpace(matches[2]) != "" {
+		if strings.TrimSpace(matches[1]) != "" {
+			targetProjectID = strings.TrimSpace(matches[1])
+		}
+		targetDatasetID = strings.TrimSpace(matches[2])
+	} else if strings.TrimSpace(matches[1]) != "" {
+		targetDatasetID = strings.TrimSpace(matches[1])
+	}
+
+	objectType := strings.ToLower(strings.TrimSpace(matches[3]))
+	datasets, _, _ := s.datasets.list(targetProjectID, 0, 1000)
+	filterDataset := func(datasetID string) bool {
+		return targetDatasetID == "" || datasetID == targetDatasetID
+	}
+
+	switch objectType {
+	case "schemata":
+		rows := make([][]string, 0, len(datasets))
+		for _, ds := range datasets {
+			if !filterDataset(ds.DatasetID) {
+				continue
+			}
+			rows = append(rows, []string{targetProjectID, ds.DatasetID})
+		}
+		return []map[string]string{{"name": "catalog_name", "type": "STRING"}, {"name": "schema_name", "type": "STRING"}}, rows, true
+	case "tables":
+		rows := [][]string{}
+		for _, ds := range datasets {
+			if !filterDataset(ds.DatasetID) {
+				continue
+			}
+			tables, _, _ := s.tables.list(targetProjectID, ds.DatasetID, 0, 1000)
+			for _, table := range tables {
+				rows = append(rows, []string{targetProjectID, ds.DatasetID, table.TableID, "BASE TABLE"})
+			}
+		}
+		return []map[string]string{{"name": "table_catalog", "type": "STRING"}, {"name": "table_schema", "type": "STRING"}, {"name": "table_name", "type": "STRING"}, {"name": "table_type", "type": "STRING"}}, rows, true
+	case "columns":
+		rows := [][]string{}
+		for _, ds := range datasets {
+			if !filterDataset(ds.DatasetID) {
+				continue
+			}
+			tables, _, _ := s.tables.list(targetProjectID, ds.DatasetID, 0, 1000)
+			for _, table := range tables {
+				fields, _, ok := s.tables.getData(targetProjectID, ds.DatasetID, table.TableID)
+				if !ok {
+					continue
+				}
+				for i, field := range fields {
+					rows = append(rows, []string{targetProjectID, ds.DatasetID, table.TableID, field.Name, strconv.Itoa(i + 1), field.Type})
+				}
+			}
+		}
+		return []map[string]string{{"name": "table_catalog", "type": "STRING"}, {"name": "table_schema", "type": "STRING"}, {"name": "table_name", "type": "STRING"}, {"name": "column_name", "type": "STRING"}, {"name": "ordinal_position", "type": "INT64"}, {"name": "data_type", "type": "STRING"}}, rows, true
+	default:
+		return nil, nil, false
+	}
+}
+
+func (s *Server) executeCopyJob(job *jobRecord) (jobStatistics, error) {
+	if strings.TrimSpace(job.TargetDataset) == "" || strings.TrimSpace(job.TargetTable) == "" {
+		return jobStatistics{Executor: "copy", Simulated: false}, fmt.Errorf("destinationTable is required")
+	}
+	if len(job.SourceTables) == 0 {
+		return jobStatistics{Executor: "copy", Simulated: false}, fmt.Errorf("copy job requires at least one source table")
+	}
+	if !s.datasets.exists(job.ProjectID, job.TargetDataset) {
+		return jobStatistics{Executor: "copy", Simulated: false}, fmt.Errorf("destination dataset not found")
+	}
+
+	var schema []tableField
+	rows := make([][]string, 0)
+	for idx, source := range job.SourceTables {
+		if source.ProjectID == "" {
+			source.ProjectID = job.ProjectID
+		}
+		if !s.datasets.exists(source.ProjectID, source.DatasetID) {
+			return jobStatistics{Executor: "copy", Simulated: false}, fmt.Errorf("source dataset not found")
+		}
+		sourceSchema, sourceRows, ok := s.tables.getData(source.ProjectID, source.DatasetID, source.TableID)
+		if !ok {
+			return jobStatistics{Executor: "copy", Simulated: false}, fmt.Errorf("source table not found")
+		}
+		if idx == 0 {
+			schema = sourceSchema
+		} else if !sameSchema(schema, sourceSchema) {
+			return jobStatistics{Executor: "copy", Simulated: false}, fmt.Errorf("source tables must share the same schema")
+		}
+		rows = append(rows, sourceRows...)
+	}
+
+	outputRows, err := s.tables.upsertCopyDestination(tableReference{ProjectID: job.ProjectID, DatasetID: job.TargetDataset, TableID: job.TargetTable}, schema, rows, job.CreateDisposition, job.WriteDisposition)
+	if err != nil {
+		return jobStatistics{Executor: "copy", Simulated: false}, err
+	}
+	return jobStatistics{Executor: "copy", Simulated: false, TotalSlotMs: 30, ProcessedBytes: int64(outputRows * 128), OutputRows: int64(outputRows)}, nil
 }
 
 func parsePagination(r *http.Request, defaultSize, maxSize int) (start, size int) {
