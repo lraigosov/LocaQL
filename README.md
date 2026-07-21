@@ -62,9 +62,9 @@ Registry file:
 | Concurrent reads safety | Partial | `jobs.get` and `jobs.list` use read locks (`RWMutex`) |
 | Resource mutation serialization | Partial | Conflicting mutations serialized by `project:dataset.table` |
 | Catalog snapshot atomicity | Partial | Optional persisted state uses temp file replace to avoid partial commits |
-| INFORMATION_SCHEMA priority | Partial | Basic `SCHEMATA`, `TABLES`, `COLUMNS`, `JOBS` and `PARTITIONS` queries are served from the in-memory catalog |
+| INFORMATION_SCHEMA priority | Partial | Basic `SCHEMATA`, `SCHEMATA_OPTIONS`, `TABLES`, `COLUMNS`, `JOBS` and `PARTITIONS` queries are served from the in-memory catalog |
 | Standalone UI service | Partial | `cmd/locaql-ui` with dynamic capability-driven console and API proxy |
-| UI resource forms | Partial | Explorer can create datasets, create tables and edit basic table metadata against emulator REST endpoints |
+| UI resource forms | Partial | Explorer can create, update and delete datasets, create tables, and edit basic table metadata against emulator REST endpoints |
 
 ## Runtime Architecture
 
@@ -159,6 +159,6 @@ UI notes:
 Current UI scope:
 
 - Health and capabilities dashboard.
-- Dataset listing and basic dataset creation.
+- Dataset listing and dataset create/update/delete management.
 - Query job submission from SQL input.
 - Job list with selection, detail refresh, and cancellation.

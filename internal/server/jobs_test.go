@@ -418,6 +418,46 @@ func TestJobsSyncQuerySupportsInformationSchemaPartitions(t *testing.T) {
 	}
 }
 
+func TestJobsSyncQuerySupportsInformationSchemaSchemataOptions(t *testing.T) {
+	s := newTestServer()
+	patchReq := httptest.NewRequest(http.MethodPatch, "/bigquery/v2/projects/p1/datasets/analytics", strings.NewReader(`{"friendlyName":"Analytics DS","location":"US"}`))
+	patchReq.Header.Set("Content-Type", "application/json")
+	patchRes := httptest.NewRecorder()
+	s.Handler().ServeHTTP(patchRes, patchReq)
+	if patchRes.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", patchRes.Code)
+	}
+
+	body := `{"query":"SELECT * FROM p1.INFORMATION_SCHEMA.SCHEMATA_OPTIONS"}`
+	req := httptest.NewRequest(http.MethodPost, "/bigquery/v2/projects/p1/queries", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	res := httptest.NewRecorder()
+	s.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", res.Code)
+	}
+
+	var out map[string]any
+	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+		t.Fatalf("decode schemata options response: %v", err)
+	}
+	rows, ok := out["rows"].([]any)
+	if !ok || len(rows) == 0 {
+		t.Fatalf("expected rows from INFORMATION_SCHEMA.SCHEMATA_OPTIONS")
+	}
+	foundLocation := false
+	for _, row := range rows {
+		cells := row.(map[string]any)["f"].([]any)
+		if cells[2].(map[string]any)["v"] == "location" && cells[4].(map[string]any)["v"] == "US" {
+			foundLocation = true
+			break
+		}
+	}
+	if !foundLocation {
+		t.Fatalf("expected location option in schemata options rows")
+	}
+}
+
 func TestJobsGetQueryResults(t *testing.T) {
 	s := newTestServer()
 	body := `{"configuration":{"query":{"query":"SELECT 1 AS one, 'two' AS two"}}}`

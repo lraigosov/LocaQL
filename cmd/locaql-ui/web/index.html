@@ -77,6 +77,13 @@
           <input id="newDatasetId" placeholder="new dataset id" required />
           <button type="submit">Create</button>
         </form>
+        <form id="updateDatasetForm" class="compact-form">
+          <input id="datasetMetaDatasetId" placeholder="dataset id" />
+          <input id="datasetFriendlyNameInput" placeholder="friendly name" />
+          <input id="datasetLocationInput" placeholder="location" />
+          <button type="submit">Save Dataset</button>
+          <button id="deleteDatasetBtn" type="button">Delete Dataset</button>
+        </form>
         <form id="createTableForm" class="compact-form">
           <input id="newTableDatasetId" placeholder="dataset id" />
           <input id="newTableId" placeholder="new table id" required />
@@ -297,6 +304,6 @@
     </section>
   </main>
 
-  <script src="/web/app.js?v=11" type="module"></script>
+  <script src="/web/app.js?v=13" type="module"></script>
 </body>
 </html>

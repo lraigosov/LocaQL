@@ -155,11 +155,11 @@ capabilities:
       - unit/server/information_schema_priority_tables_columns
       - unit/server/information_schema_priority_jobs
       - unit/server/information_schema_priority_partitions
-    reason: basic SCHEMATA, TABLES, COLUMNS, JOBS and PARTITIONS query emulation is backed by the live in-memory catalog; broader semantic parity is still pending
+    reason: basic SCHEMATA, SCHEMATA_OPTIONS, TABLES, COLUMNS, JOBS and PARTITIONS query emulation is backed by the live in-memory catalog; broader semantic parity is still pending
   console.ui.resource_forms.basic:
     status: partial
     fidelity: medium
-    reason: explorer supports validated dataset creation, basic table creation and table metadata editing against emulator REST endpoints
+    reason: explorer supports validated dataset create/update/delete, basic table creation and table metadata editing against emulator REST endpoints
   emulator.health:
     status: supported
     fidelity: high
