@@ -55,13 +55,14 @@ Registry file:
 | Opaque pagination tokens | Supported | `nextPageToken` is opaque; legacy numeric token input remains accepted |
 | Jobs lifecycle | Supported | `PENDING -> RUNNING -> DONE`, cancel before/during run |
 | requestId idempotency | Partial | Implemented for `jobs.insert` subset with TTL |
-| Job executors (query/load/extract/copy) | Partial | Simulated execution and synthetic stats |
+| Job executors (query/load/extract/copy) | Partial | Query/load/extract remain simulated; copy jobs now create real destination table data in the local catalog |
 | Job persistence across restart | Partial | Optional local file persistence |
 | Job concurrency limit | Partial | Controlled with `LOCAQL_JOB_WORKERS` |
 | Storage Write backpressure | Partial | `load/copy` jobs throttled by `LOCAQL_STORAGE_WRITE_WORKERS` |
 | Concurrent reads safety | Partial | `jobs.get` and `jobs.list` use read locks (`RWMutex`) |
 | Resource mutation serialization | Partial | Conflicting mutations serialized by `project:dataset.table` |
 | Catalog snapshot atomicity | Partial | Optional persisted state uses temp file replace to avoid partial commits |
+| INFORMATION_SCHEMA priority | Partial | Basic `SCHEMATA`, `TABLES` and `COLUMNS` queries are served from the in-memory catalog |
 | Standalone UI service | Partial | `cmd/locaql-ui` with dynamic capability-driven console and API proxy |
 
 ## Runtime Architecture

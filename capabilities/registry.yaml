@@ -102,7 +102,8 @@ capabilities:
     fidelity: medium
     tests:
       - unit/server/jobs_executor_type_and_statistics
-    reason: simulated executors implemented with synthetic statistics; support for BATCH vs INTERACTIVE priority simulation added
+      - unit/server/jobs_copy_real_destination_data
+    reason: query, load and extract remain simulated; copy jobs now materialize real destination rows in the in-memory catalog and preserve basic table shape
   rest.jobs.errors.detailed:
     status: supported
     fidelity: medium
@@ -147,6 +148,12 @@ capabilities:
     fidelity: medium
     tests:
       - conformance/pagination/rest_tabledata_list_pagination
+  sql.information_schema.priority:
+    status: partial
+    fidelity: medium
+    tests:
+      - unit/server/information_schema_priority_tables_columns
+    reason: basic SCHEMATA, TABLES and COLUMNS query emulation is backed by the live in-memory catalog; broader semantic parity is still pending
   emulator.health:
     status: supported
     fidelity: high

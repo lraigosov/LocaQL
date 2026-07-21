@@ -26,6 +26,7 @@ func New(reg capabilities.Registry) *Server {
 		datasets: newDatasetService(),
 		tables:   newTableService(),
 	}
+	s.jobs.copyExecutor = s.executeCopyJob
 	s.routes()
 	return s
 }
