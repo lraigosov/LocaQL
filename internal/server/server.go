@@ -15,6 +15,7 @@ type Server struct {
 	registry capabilities.Registry
 	jobs     *jobService
 	datasets *datasetService
+	tables   *tableService
 }
 
 func New(reg capabilities.Registry) *Server {
@@ -23,6 +24,7 @@ func New(reg capabilities.Registry) *Server {
 		registry: reg,
 		jobs:     newJobService(),
 		datasets: newDatasetService(),
+		tables:   newTableService(),
 	}
 	s.routes()
 	return s

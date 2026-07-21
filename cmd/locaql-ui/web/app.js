@@ -37,6 +37,9 @@ const clearExplorerSearchBtn = document.getElementById("clearExplorerSearchBtn")
 const jobsList = document.getElementById("jobsList");
 const capabilitiesJson = document.getElementById("capabilitiesJson");
 const savedQueriesList = document.getElementById("savedQueriesList");
+const exportSavedQueriesBtn = document.getElementById("exportSavedQueriesBtn");
+const importSavedQueriesBtn = document.getElementById("importSavedQueriesBtn");
+const savedQueriesImportInput = document.getElementById("savedQueriesImportInput");
 
 let selectedJobId = "";
 let selectedDatasetId = "";
@@ -80,6 +83,42 @@ function getProjectId() {
   return projectInput.value.trim() || "p1";
 }
 
+function normalizeSavedQuery(item) {
+  if (!item || typeof item !== "object") {
+    return null;
+  }
+  const name = String(item.name || "").trim();
+  if (!name) {
+    return null;
+  }
+
+  let versions = [];
+  if (Array.isArray(item.versions) && item.versions.length > 0) {
+    versions = item.versions
+      .map((v) => ({
+        sql: String(v?.sql || "").trim(),
+        savedAt: Number(v?.savedAt) || Date.now(),
+      }))
+      .filter((v) => v.sql !== "");
+  } else {
+    const legacySQL = String(item.sql || "").trim();
+    if (legacySQL) {
+      versions = [{ sql: legacySQL, savedAt: Number(item.savedAt) || Date.now() }];
+    }
+  }
+
+  if (!versions.length) {
+    return null;
+  }
+
+  let currentVersion = Number(item.currentVersion);
+  if (!Number.isInteger(currentVersion) || currentVersion < 0 || currentVersion >= versions.length) {
+    currentVersion = versions.length - 1;
+  }
+
+  return { name, versions, currentVersion };
+}
+
 function getSavedQueries() {
   try {
     const raw = localStorage.getItem(savedQueriesStorageKey);
@@ -87,14 +126,131 @@ function getSavedQueries() {
       return [];
     }
     const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+    return parsed
+      .map(normalizeSavedQuery)
+      .filter((item) => item !== null)
+      .slice(0, 50);
   } catch (_) {
     return [];
   }
 }
 
 function setSavedQueries(items) {
-  localStorage.setItem(savedQueriesStorageKey, JSON.stringify(items));
+  const normalized = (items || [])
+    .map(normalizeSavedQuery)
+    .filter((item) => item !== null)
+    .slice(0, 50);
+  localStorage.setItem(savedQueriesStorageKey, JSON.stringify(normalized));
+}
+
+function upsertSavedQuery(name, sql) {
+  const safeName = String(name || "").trim();
+  const safeSQL = String(sql || "").trim();
+  if (!safeName || !safeSQL) {
+    return false;
+  }
+
+  const items = getSavedQueries();
+  const existing = items.find((q) => q.name === safeName);
+  if (!existing) {
+    items.unshift({
+      name: safeName,
+      versions: [{ sql: safeSQL, savedAt: Date.now() }],
+      currentVersion: 0,
+    });
+    setSavedQueries(items);
+    return true;
+  }
+
+  const current = existing.versions[existing.currentVersion] || existing.versions[existing.versions.length - 1];
+  if (current && current.sql === safeSQL) {
+    return false;
+  }
+
+  existing.versions.push({ sql: safeSQL, savedAt: Date.now() });
+  if (existing.versions.length > 20) {
+    existing.versions = existing.versions.slice(existing.versions.length - 20);
+  }
+  existing.currentVersion = existing.versions.length - 1;
+  setSavedQueries(items);
+  return true;
+}
+
+function mergeSavedQueries(importedItems) {
+  const current = getSavedQueries();
+  const byName = new Map(current.map((item) => [item.name, item]));
+
+  for (const raw of importedItems) {
+    const incoming = normalizeSavedQuery(raw);
+    if (!incoming) {
+      continue;
+    }
+
+    const existing = byName.get(incoming.name);
+    if (!existing) {
+      byName.set(incoming.name, incoming);
+      continue;
+    }
+
+    const mergedVersions = [...existing.versions];
+    for (const version of incoming.versions) {
+      const duplicated = mergedVersions.some((v) => v.sql === version.sql && v.savedAt === version.savedAt);
+      if (!duplicated) {
+        mergedVersions.push(version);
+      }
+    }
+    mergedVersions.sort((a, b) => a.savedAt - b.savedAt);
+    existing.versions = mergedVersions.slice(-20);
+    existing.currentVersion = existing.versions.length - 1;
+  }
+
+  const merged = Array.from(byName.values()).slice(0, 50);
+  setSavedQueries(merged);
+}
+
+async function importSavedQueriesFromFile(file) {
+  const text = await file.text();
+  const parsed = JSON.parse(text);
+  if (!Array.isArray(parsed)) {
+    throw new Error("Invalid JSON format: expected an array");
+  }
+  mergeSavedQueries(parsed);
+}
+
+function exportSavedQueries() {
+  const items = getSavedQueries();
+  const blob = new Blob([JSON.stringify(items, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `locaql-saved-queries-${new Date().toISOString().slice(0, 10)}.json`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+async function copyQueryShareLink(sql) {
+  const url = new URL(window.location.href);
+  url.searchParams.set("query", sql);
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    await navigator.clipboard.writeText(url.toString());
+  } else {
+    window.prompt("Copy query URL:", url.toString());
+  }
+}
+
+function loadQueryFromURL() {
+  const url = new URL(window.location.href);
+  const queryParam = url.searchParams.get("query");
+  if (!queryParam) {
+    return;
+  }
+  queryText.value = queryParam;
+  queryRunStatus.textContent = "query loaded from URL";
 }
 
 function applyTheme(theme) {
@@ -390,19 +546,52 @@ function renderSavedQueries() {
   }
 
   for (const item of items) {
+    const activeVersion = item.versions[item.currentVersion] || item.versions[item.versions.length - 1];
     const li = document.createElement("li");
     const row = document.createElement("div");
     row.className = "row-actions";
 
     const label = document.createElement("span");
-    label.textContent = item.name;
+    label.textContent = `${item.name} (v${item.currentVersion + 1}/${item.versions.length})`;
     label.className = "meta-text";
 
     const loadBtn = document.createElement("button");
     loadBtn.type = "button";
     loadBtn.textContent = "Load";
     loadBtn.addEventListener("click", () => {
-      queryText.value = item.sql || "";
+      queryText.value = activeVersion?.sql || "";
+    });
+
+    const prevBtn = document.createElement("button");
+    prevBtn.type = "button";
+    prevBtn.textContent = "Prev";
+    prevBtn.disabled = item.currentVersion === 0;
+    prevBtn.addEventListener("click", () => {
+      item.currentVersion = Math.max(0, item.currentVersion - 1);
+      setSavedQueries(items);
+      renderSavedQueries();
+    });
+
+    const nextBtn = document.createElement("button");
+    nextBtn.type = "button";
+    nextBtn.textContent = "Next";
+    nextBtn.disabled = item.currentVersion >= item.versions.length - 1;
+    nextBtn.addEventListener("click", () => {
+      item.currentVersion = Math.min(item.versions.length - 1, item.currentVersion + 1);
+      setSavedQueries(items);
+      renderSavedQueries();
+    });
+
+    const shareBtn = document.createElement("button");
+    shareBtn.type = "button";
+    shareBtn.textContent = "Share";
+    shareBtn.addEventListener("click", async () => {
+      try {
+        await copyQueryShareLink(activeVersion?.sql || "");
+        queryRunStatus.textContent = "query link copied";
+      } catch (_) {
+        queryRunStatus.textContent = "unable to copy link";
+      }
     });
 
     const delBtn = document.createElement("button");
@@ -416,6 +605,9 @@ function renderSavedQueries() {
 
     row.appendChild(label);
     row.appendChild(loadBtn);
+    row.appendChild(prevBtn);
+    row.appendChild(nextBtn);
+    row.appendChild(shareBtn);
     row.appendChild(delBtn);
     li.appendChild(row);
     savedQueriesList.appendChild(li);
@@ -488,9 +680,7 @@ async function saveQueryShortcut() {
     return;
   }
 
-  const items = getSavedQueries().filter((q) => q.name !== name);
-  items.unshift({ name, sql, savedAt: Date.now() });
-  setSavedQueries(items.slice(0, 20));
+  upsertSavedQuery(name, sql);
   savedQueryName.value = "";
   renderSavedQueries();
   queryRunStatus.textContent = "query saved";
@@ -568,12 +758,40 @@ saveQueryForm.addEventListener("submit", (event) => {
     return;
   }
 
-  const items = getSavedQueries().filter((q) => q.name !== name);
-  items.unshift({ name, sql, savedAt: Date.now() });
-  setSavedQueries(items.slice(0, 20));
+  upsertSavedQuery(name, sql);
   savedQueryName.value = "";
   renderSavedQueries();
 });
+
+if (exportSavedQueriesBtn) {
+  exportSavedQueriesBtn.addEventListener("click", () => {
+    exportSavedQueries();
+    queryRunStatus.textContent = "saved queries exported";
+  });
+}
+
+if (importSavedQueriesBtn && savedQueriesImportInput) {
+  importSavedQueriesBtn.addEventListener("click", () => {
+    savedQueriesImportInput.click();
+  });
+
+  savedQueriesImportInput.addEventListener("change", async (event) => {
+    const file = event.target.files && event.target.files[0];
+    if (!file) {
+      return;
+    }
+    try {
+      await importSavedQueriesFromFile(file);
+      renderSavedQueries();
+      queryRunStatus.textContent = "saved queries imported";
+    } catch (err) {
+      queryRunStatus.textContent = "import failed";
+      alert(`Import failed: ${err.message}`);
+    } finally {
+      savedQueriesImportInput.value = "";
+    }
+  });
+}
 
 clearJobsFiltersBtn.addEventListener("click", async () => {
   jobsStateFilter.value = "";
@@ -699,6 +917,7 @@ jobsNextBtn.disabled = true;
 jobsPageHint.textContent = "page: start";
 const initialTheme = localStorage.getItem(themeStorageKey) || "light";
 applyTheme(initialTheme);
+loadQueryFromURL();
 renderSavedQueries();
 refreshAll();
 setInterval(refreshAll, 5000);
