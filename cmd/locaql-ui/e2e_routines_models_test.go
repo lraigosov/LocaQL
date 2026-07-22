@@ -26,11 +26,12 @@ func TestE2E_RoutinesModelsCrud(t *testing.T) {
 		t.Fatalf("create dataset: %v", err)
 	}
 
-	// --- Routine: create, view details, edit description, delete ---
+	// --- Routine: create (with arguments), view details, edit description, delete ---
 	if err := run(ctx,
 		setValue("newRoutineDatasetId", datasetID),
 		setValue("newRoutineId", routineID),
 		setValue("newRoutineDefinitionBody", "x + 1"),
+		setValue("newRoutineArguments", `[{"name":"x","dataType":"INT64"}]`),
 		submitForm("createRoutineForm"),
 		pollTrue(treeContainsExpr(routineID)),
 		pollTrue(`document.getElementById("resourceDetailsTitle").textContent === "Routine Details"`),
@@ -44,6 +45,9 @@ func TestE2E_RoutinesModelsCrud(t *testing.T) {
 	}
 	if !strings.Contains(routineJSON, routineID) || !strings.Contains(routineJSON, "x + 1") {
 		t.Errorf("expected routine details JSON to reflect %s / definitionBody, got %q", routineID, routineJSON)
+	}
+	if !strings.Contains(routineJSON, `"dataType": "INT64"`) {
+		t.Errorf("expected routine details JSON to reflect the arguments submitted via the UI form, got %q", routineJSON)
 	}
 
 	if err := run(ctx,
