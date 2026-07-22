@@ -16,6 +16,8 @@ type Server struct {
 	jobs     *jobService
 	datasets *datasetService
 	tables   *tableService
+	routines *routineService
+	models   *modelService
 }
 
 func New(reg capabilities.Registry) *Server {
@@ -25,9 +27,13 @@ func New(reg capabilities.Registry) *Server {
 		jobs:     newJobService(),
 		datasets: newDatasetService(),
 		tables:   newTableService(),
+		routines: newRoutineService(),
+		models:   newModelService(),
 	}
 	s.jobs.copyExecutor = s.executeCopyJob
 	s.jobs.loadExecutor = s.executeLoadJob
+	s.jobs.extractExecutor = s.executeExtractJob
+	s.jobs.queryExecutor = s.executeQueryJob
 	s.routes()
 	return s
 }
@@ -41,6 +47,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/_emulator/readiness", s.readiness)
 	s.mux.HandleFunc("/_emulator/version", s.version)
 	s.mux.HandleFunc("/_emulator/capabilities", s.capabilities)
+	s.mux.HandleFunc("/_emulator/datasets/undelete", s.undeleteDataset)
 	s.mux.HandleFunc("/bigquery/v2/projects/", s.bigQueryV2)
 }
 
