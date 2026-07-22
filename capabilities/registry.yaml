@@ -76,6 +76,20 @@ capabilities:
     fidelity: medium
     tests:
       - unit/server/tables_update
+  rest.tables.external_data_configuration:
+    status: partial
+    fidelity: medium
+    tests:
+      - unit/server/external_table_insert_requires_source_uris
+      - unit/server/external_table_insert_requires_source_format
+      - unit/server/external_table_insert_requires_schema
+      - unit/server/external_table_insert_renders_type_and_config
+      - unit/server/external_table_query_reflects_live_file_contents
+      - unit/server/external_table_tabledata_list_reads_file
+      - unit/server/external_table_unreadable_source_fails_query_explicitly
+      - unit/server/external_table_information_schema_tables_marks_type_external
+      - unit/server/external_table_copy_job_materializes_into_destination
+    reason: "tables.insert accepts externalDataConfiguration (sourceUris/sourceFormat/fieldDelimiter/skipLeadingRows, mirroring configuration.load's flat field layout instead of real BigQuery's nested csvOptions) with an explicit schema.fields required (no autodetect); nothing is materialized at creation time — every consumer of real row data (query execution, tabledata.list, copy/extract job sources, INFORMATION_SCHEMA.PARTITIONS row counts) re-reads sourceUris fresh through a single resolveTableRows choke point, so external tables always reflect current file contents. An unreadable source fails the request/job explicitly instead of silently falling back to empty or simulated data. Supported sourceFormat values are the same four as load/extract (NEWLINE_DELIMITED_JSON/CSV/AVRO/PARQUET); ORC and other formats, patching externalDataConfiguration after creation, autodetect, Hive partitioning and compression options are not supported"
   rest.jobs.list.pagination:
     status: supported
     fidelity: medium
@@ -185,7 +199,11 @@ capabilities:
   console.ui.resource_forms.basic:
     status: partial
     fidelity: medium
-    reason: explorer supports validated dataset create/update/delete with labels, basic table creation, table metadata editing, table labels editing and a selected-dataset summary panel against emulator REST endpoints
+    reason: explorer supports validated dataset create/update/delete (with labels and defaultTableExpirationMs), a dataset delete flow that detects non-empty datasets and retries with deleteContents=true, a Dataset Undelete form, basic table creation, table metadata editing, table labels editing and a selected-dataset summary panel against emulator REST endpoints
+  console.ui.external_tables:
+    status: partial
+    fidelity: medium
+    reason: a dedicated Explorer form creates external tables (schema.fields JSON, sourceUris, sourceFormat select, CSV fieldDelimiter/skipLeadingRows) against tables.insert's externalDataConfiguration (see rest.tables.external_data_configuration); the table details panel shows Type EXTERNAL plus a raw External Data Configuration block, and the Explorer tree marks external table nodes with an "(external)" suffix. Preview/query/copy/extract from the UI read the same live file contents as a direct API call, since they go through the same backend endpoints
   emulator.health:
     status: supported
     fidelity: high
@@ -236,10 +254,14 @@ capabilities:
     status: partial
     fidelity: medium
     reason: appbar and side navigation actions are wired to emulator-backed views for search, jobs, history and capabilities
-  console.ui.explorer.placeholders.routines_models:
+  console.ui.explorer.routines_models_crud:
     status: partial
-    fidelity: low
-    reason: explorer renders explicit placeholders for routines and models to expose unsupported catalog categories without pretending backend parity
+    fidelity: medium
+    reason: explorer renders real routine and model nodes per dataset (backed by rest.routines.crud/rest.models.crud), with sidebar forms to create either, a selection flow that opens a resource details panel (raw JSON, friendlyName/description edit, delete), fidelity stays medium/partial because the underlying routines and models are metadata-only, not executable
+  console.ui.load_extract_workspace:
+    status: partial
+    fidelity: medium
+    reason: dedicated Load / Extract tab submits real load jobs (NDJSON/CSV/AVRO/PARQUET sourceUris, schema, write disposition, CSV delimiter/skip rows) and real extract jobs (destination format, field delimiter, printHeader) through jobs.insert, showing the immediate job-creation response with a hint to check the Jobs tab for final DONE-state statistics
   console.ui.table_actions.query_copy_delete:
     status: partial
     fidelity: medium

@@ -13,6 +13,7 @@ const themeToggle = document.getElementById("themeToggle");
 const createDatasetForm = document.getElementById("createDatasetForm");
 const updateDatasetForm = document.getElementById("updateDatasetForm");
 const createTableForm = document.getElementById("createTableForm");
+const createExternalTableForm = document.getElementById("createExternalTableForm");
 const deleteDatasetBtn = document.getElementById("deleteDatasetBtn");
 const updateTableMetaForm = document.getElementById("updateTableMetaForm");
 const saveQueryForm = document.getElementById("saveQueryForm");
@@ -53,7 +54,27 @@ const explorerCapabilityFilter = document.getElementById("explorerCapabilityFilt
 const datasetMetaDatasetId = document.getElementById("datasetMetaDatasetId");
 const datasetFriendlyNameInput = document.getElementById("datasetFriendlyNameInput");
 const datasetLocationInput = document.getElementById("datasetLocationInput");
+const datasetExpirationInput = document.getElementById("datasetExpirationInput");
 const datasetLabelsInput = document.getElementById("datasetLabelsInput");
+const undeleteDatasetForm = document.getElementById("undeleteDatasetForm");
+const undeleteDatasetId = document.getElementById("undeleteDatasetId");
+const createRoutineForm = document.getElementById("createRoutineForm");
+const createModelForm = document.getElementById("createModelForm");
+const resourceDetailsPanel = document.getElementById("resource-details-panel");
+const resourceDetailsTitle = document.getElementById("resourceDetailsTitle");
+const resourceDetailsMeta = document.getElementById("resourceDetailsMeta");
+const resourceDetailsJson = document.getElementById("resourceDetailsJson");
+const deleteResourceBtn = document.getElementById("deleteResourceBtn");
+const resourceActionStatus = document.getElementById("resourceActionStatus");
+const updateResourceMetaForm = document.getElementById("updateResourceMetaForm");
+const resourceFriendlyNameInput = document.getElementById("resourceFriendlyNameInput");
+const resourceDescriptionInput = document.getElementById("resourceDescriptionInput");
+const loadJobForm = document.getElementById("loadJobForm");
+const loadJobStatus = document.getElementById("loadJobStatus");
+const loadJobResult = document.getElementById("loadJobResult");
+const extractJobForm = document.getElementById("extractJobForm");
+const extractJobStatus = document.getElementById("extractJobStatus");
+const extractJobResult = document.getElementById("extractJobResult");
 const datasetSummaryStatus = document.getElementById("datasetSummaryStatus");
 const datasetSummaryCapabilityNote = document.getElementById("datasetSummaryCapabilityNote");
 const datasetSummaryId = document.getElementById("datasetSummaryId");
@@ -69,11 +90,14 @@ const breadcrumbDatasetChip = document.getElementById("breadcrumbDatasetChip");
 const breadcrumbTableChip = document.getElementById("breadcrumbTableChip");
 const tableDetailsMeta = document.getElementById("tableDetailsMeta");
 const tableInfoName = document.getElementById("tableInfoName");
+const tableInfoType = document.getElementById("tableInfoType");
 const tableInfoDescription = document.getElementById("tableInfoDescription");
 const tableInfoETag = document.getElementById("tableInfoETag");
 const tableInfoCreated = document.getElementById("tableInfoCreated");
 const tableInfoUpdated = document.getElementById("tableInfoUpdated");
 const tableInfoLabels = document.getElementById("tableInfoLabels");
+const tableInfoExternalSection = document.getElementById("tableInfoExternalSection");
+const tableInfoExternal = document.getElementById("tableInfoExternal");
 const tableFriendlyNameInput = document.getElementById("tableFriendlyNameInput");
 const tableDescriptionInput = document.getElementById("tableDescriptionInput");
 const tableLabelsInput = document.getElementById("tableLabelsInput");
@@ -104,7 +128,11 @@ let explorerFilterText = "";
 let explorerCapabilityFilterText = "all";
 let explorerDatasetsCache = [];
 let explorerTablesCache = new Map();
+let explorerRoutinesCache = new Map();
+let explorerModelsCache = new Map();
 let explorerCollapsedDatasets = new Set();
+let selectedResourceKind = "";
+let selectedResourceId = "";
 let capabilityCounts = { supported: 0, partial: 0, unsupported: 0 };
 let capabilityStatusByKey = new Map();
 
@@ -188,6 +216,9 @@ function syncDatasetMetaInputs() {
   }
   if (datasetLocationInput) {
     datasetLocationInput.value = (match && match.location) || "";
+  }
+  if (datasetExpirationInput) {
+    datasetExpirationInput.value = (match && match.defaultTableExpirationMs) || "";
   }
   if (datasetLabelsInput) {
     datasetLabelsInput.value = match && match.labels ? JSON.stringify(match.labels) : "";
@@ -289,9 +320,15 @@ function updateExplorerCapabilityFilterOptions() {
       });
     }
 
-    const routineSearchMatch = !searchTerm || matchExplorerFilter("routines", searchTerm);
-    const modelSearchMatch = !searchTerm || matchExplorerFilter("models", searchTerm);
-    const hasVisibleChildren = filteredTables.length > 0 || routineSearchMatch || modelSearchMatch;
+    const routines = (explorerRoutinesCache.get(datasetId) || []).filter((r) => {
+      const routineId = (r.routineReference || {}).routineId || "";
+      return !searchTerm || matchExplorerFilter(routineId, searchTerm);
+    });
+    const models = (explorerModelsCache.get(datasetId) || []).filter((m) => {
+      const modelId = (m.modelReference || {}).modelId || "";
+      return !searchTerm || matchExplorerFilter(modelId, searchTerm);
+    });
+    const hasVisibleChildren = filteredTables.length > 0 || routines.length > 0 || models.length > 0;
     const visibleBySearch = !searchTerm || projectMatches || datasetMatches || hasVisibleChildren;
     if (!visibleBySearch) {
       continue;
@@ -317,12 +354,11 @@ function updateExplorerCapabilityFilterOptions() {
     ]);
     counts[tableStatus] = (counts[tableStatus] || 0) + filteredTables.length;
 
-    if (routineSearchMatch) {
-      counts.unsupported += 1;
-    }
-    if (modelSearchMatch) {
-      counts.unsupported += 1;
-    }
+    const routineStatus = combineCapabilityStatus(["rest.routines.crud"]);
+    counts[routineStatus] = (counts[routineStatus] || 0) + routines.length;
+
+    const modelStatus = combineCapabilityStatus(["rest.models.crud"]);
+    counts[modelStatus] = (counts[modelStatus] || 0) + models.length;
   }
 
   for (const option of explorerCapabilityFilter.options) {
@@ -384,6 +420,9 @@ function querySelectedDataset() {
 async function selectDataset(projectId, datasetId) {
   selectedDatasetId = datasetId;
   selectedTableId = "";
+  selectedResourceKind = "";
+  selectedResourceId = "";
+  hideResourceDetailsPanel();
   syncCreateTableDatasetInput();
   syncDatasetMetaInputs();
   if (breadcrumbDatasetChip) {
@@ -419,6 +458,9 @@ function updateTableActionState(statusText) {
 async function selectTable(projectId, datasetId, tableId) {
   selectedDatasetId = datasetId;
   selectedTableId = tableId;
+  selectedResourceKind = "";
+  selectedResourceId = "";
+  hideResourceDetailsPanel();
   syncCreateTableDatasetInput();
   syncDatasetMetaInputs();
   if (breadcrumbDatasetChip) {
@@ -433,6 +475,92 @@ async function selectTable(projectId, datasetId, tableId) {
     loadTableDetails(projectId, datasetId, tableId),
   ]);
   updateTableActionState();
+}
+
+function hideResourceDetailsPanel() {
+  if (resourceDetailsPanel) {
+    resourceDetailsPanel.style.display = "none";
+  }
+}
+
+function updateResourceActionState(statusText) {
+  const enabled = Boolean(selectedResourceKind && selectedResourceId);
+  if (deleteResourceBtn) deleteResourceBtn.disabled = !enabled;
+  if (resourceActionStatus) {
+    resourceActionStatus.textContent = statusText
+      || (enabled ? `${selectedDatasetId}.${selectedResourceId} selected` : "select a routine or model to enable actions");
+  }
+}
+
+async function selectRoutine(projectId, datasetId, routineId) {
+  selectedDatasetId = datasetId;
+  selectedTableId = "";
+  selectedResourceKind = "routine";
+  selectedResourceId = routineId;
+  syncCreateTableDatasetInput();
+  syncDatasetMetaInputs();
+  if (breadcrumbDatasetChip) breadcrumbDatasetChip.textContent = datasetId;
+  if (breadcrumbTableChip) breadcrumbTableChip.textContent = routineId || "Routine";
+  await renderExplorerTree(projectId);
+  await loadRoutineDetails(projectId, datasetId, routineId);
+  updateResourceActionState();
+}
+
+async function selectModel(projectId, datasetId, modelId) {
+  selectedDatasetId = datasetId;
+  selectedTableId = "";
+  selectedResourceKind = "model";
+  selectedResourceId = modelId;
+  syncCreateTableDatasetInput();
+  syncDatasetMetaInputs();
+  if (breadcrumbDatasetChip) breadcrumbDatasetChip.textContent = datasetId;
+  if (breadcrumbTableChip) breadcrumbTableChip.textContent = modelId || "Model";
+  await renderExplorerTree(projectId);
+  await loadModelDetails(projectId, datasetId, modelId);
+  updateResourceActionState();
+}
+
+async function loadRoutineDetails(projectId, datasetId, routineId) {
+  if (resourceDetailsPanel) resourceDetailsPanel.style.display = "block";
+  if (resourceDetailsTitle) resourceDetailsTitle.textContent = "Routine Details";
+  try {
+    const routine = await fetchJson(`/api/bigquery/v2/projects/${encodeURIComponent(projectId)}/datasets/${encodeURIComponent(datasetId)}/routines/${encodeURIComponent(routineId)}`);
+    if (resourceDetailsMeta) resourceDetailsMeta.textContent = `${projectId}:${datasetId}.${routineId} (metadata-only: no SQL execution)`;
+    if (resourceFriendlyNameInput) {
+      resourceFriendlyNameInput.value = "";
+      resourceFriendlyNameInput.disabled = true;
+      resourceFriendlyNameInput.placeholder = "friendlyName (models only)";
+    }
+    if (resourceDescriptionInput) {
+      resourceDescriptionInput.disabled = false;
+      resourceDescriptionInput.value = routine.description || "";
+    }
+    if (resourceDetailsJson) resourceDetailsJson.textContent = JSON.stringify(routine, null, 2);
+  } catch (err) {
+    if (resourceDetailsMeta) resourceDetailsMeta.textContent = `failed to load routine: ${err.message}`;
+    if (resourceDetailsJson) resourceDetailsJson.textContent = "";
+  }
+}
+
+async function loadModelDetails(projectId, datasetId, modelId) {
+  if (resourceDetailsPanel) resourceDetailsPanel.style.display = "block";
+  if (resourceDetailsTitle) resourceDetailsTitle.textContent = "Model Details";
+  try {
+    const model = await fetchJson(`/api/bigquery/v2/projects/${encodeURIComponent(projectId)}/datasets/${encodeURIComponent(datasetId)}/models/${encodeURIComponent(modelId)}`);
+    if (resourceDetailsMeta) resourceDetailsMeta.textContent = `${projectId}:${datasetId}.${modelId} (metadata-only: no training/inference)`;
+    if (resourceFriendlyNameInput) {
+      resourceFriendlyNameInput.disabled = false;
+      resourceFriendlyNameInput.value = model.friendlyName || "";
+    }
+    if (resourceDescriptionInput) {
+      resourceDescriptionInput.disabled = false;
+      resourceDescriptionInput.value = model.description || "";
+    }
+    if (resourceDetailsJson) resourceDetailsJson.textContent = JSON.stringify(model, null, 2);
+  } catch (err) {
+    if (resourceDetailsMeta) resourceDetailsMeta.textContent = `failed to load model: ${err.message}`;
+    if (resourceDetailsJson) resourceDetailsJson.textContent = "";
+  }
 }
 
 function inferValueType(value) {
@@ -663,6 +791,8 @@ async function loadDatasets(projectId) {
   const data = await fetchJson(`/api/bigquery/v2/projects/${encodeURIComponent(projectId)}/datasets?maxResults=50`);
   explorerDatasetsCache = data.datasets || [];
   explorerTablesCache = new Map();
+  explorerRoutinesCache = new Map();
+  explorerModelsCache = new Map();
 
   await Promise.all(explorerDatasetsCache.map(async (ds) => {
     const dsRef = ds.datasetReference || {};
@@ -675,6 +805,18 @@ async function loadDatasets(projectId) {
       explorerTablesCache.set(datasetId, tablesResp.tables || []);
     } catch (_) {
       explorerTablesCache.set(datasetId, []);
+    }
+    try {
+      const routinesResp = await fetchJson(`/api/bigquery/v2/projects/${encodeURIComponent(projectId)}/datasets/${encodeURIComponent(datasetId)}/routines?maxResults=50`);
+      explorerRoutinesCache.set(datasetId, routinesResp.routines || []);
+    } catch (_) {
+      explorerRoutinesCache.set(datasetId, []);
+    }
+    try {
+      const modelsResp = await fetchJson(`/api/bigquery/v2/projects/${encodeURIComponent(projectId)}/datasets/${encodeURIComponent(datasetId)}/models?maxResults=50`);
+      explorerModelsCache.set(datasetId, modelsResp.models || []);
+    } catch (_) {
+      explorerModelsCache.set(datasetId, []);
     }
   }));
 
@@ -732,12 +874,28 @@ async function renderExplorerTree(projectId) {
       })
       .filter((entry) => matchesCapabilityFilter(entry.status));
 
-    const routineSearchMatch = !searchTerm || matchExplorerFilter("routines", searchTerm);
-    const modelSearchMatch = !searchTerm || matchExplorerFilter("models", searchTerm);
-    const routineVisible = routineSearchMatch && matchesCapabilityFilter("unsupported");
-    const modelVisible = modelSearchMatch && matchesCapabilityFilter("unsupported");
+    const routines = explorerRoutinesCache.get(datasetId) || [];
+    const models = explorerModelsCache.get(datasetId) || [];
 
-    const hasVisibleChildren = filteredTableEntries.length > 0 || routineVisible || modelVisible;
+    const filteredRoutineEntries = routines
+      .map((r) => {
+        const rRef = r.routineReference || {};
+        const routineId = rRef.routineId || "";
+        const status = combineCapabilityStatus(["rest.routines.crud"]);
+        return { routine: r, routineId, status };
+      })
+      .filter((entry) => (!searchTerm || matchExplorerFilter(entry.routineId, searchTerm)) && matchesCapabilityFilter(entry.status));
+
+    const filteredModelEntries = models
+      .map((m) => {
+        const mRef = m.modelReference || {};
+        const modelId = mRef.modelId || "";
+        const status = combineCapabilityStatus(["rest.models.crud"]);
+        return { model: m, modelId, status };
+      })
+      .filter((entry) => (!searchTerm || matchExplorerFilter(entry.modelId, searchTerm)) && matchesCapabilityFilter(entry.status));
+
+    const hasVisibleChildren = filteredTableEntries.length > 0 || filteredRoutineEntries.length > 0 || filteredModelEntries.length > 0;
     const visibleBySearch = !searchTerm || projectMatches || datasetMatches || hasVisibleChildren;
     const visibleByCapability = matchesCapabilityFilter(datasetStatus) || hasVisibleChildren;
     if (!visibleBySearch || !visibleByCapability) {
@@ -819,7 +977,7 @@ async function renderExplorerTree(projectId) {
       }
       const tableName = document.createElement("span");
       tableName.className = "node-label";
-      tableName.textContent = tableId;
+      tableName.textContent = t.type === "EXTERNAL" ? `${tableId} (external)` : tableId;
       tableNode.appendChild(tableName);
 
       tableNode.appendChild(buildCapabilityBadge(entry.status, "Table capabilities"));
@@ -832,30 +990,42 @@ async function renderExplorerTree(projectId) {
       visibleNodes++;
     }
 
-    // Routines placeholder
-    if (routineVisible) {
+    for (const entry of filteredRoutineEntries) {
+      const routineId = entry.routineId;
       const routineNode = document.createElement("div");
-      routineNode.className = "node table meta-text";
-      routineNode.style.fontStyle = "italic";
+      routineNode.className = "node table";
+      if (datasetId === selectedDatasetId && selectedResourceKind === "routine" && routineId === selectedResourceId) {
+        routineNode.classList.add("active");
+      }
       const routineLabel = document.createElement("span");
       routineLabel.className = "node-label";
-      routineLabel.textContent = "Routines";
+      routineLabel.textContent = `ƒ ${routineId}`;
       routineNode.appendChild(routineLabel);
-      routineNode.appendChild(buildCapabilityBadge("unsupported", "Backend routine resources are not implemented"));
+      routineNode.appendChild(buildCapabilityBadge(entry.status, "Routine capabilities (metadata-only: no SQL execution)"));
+      routineNode.addEventListener("click", async () => {
+        await selectRoutine(projectId, datasetId, routineId);
+      });
       tableGroup.appendChild(routineNode);
+      visibleNodes++;
     }
 
-    // Models placeholder
-    if (modelVisible) {
+    for (const entry of filteredModelEntries) {
+      const modelId = entry.modelId;
       const modelNode = document.createElement("div");
-      modelNode.className = "node table meta-text";
-      modelNode.style.fontStyle = "italic";
+      modelNode.className = "node table";
+      if (datasetId === selectedDatasetId && selectedResourceKind === "model" && modelId === selectedResourceId) {
+        modelNode.classList.add("active");
+      }
       const modelLabel = document.createElement("span");
       modelLabel.className = "node-label";
-      modelLabel.textContent = "Models";
+      modelLabel.textContent = `◎ ${modelId}`;
       modelNode.appendChild(modelLabel);
-      modelNode.appendChild(buildCapabilityBadge("unsupported", "Backend model resources are not implemented"));
+      modelNode.appendChild(buildCapabilityBadge(entry.status, "Model capabilities (metadata-only: no training/inference)"));
+      modelNode.addEventListener("click", async () => {
+        await selectModel(projectId, datasetId, modelId);
+      });
       tableGroup.appendChild(modelNode);
+      visibleNodes++;
     }
 
     datasetSection.appendChild(tableGroup);
@@ -918,11 +1088,19 @@ async function loadTableDetails(projectId, datasetId, tableId) {
 
     tableDetailsMeta.textContent = `${projectId}:${datasetId}.${tableId}`;
     tableInfoName.textContent = tableMeta.id || `${projectId}:${datasetId}.${tableId}`;
+    tableInfoType.textContent = tableMeta.type || "TABLE";
     tableInfoDescription.textContent = tableMeta.description || "No description";
     tableInfoETag.textContent = tableMeta.etag || "-";
     tableInfoCreated.textContent = formatEpochMillis(tableMeta.creationTime);
     tableInfoUpdated.textContent = formatEpochMillis(tableMeta.lastModifiedTime);
     tableInfoLabels.textContent = JSON.stringify(tableMeta.labels || {}, null, 2);
+    if (tableMeta.externalDataConfiguration) {
+      tableInfoExternalSection.style.display = "";
+      tableInfoExternal.textContent = JSON.stringify(tableMeta.externalDataConfiguration, null, 2);
+    } else {
+      tableInfoExternalSection.style.display = "none";
+      tableInfoExternal.textContent = "{}";
+    }
     tableDetailsJson.textContent = JSON.stringify(tableMeta, null, 2);
     if (tableFriendlyNameInput) {
       tableFriendlyNameInput.value = tableMeta.friendlyName || "";
@@ -996,10 +1174,12 @@ async function loadTableDetails(projectId, datasetId, tableId) {
   } catch (err) {
     tableDetailsMeta.textContent = "table details unavailable";
     tableInfoName.textContent = "-";
+    tableInfoType.textContent = "-";
     tableInfoDescription.textContent = "-";
     tableInfoETag.textContent = "-";
     tableInfoCreated.textContent = "-";
     tableInfoUpdated.textContent = "-";
+    tableInfoExternalSection.style.display = "none";
     tableInfoLabels.textContent = "{}";
     if (tableFriendlyNameInput) {
       tableFriendlyNameInput.value = "";
@@ -1123,6 +1303,65 @@ async function updateSelectedTableMetadata() {
   } catch (err) {
     updateTableActionState("table metadata update failed");
     alert(`Update table metadata failed: ${err.message}`);
+  }
+}
+
+function resourceEndpoint(projectId, datasetId, resourceKind, resourceId) {
+  const kindPath = resourceKind === "routine" ? "routines" : "models";
+  return `/api/bigquery/v2/projects/${encodeURIComponent(projectId)}/datasets/${encodeURIComponent(datasetId)}/${kindPath}/${encodeURIComponent(resourceId)}`;
+}
+
+async function deleteSelectedResource() {
+  if (!selectedResourceKind || !selectedResourceId) {
+    return;
+  }
+  const projectId = getProjectId();
+  const full = `${selectedDatasetId}.${selectedResourceId}`;
+  const ok = window.confirm(`Delete ${selectedResourceKind} ${full}?`);
+  if (!ok) {
+    return;
+  }
+  try {
+    await fetchJson(resourceEndpoint(projectId, selectedDatasetId, selectedResourceKind, selectedResourceId), { method: "DELETE" });
+    updateResourceActionState(`${selectedResourceKind} deleted: ${full}`);
+    selectedResourceKind = "";
+    selectedResourceId = "";
+    hideResourceDetailsPanel();
+    await refreshAll();
+  } catch (err) {
+    updateResourceActionState("delete failed");
+    alert(`Delete ${selectedResourceKind} failed: ${err.message}`);
+  }
+}
+
+async function updateSelectedResourceMetadata() {
+  if (!selectedResourceKind || !selectedResourceId) {
+    return;
+  }
+  const projectId = getProjectId();
+  const body = selectedResourceKind === "model"
+    ? {
+      friendlyName: resourceFriendlyNameInput ? resourceFriendlyNameInput.value.trim() : "",
+      description: resourceDescriptionInput ? resourceDescriptionInput.value.trim() : "",
+    }
+    : {
+      description: resourceDescriptionInput ? resourceDescriptionInput.value.trim() : "",
+    };
+  try {
+    await fetchJson(resourceEndpoint(projectId, selectedDatasetId, selectedResourceKind, selectedResourceId), {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    updateResourceActionState(`${selectedResourceKind} metadata saved: ${selectedDatasetId}.${selectedResourceId}`);
+    if (selectedResourceKind === "routine") {
+      await loadRoutineDetails(projectId, selectedDatasetId, selectedResourceId);
+    } else {
+      await loadModelDetails(projectId, selectedDatasetId, selectedResourceId);
+    }
+  } catch (err) {
+    updateResourceActionState("metadata update failed");
+    alert(`Update ${selectedResourceKind} metadata failed: ${err.message}`);
   }
 }
 
@@ -1460,7 +1699,7 @@ function setActiveMainTab(targetId) {
   mainTabs.querySelectorAll(".tab").forEach((t) => t.classList.remove("active"));
   tab.classList.add("active");
 
-  ["query-workspace", "query-results-panel", "table-details-panel", "jobs-explorer", "details-section", "capabilities-view"].forEach((id) => {
+  ["query-workspace", "query-results-panel", "table-details-panel", "jobs-explorer", "details-section", "load-extract-workspace", "capabilities-view"].forEach((id) => {
     const section = document.getElementById(id);
     if (!section) {
       return;
@@ -1473,6 +1712,13 @@ function setActiveMainTab(targetId) {
 
     section.style.display = show ? "block" : "none";
   });
+
+  // resource-details-panel is managed programmatically (hidden until a
+  // routine/model is selected) except when navigating away from the Query
+  // tab entirely, where it must not stay visible alongside another tab.
+  if (resourceDetailsPanel && targetId !== "query-workspace") {
+    resourceDetailsPanel.style.display = "none";
+  }
 }
 
 function setActiveRail(nav) {
@@ -1733,14 +1979,20 @@ if (updateDatasetForm) {
         }
       }
 
+      const body = {
+        friendlyName: datasetFriendlyNameInput ? datasetFriendlyNameInput.value.trim() : "",
+        location: datasetLocationInput ? datasetLocationInput.value.trim() : "",
+        labels: labels,
+      };
+      const expirationRaw = datasetExpirationInput ? datasetExpirationInput.value.trim() : "";
+      if (expirationRaw) {
+        body.defaultTableExpirationMs = expirationRaw;
+      }
+
       await fetchJson(`/api/bigquery/v2/projects/${encodeURIComponent(projectId)}/datasets/${encodeURIComponent(datasetId)}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          friendlyName: datasetFriendlyNameInput ? datasetFriendlyNameInput.value.trim() : "",
-          location: datasetLocationInput ? datasetLocationInput.value.trim() : "",
-          labels: labels,
-        }),
+        body: JSON.stringify(body),
       });
       selectedDatasetId = datasetId;
       await refreshAll();
@@ -1766,14 +2018,53 @@ if (deleteDatasetBtn) {
       await fetchJson(`/api/bigquery/v2/projects/${encodeURIComponent(projectId)}/datasets/${encodeURIComponent(datasetId)}`, {
         method: "DELETE",
       });
-      if (selectedDatasetId === datasetId) {
-        selectedDatasetId = "";
-        selectedTableId = "";
-      }
-      await refreshAll();
-      syncDatasetMetaInputs();
     } catch (err) {
-      alert(`Delete dataset failed: ${err.message}`);
+      if (String(err.message).includes("deleteContents")) {
+        const confirmCascade = window.confirm(`${err.message}\n\nDelete the dataset AND its tables? This cannot be undone (though the dataset's own metadata can be restored with Undelete afterwards).`);
+        if (!confirmCascade) {
+          return;
+        }
+        try {
+          await fetchJson(`/api/bigquery/v2/projects/${encodeURIComponent(projectId)}/datasets/${encodeURIComponent(datasetId)}?deleteContents=true`, {
+            method: "DELETE",
+          });
+        } catch (cascadeErr) {
+          alert(`Delete dataset failed: ${cascadeErr.message}`);
+          return;
+        }
+      } else {
+        alert(`Delete dataset failed: ${err.message}`);
+        return;
+      }
+    }
+    if (selectedDatasetId === datasetId) {
+      selectedDatasetId = "";
+      selectedTableId = "";
+    }
+    await refreshAll();
+    syncDatasetMetaInputs();
+  });
+}
+
+if (undeleteDatasetForm) {
+  undeleteDatasetForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const projectId = getProjectId();
+    const datasetId = (undeleteDatasetId?.value || "").trim();
+    if (!datasetId) {
+      return;
+    }
+    try {
+      await fetchJson("/api/_emulator/datasets/undelete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ projectId, datasetId }),
+      });
+      undeleteDatasetId.value = "";
+      await refreshAll();
+      await selectDataset(projectId, datasetId);
+    } catch (err) {
+      alert(`Undelete dataset failed: ${err.message}`);
     }
   });
 }
@@ -1801,6 +2092,233 @@ if (createTableForm) {
       await selectTable(projectId, datasetId, tableId);
     } catch (err) {
       alert(`Create table failed: ${err.message}`);
+    }
+  });
+}
+
+if (createExternalTableForm) {
+  createExternalTableForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const projectId = getProjectId();
+    const datasetId = document.getElementById("newExternalTableDatasetId").value.trim() || selectedDatasetId || "analytics";
+    const tableId = document.getElementById("newExternalTableId").value.trim();
+    const schemaFieldsRaw = document.getElementById("newExternalTableSchemaFields").value.trim();
+    const sourceUris = parseLinesToList(document.getElementById("newExternalTableSourceUris").value);
+    const sourceFormat = document.getElementById("newExternalTableSourceFormat").value;
+    const fieldDelimiter = document.getElementById("newExternalTableFieldDelimiter").value.trim();
+    const skipLeadingRowsRaw = document.getElementById("newExternalTableSkipLeadingRows").value.trim();
+    if (!datasetId || !tableId || !schemaFieldsRaw) {
+      return;
+    }
+
+    let schemaFields;
+    try {
+      schemaFields = JSON.parse(schemaFieldsRaw);
+    } catch (err) {
+      alert(`Invalid schema.fields JSON: ${err.message}`);
+      return;
+    }
+
+    const externalDataConfiguration = { sourceUris, sourceFormat };
+    if (fieldDelimiter) {
+      externalDataConfiguration.fieldDelimiter = fieldDelimiter;
+    }
+    if (skipLeadingRowsRaw) {
+      externalDataConfiguration.skipLeadingRows = Number(skipLeadingRowsRaw);
+    }
+
+    try {
+      await fetchJson(`/api/bigquery/v2/projects/${encodeURIComponent(projectId)}/datasets/${encodeURIComponent(datasetId)}/tables`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          tableReference: { tableId },
+          schema: { fields: schemaFields },
+          externalDataConfiguration,
+        }),
+      });
+      document.getElementById("newExternalTableDatasetId").value = datasetId;
+      document.getElementById("newExternalTableId").value = "";
+      document.getElementById("newExternalTableSchemaFields").value = "";
+      document.getElementById("newExternalTableSourceUris").value = "";
+      document.getElementById("newExternalTableFieldDelimiter").value = "";
+      document.getElementById("newExternalTableSkipLeadingRows").value = "";
+      selectedDatasetId = datasetId;
+      await refreshAll();
+      await selectTable(projectId, datasetId, tableId);
+    } catch (err) {
+      alert(`Create external table failed: ${err.message}`);
+    }
+  });
+}
+
+if (createRoutineForm) {
+  createRoutineForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const projectId = getProjectId();
+    const datasetId = document.getElementById("newRoutineDatasetId").value.trim() || selectedDatasetId || "analytics";
+    const routineId = document.getElementById("newRoutineId").value.trim();
+    const routineType = document.getElementById("newRoutineType").value;
+    const language = document.getElementById("newRoutineLanguage").value;
+    const definitionBody = document.getElementById("newRoutineDefinitionBody").value.trim();
+    if (!datasetId || !routineId || !definitionBody) {
+      return;
+    }
+
+    try {
+      await fetchJson(`/api/bigquery/v2/projects/${encodeURIComponent(projectId)}/datasets/${encodeURIComponent(datasetId)}/routines`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ routineReference: { routineId }, routineType, language, definitionBody }),
+      });
+      document.getElementById("newRoutineDatasetId").value = datasetId;
+      document.getElementById("newRoutineId").value = "";
+      document.getElementById("newRoutineDefinitionBody").value = "";
+      selectedDatasetId = datasetId;
+      await refreshAll();
+      await selectRoutine(projectId, datasetId, routineId);
+    } catch (err) {
+      alert(`Create routine failed: ${err.message}`);
+    }
+  });
+}
+
+if (createModelForm) {
+  createModelForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const projectId = getProjectId();
+    const datasetId = document.getElementById("newModelDatasetId").value.trim() || selectedDatasetId || "analytics";
+    const modelId = document.getElementById("newModelId").value.trim();
+    const modelType = document.getElementById("newModelType").value.trim();
+    if (!datasetId || !modelId) {
+      return;
+    }
+
+    try {
+      await fetchJson(`/api/bigquery/v2/projects/${encodeURIComponent(projectId)}/datasets/${encodeURIComponent(datasetId)}/models`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ modelReference: { modelId }, modelType }),
+      });
+      document.getElementById("newModelDatasetId").value = datasetId;
+      document.getElementById("newModelId").value = "";
+      document.getElementById("newModelType").value = "";
+      selectedDatasetId = datasetId;
+      await refreshAll();
+      await selectModel(projectId, datasetId, modelId);
+    } catch (err) {
+      alert(`Create model failed: ${err.message}`);
+    }
+  });
+}
+
+if (deleteResourceBtn) {
+  deleteResourceBtn.addEventListener("click", deleteSelectedResource);
+}
+
+if (updateResourceMetaForm) {
+  updateResourceMetaForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    await updateSelectedResourceMetadata();
+  });
+}
+
+function parseLinesToList(value) {
+  return String(value || "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
+if (loadJobForm) {
+  loadJobForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const projectId = getProjectId();
+    const datasetId = document.getElementById("loadDatasetId").value.trim();
+    const tableId = document.getElementById("loadTableId").value.trim();
+    if (!datasetId || !tableId) {
+      return;
+    }
+
+    let fields;
+    try {
+      fields = JSON.parse(document.getElementById("loadSchemaFields").value.trim());
+    } catch (e) {
+      alert('Invalid schema.fields JSON. Use format: [{"name":"col","type":"STRING"}]');
+      return;
+    }
+
+    const sourceUris = parseLinesToList(document.getElementById("loadSourceUris").value);
+    const sourceFormat = document.getElementById("loadSourceFormat").value;
+    const writeDisposition = document.getElementById("loadWriteDisposition").value;
+    const fieldDelimiter = document.getElementById("loadFieldDelimiter").value.trim();
+    const skipLeadingRowsRaw = document.getElementById("loadSkipLeadingRows").value.trim();
+
+    const load = {
+      destinationTable: { projectId, datasetId, tableId },
+      schema: { fields },
+      writeDisposition,
+    };
+    if (sourceUris.length) {
+      load.sourceUris = sourceUris;
+      load.sourceFormat = sourceFormat;
+    }
+    if (fieldDelimiter) load.fieldDelimiter = fieldDelimiter;
+    if (skipLeadingRowsRaw) load.skipLeadingRows = Number(skipLeadingRowsRaw);
+
+    if (loadJobStatus) loadJobStatus.textContent = "submitting...";
+    try {
+      const job = await fetchJson(`/api/bigquery/v2/projects/${encodeURIComponent(projectId)}/jobs`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ configuration: { load } }),
+      });
+      if (loadJobResult) loadJobResult.textContent = JSON.stringify(job, null, 2);
+      if (loadJobStatus) loadJobStatus.textContent = `job submitted: ${(job.jobReference || {}).jobId || "?"} — see Jobs tab for status`;
+      await refreshAll();
+    } catch (err) {
+      if (loadJobStatus) loadJobStatus.textContent = "submit failed";
+      alert(`Load job failed: ${err.message}`);
+    }
+  });
+}
+
+if (extractJobForm) {
+  extractJobForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const projectId = getProjectId();
+    const datasetId = document.getElementById("extractDatasetId").value.trim();
+    const tableId = document.getElementById("extractTableId").value.trim();
+    const destinationUris = parseLinesToList(document.getElementById("extractDestinationUris").value);
+    if (!datasetId || !tableId || !destinationUris.length) {
+      return;
+    }
+
+    const destinationFormat = document.getElementById("extractDestinationFormat").value;
+    const fieldDelimiter = document.getElementById("extractFieldDelimiter").value.trim();
+    const printHeader = document.getElementById("extractPrintHeader").checked;
+
+    const extract = {
+      sourceTable: { projectId, datasetId, tableId },
+      destinationUris,
+      destinationFormat,
+      printHeader,
+    };
+    if (fieldDelimiter) extract.fieldDelimiter = fieldDelimiter;
+
+    if (extractJobStatus) extractJobStatus.textContent = "submitting...";
+    try {
+      const job = await fetchJson(`/api/bigquery/v2/projects/${encodeURIComponent(projectId)}/jobs`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ configuration: { extract } }),
+      });
+      if (extractJobResult) extractJobResult.textContent = JSON.stringify(job, null, 2);
+      if (extractJobStatus) extractJobStatus.textContent = `job submitted: ${(job.jobReference || {}).jobId || "?"} — see Jobs tab for status`;
+      await refreshAll();
+    } catch (err) {
+      if (extractJobStatus) extractJobStatus.textContent = "submit failed";
+      alert(`Extract job failed: ${err.message}`);
     }
   });
 }

@@ -28,9 +28,31 @@ type tableRecord struct {
 	Labels       map[string]string
 	Schema       []tableField
 	Rows         [][]string
+	External     *externalTableConfig
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
 	Version      int
+}
+
+// externalTableConfig marks a table as backed by local files (or fake-GCS via
+// LOCAQL_FAKE_GCS_ROOT) instead of in-memory rows. Data is never materialized
+// into tableRecord.Rows; it is read fresh from sourceUris on every access, so
+// external tables reflect the current file contents at query time, matching
+// real BigQuery external table semantics.
+type externalTableConfig struct {
+	SourceURIs      []string
+	SourceFormat    string
+	FieldDelimiter  string
+	SkipLeadingRows int
+}
+
+func cloneExternalConfig(c *externalTableConfig) *externalTableConfig {
+	if c == nil {
+		return nil
+	}
+	cp := *c
+	cp.SourceURIs = append([]string(nil), c.SourceURIs...)
+	return &cp
 }
 
 type tableInsert struct {
@@ -42,6 +64,7 @@ type tableInsert struct {
 	Labels       map[string]string
 	Schema       []tableField
 	Rows         [][]string
+	External     *externalTableConfig
 }
 
 type tablePatch struct {
@@ -125,6 +148,9 @@ func (s *tableService) get(projectID, datasetID, tableID string) (*tableRecord, 
 	}
 	cp := *t
 	cp.Labels = cloneLabels(cp.Labels)
+	cp.Schema = cloneTableFields(cp.Schema)
+	cp.Rows = cloneTableRows(cp.Rows)
+	cp.External = cloneExternalConfig(cp.External)
 	return &cp, true, t.Version
 }
 
@@ -153,6 +179,7 @@ func (s *tableService) insert(input tableInsert) (*tableRecord, bool) {
 		Labels:       cloneLabels(input.Labels),
 		Schema:       cloneTableFields(input.Schema),
 		Rows:         cloneTableRows(input.Rows),
+		External:     cloneExternalConfig(input.External),
 		CreatedAt:    now,
 		UpdatedAt:    now,
 		Version:      1,
