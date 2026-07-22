@@ -26,6 +26,8 @@ This repository currently implements incremental scope from the master plan:
 - [Conformance Baseline](#conformance-baseline)
 - [Test](#test)
 - [LocaQL Console (Standalone UI)](#locaql-console-standalone-ui)
+- [Contributing](#contributing)
+- [License](#license)
 
 ## Requirements
 
@@ -347,3 +349,11 @@ Current UI scope:
 - Jobs Explorer with personal/project history tabs, selection, detail refresh, and cancellation.
 - Saved Queries stored in the browser (`localStorage`) with local version history, JSON import/export, and shareable URL links.
 - Persistent Dark/Light theme toggle.
+
+## Contributing
+
+Issues and pull requests are welcome. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the branching model (`feature`/`fix`/`docs`/`chore`/`hotfix` → `dev` → `main`), commit conventions, the pull request checklist, and exactly who can approve and merge into `main`/`dev` (branch protection is enforced via a GitHub ruleset + [`CODEOWNERS`](.github/CODEOWNERS): any PR needs the code owner's approval, and only the repository owner can bypass that requirement).
+
+## License
+
+LocaQL is licensed under the [Apache License, Version 2.0](LICENSE). Read [`NOTICE`](NOTICE) before using, deploying, modifying, or forking this project: it explains the attribution you must carry forward into any derivative work, and clarifies that LocaQL is not affiliated with Google or BigQuery.
