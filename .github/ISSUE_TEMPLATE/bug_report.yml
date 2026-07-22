@@ -1,0 +1,39 @@
+name: Bug report
+description: Something in the emulator, CLI, or console behaves incorrectly or diverges from real BigQuery.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing, please check the [Current Scope Matrix](../../README.md#current-scope-matrix) and `capabilities/registry.yaml` — some gaps are already known and tracked as `partial`/`unsupported` there.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what actually happened?
+    validations:
+      required: true
+  - type: textarea
+    id: request-response
+    attributes:
+      label: Request / response (if applicable)
+      description: The exact REST request (method, path, body) and the response you got, or the CLI command and its output.
+      render: text
+  - type: input
+    id: commit
+    attributes:
+      label: Commit or version
+      description: Output of `git rev-parse HEAD`, or the release/tag you're using.
+    validations:
+      required: true
+  - type: dropdown
+    id: environment
+    attributes:
+      label: Environment
+      options:
+        - WSL (Ubuntu-24.04)
+        - Linux (native)
+        - macOS
+        - Other/unsure
+    validations:
+      required: true
