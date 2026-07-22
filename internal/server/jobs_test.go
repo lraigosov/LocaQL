@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -944,6 +945,262 @@ func TestExtractJobWritesParquetDestination(t *testing.T) {
 	}
 }
 
+// loadHighlyCompressibleTable seeds a table via a real NDJSON load job whose
+// rows are dominated by a long repeated string, so a compression codec
+// actually run over the data shrinks the output measurably. Comparing
+// extracted file sizes with/without compression is a black-box proof that a
+// codec was genuinely applied, since both goavro and parquet-go transparently
+// decode any codec on read regardless of what was requested at write time.
+func loadHighlyCompressibleTable(t *testing.T, s *Server, tableID string) {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "compressible.ndjson")
+	padding := strings.Repeat("x", 400)
+	var buf bytes.Buffer
+	for i := 0; i < 200; i++ {
+		buf.WriteString(`{"event_id":` + strconv.Itoa(i) + `,"event_name":"` + padding + `"}` + "\n")
+	}
+	if err := os.WriteFile(path, buf.Bytes(), 0o600); err != nil {
+		t.Fatalf("write compressible fixture: %v", err)
+	}
+
+	bodyObj := map[string]any{
+		"configuration": map[string]any{
+			"load": map[string]any{
+				"destinationTable": map[string]any{"projectId": "p1", "datasetId": "analytics", "tableId": tableID},
+				"schema": map[string]any{"fields": []any{
+					map[string]any{"name": "event_id", "type": "INT64"},
+					map[string]any{"name": "event_name", "type": "STRING"},
+				}},
+				"sourceUris":       []any{path},
+				"sourceFormat":     "NEWLINE_DELIMITED_JSON",
+				"writeDisposition": "WRITE_TRUNCATE",
+			},
+		},
+	}
+	raw, err := json.Marshal(bodyObj)
+	if err != nil {
+		t.Fatalf("marshal load body: %v", err)
+	}
+	jobOut := runJobAndFetch(t, s, string(raw))
+	status := jobOut["status"].(map[string]any)
+	if status["errorResult"] != nil {
+		t.Fatalf("unexpected load error seeding compressible table: %v", status["errorResult"])
+	}
+}
+
+func extractToFile(t *testing.T, s *Server, tableID, destPath, format, compression string) map[string]any {
+	t.Helper()
+	extractCfg := map[string]any{
+		"sourceTable":       map[string]any{"projectId": "p1", "datasetId": "analytics", "tableId": tableID},
+		"destinationUris":   []any{destPath},
+		"destinationFormat": format,
+	}
+	if compression != "" {
+		extractCfg["compression"] = compression
+	}
+	raw, err := json.Marshal(map[string]any{"configuration": map[string]any{"extract": extractCfg}})
+	if err != nil {
+		t.Fatalf("marshal extract body: %v", err)
+	}
+	return runJobAndFetch(t, s, string(raw))
+}
+
+func TestExtractJobCompressionShrinksAvroAndParquetOutput(t *testing.T) {
+	s := newTestServer()
+	loadHighlyCompressibleTable(t, s, "compressible_events")
+	dir := t.TempDir()
+
+	for _, tc := range []struct {
+		format      string
+		compression string
+	}{
+		{"AVRO", "SNAPPY"},
+		{"AVRO", "DEFLATE"},
+		{"PARQUET", "SNAPPY"},
+		{"PARQUET", "GZIP"},
+	} {
+		t.Run(tc.format+"_"+tc.compression, func(t *testing.T) {
+			nonePath := filepath.Join(dir, "none_"+tc.format+"_"+tc.compression)
+			compressedPath := filepath.Join(dir, "compressed_"+tc.format+"_"+tc.compression)
+
+			noneOut := extractToFile(t, s, "compressible_events", nonePath, tc.format, "")
+			if err := noneOut["status"].(map[string]any)["errorResult"]; err != nil {
+				t.Fatalf("unexpected error extracting uncompressed baseline: %v", err)
+			}
+			compressedOut := extractToFile(t, s, "compressible_events", compressedPath, tc.format, tc.compression)
+			if err := compressedOut["status"].(map[string]any)["errorResult"]; err != nil {
+				t.Fatalf("unexpected error extracting with compression %s: %v", tc.compression, err)
+			}
+
+			noneInfo, err := os.Stat(nonePath)
+			if err != nil {
+				t.Fatalf("stat uncompressed file: %v", err)
+			}
+			compressedInfo, err := os.Stat(compressedPath)
+			if err != nil {
+				t.Fatalf("stat compressed file: %v", err)
+			}
+			if compressedInfo.Size() >= noneInfo.Size() {
+				t.Fatalf("expected %s compression to shrink output (uncompressed=%d, compressed=%d)", tc.compression, noneInfo.Size(), compressedInfo.Size())
+			}
+		})
+	}
+}
+
+func TestExtractJobCompressionShrinksGzippedCSV(t *testing.T) {
+	s := newTestServer()
+	loadHighlyCompressibleTable(t, s, "compressible_events_csv")
+	dir := t.TempDir()
+
+	nonePath := filepath.Join(dir, "none.csv")
+	gzipPath := filepath.Join(dir, "compressed.csv")
+
+	extractToFile(t, s, "compressible_events_csv", nonePath, "CSV", "")
+	extractToFile(t, s, "compressible_events_csv", gzipPath, "CSV", "GZIP")
+
+	noneInfo, err := os.Stat(nonePath)
+	if err != nil {
+		t.Fatalf("stat uncompressed csv: %v", err)
+	}
+	gzipInfo, err := os.Stat(gzipPath)
+	if err != nil {
+		t.Fatalf("stat gzip csv: %v", err)
+	}
+	if gzipInfo.Size() >= noneInfo.Size() {
+		t.Fatalf("expected GZIP to shrink CSV output (uncompressed=%d, compressed=%d)", noneInfo.Size(), gzipInfo.Size())
+	}
+
+	data, err := os.ReadFile(gzipPath)
+	if err != nil {
+		t.Fatalf("read gzip csv: %v", err)
+	}
+	reader, err := gzip.NewReader(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("open gzip reader on extracted csv: %v", err)
+	}
+	defer reader.Close()
+	decompressed, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("decompress extracted csv: %v", err)
+	}
+	if !strings.Contains(string(decompressed), "event_id") {
+		t.Fatalf("expected decompressed CSV to contain header, got %q", string(decompressed)[:min(200, len(decompressed))])
+	}
+}
+
+func TestExtractJobRejectsUnsupportedCompressionForFormat(t *testing.T) {
+	s := newTestServer()
+	dir := t.TempDir()
+	destPath := filepath.Join(dir, "out.avro")
+
+	jobOut := extractToFile(t, s, "events", destPath, "AVRO", "GZIP")
+	status := jobOut["status"].(map[string]any)
+	errResult, ok := status["errorResult"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected errorResult for unsupported GZIP+AVRO compression, got status: %v", status)
+	}
+	if !strings.Contains(errResult["message"].(string), "compression") {
+		t.Fatalf("expected error message to mention compression, got %v", errResult["message"])
+	}
+}
+
+func TestLoadJobRoundTripsGzipCompressedCSVSourceRows(t *testing.T) {
+	s := newTestServer()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "events.csv.gz")
+
+	var buf bytes.Buffer
+	gw := gzip.NewWriter(&buf)
+	if _, err := gw.Write([]byte("event_id,event_name\n1,page_view\n2,checkout\n")); err != nil {
+		t.Fatalf("write gzip fixture: %v", err)
+	}
+	if err := gw.Close(); err != nil {
+		t.Fatalf("close gzip fixture writer: %v", err)
+	}
+	if err := os.WriteFile(path, buf.Bytes(), 0o600); err != nil {
+		t.Fatalf("write gzip csv fixture: %v", err)
+	}
+
+	bodyObj := map[string]any{
+		"configuration": map[string]any{
+			"load": map[string]any{
+				"destinationTable": map[string]any{"projectId": "p1", "datasetId": "analytics", "tableId": "events_gzip_csv"},
+				"schema": map[string]any{"fields": []any{
+					map[string]any{"name": "event_id", "type": "INT64"},
+					map[string]any{"name": "event_name", "type": "STRING"},
+				}},
+				"sourceUris":       []any{path},
+				"sourceFormat":     "CSV",
+				"skipLeadingRows":  float64(1),
+				"compression":      "GZIP",
+				"writeDisposition": "WRITE_TRUNCATE",
+			},
+		},
+	}
+	raw, err := json.Marshal(bodyObj)
+	if err != nil {
+		t.Fatalf("marshal body: %v", err)
+	}
+
+	jobOut := runJobAndFetch(t, s, string(raw))
+	status := jobOut["status"].(map[string]any)
+	if status["errorResult"] != nil {
+		t.Fatalf("unexpected job error: %v", status["errorResult"])
+	}
+	stats := jobOut["statistics"].(map[string]any)
+	if stats["outputRows"] != float64(2) {
+		t.Fatalf("expected 2 ingested rows from gzip-compressed CSV, got %v", stats["outputRows"])
+	}
+}
+
+func TestLoadJobRejectsCompressionForAvroAndParquetSourceFormat(t *testing.T) {
+	s := newTestServer()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "events.avro")
+	schemaJSON := `{"type":"record","name":"LocaQLRow","fields":[{"name":"event_id","type":"long"}]}`
+	var buf bytes.Buffer
+	writer, err := goavro.NewOCFWriter(goavro.OCFConfig{W: &buf, Schema: schemaJSON})
+	if err != nil {
+		t.Fatalf("create avro fixture writer: %v", err)
+	}
+	if err := writer.Append([]any{map[string]any{"event_id": int64(1)}}); err != nil {
+		t.Fatalf("append avro fixture row: %v", err)
+	}
+	if err := os.WriteFile(path, buf.Bytes(), 0o600); err != nil {
+		t.Fatalf("write avro fixture: %v", err)
+	}
+
+	bodyObj := map[string]any{
+		"configuration": map[string]any{
+			"load": map[string]any{
+				"destinationTable": map[string]any{"projectId": "p1", "datasetId": "analytics", "tableId": "events_avro_bad_compression"},
+				"schema": map[string]any{"fields": []any{
+					map[string]any{"name": "event_id", "type": "INT64"},
+				}},
+				"sourceUris":       []any{path},
+				"sourceFormat":     "AVRO",
+				"compression":      "GZIP",
+				"writeDisposition": "WRITE_TRUNCATE",
+			},
+		},
+	}
+	raw, err := json.Marshal(bodyObj)
+	if err != nil {
+		t.Fatalf("marshal body: %v", err)
+	}
+
+	jobOut := runJobAndFetch(t, s, string(raw))
+	status := jobOut["status"].(map[string]any)
+	errResult, ok := status["errorResult"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected errorResult for compression set on AVRO load sourceFormat, got status: %v", status)
+	}
+	if !strings.Contains(errResult["message"].(string), "compression") {
+		t.Fatalf("expected error message to mention compression, got %v", errResult["message"])
+	}
+}
+
 func TestExtractJobWritesNDJSONDestination(t *testing.T) {
 	s := newTestServer()
 	dir := t.TempDir()
@@ -1035,6 +1292,133 @@ func TestExtractJobRejectsGCSDestinationURI(t *testing.T) {
 	}
 	if !strings.Contains(errRes["message"].(string), "gs://") {
 		t.Fatalf("expected error message to mention gs://, got %v", errRes["message"])
+	}
+}
+
+// loadShardTestTable seeds a table with rowCount small, individually
+// countable NDJSON rows ({"id":N,"name":"row_N"}), used by the multi-shard
+// extract tests to force a predictable number of shards via a tiny
+// LOCAQL_EXTRACT_SHARD_MAX_BYTES threshold.
+func loadShardTestTable(t *testing.T, s *Server, tableID string, rowCount int) {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "shard_source.ndjson")
+	var buf bytes.Buffer
+	for i := 0; i < rowCount; i++ {
+		buf.WriteString(`{"id":` + strconv.Itoa(i) + `,"name":"row_` + strconv.Itoa(i) + `"}` + "\n")
+	}
+	if err := os.WriteFile(path, buf.Bytes(), 0o600); err != nil {
+		t.Fatalf("write shard source fixture: %v", err)
+	}
+
+	bodyObj := map[string]any{
+		"configuration": map[string]any{
+			"load": map[string]any{
+				"destinationTable": map[string]any{"projectId": "p1", "datasetId": "analytics", "tableId": tableID},
+				"schema": map[string]any{"fields": []any{
+					map[string]any{"name": "id", "type": "INT64"},
+					map[string]any{"name": "name", "type": "STRING"},
+				}},
+				"sourceUris":       []any{path},
+				"sourceFormat":     "NEWLINE_DELIMITED_JSON",
+				"writeDisposition": "WRITE_TRUNCATE",
+			},
+		},
+	}
+	raw, err := json.Marshal(bodyObj)
+	if err != nil {
+		t.Fatalf("marshal load body: %v", err)
+	}
+	jobOut := runJobAndFetch(t, s, string(raw))
+	status := jobOut["status"].(map[string]any)
+	if status["errorResult"] != nil {
+		t.Fatalf("unexpected load error seeding shard test table: %v", status["errorResult"])
+	}
+}
+
+func TestExtractJobSplitsIntoMultipleShardsWhenOverThreshold(t *testing.T) {
+	s := newTestServer()
+	loadShardTestTable(t, s, "shard_events_split", 10)
+	dir := t.TempDir()
+	destPattern := filepath.Join(dir, "shard-*.ndjson")
+
+	t.Setenv("LOCAQL_EXTRACT_SHARD_MAX_BYTES", "40")
+
+	jobOut := extractToFile(t, s, "shard_events_split", destPattern, "NEWLINE_DELIMITED_JSON", "")
+	status := jobOut["status"].(map[string]any)
+	if status["errorResult"] != nil {
+		t.Fatalf("unexpected job error: %v", status["errorResult"])
+	}
+
+	matches, err := filepath.Glob(filepath.Join(dir, "shard-*.ndjson"))
+	if err != nil {
+		t.Fatalf("glob shard files: %v", err)
+	}
+	if len(matches) < 2 {
+		t.Fatalf("expected extract to split into multiple shard files under a tiny threshold, got %d: %v", len(matches), matches)
+	}
+
+	totalLines := 0
+	for _, m := range matches {
+		data, err := os.ReadFile(m)
+		if err != nil {
+			t.Fatalf("read shard file %s: %v", m, err)
+		}
+		lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+		totalLines += len(lines)
+		if len(lines) >= 10 {
+			t.Fatalf("expected shard %s to hold fewer than all 10 rows (i.e. an actual split), got %d", m, len(lines))
+		}
+	}
+	if totalLines != 10 {
+		t.Fatalf("expected 10 total rows across all shards, got %d", totalLines)
+	}
+}
+
+func TestExtractJobRejectsMultiShardResultWithoutWildcardURI(t *testing.T) {
+	s := newTestServer()
+	loadShardTestTable(t, s, "shard_events_nowc", 10)
+	dir := t.TempDir()
+	destPath := filepath.Join(dir, "shard_out.ndjson")
+
+	t.Setenv("LOCAQL_EXTRACT_SHARD_MAX_BYTES", "40")
+
+	jobOut := extractToFile(t, s, "shard_events_nowc", destPath, "NEWLINE_DELIMITED_JSON", "")
+	status := jobOut["status"].(map[string]any)
+	errRes, ok := status["errorResult"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected errorResult when a multi-shard result has no wildcard destinationUri, got %v", status)
+	}
+	if !strings.Contains(errRes["message"].(string), "wildcard") {
+		t.Fatalf("expected error message to mention wildcard, got %v", errRes["message"])
+	}
+}
+
+func TestExtractJobRejectsMultiShardResultWithMultipleLiteralURIs(t *testing.T) {
+	s := newTestServer()
+	loadShardTestTable(t, s, "shard_events_multiuri", 10)
+	dir := t.TempDir()
+
+	t.Setenv("LOCAQL_EXTRACT_SHARD_MAX_BYTES", "40")
+
+	extractCfg := map[string]any{
+		"sourceTable":       map[string]any{"projectId": "p1", "datasetId": "analytics", "tableId": "shard_events_multiuri"},
+		"destinationUris":   []any{filepath.Join(dir, "a.ndjson"), filepath.Join(dir, "b.ndjson")},
+		"destinationFormat": "NEWLINE_DELIMITED_JSON",
+	}
+	raw, err := json.Marshal(map[string]any{"configuration": map[string]any{"extract": extractCfg}})
+	if err != nil {
+		t.Fatalf("marshal extract body: %v", err)
+	}
+
+	jobOut := runJobAndFetch(t, s, string(raw))
+	status := jobOut["status"].(map[string]any)
+	errRes, ok := status["errorResult"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected errorResult when a multi-shard result has multiple literal destinationUris, got %v", status)
+	}
+	if !strings.Contains(errRes["message"].(string), "wildcard") {
+		t.Fatalf("expected error message to mention wildcard, got %v", errRes["message"])
 	}
 }
 
@@ -1483,6 +1867,49 @@ func TestJobsSyncQuerySupportsInformationSchemaRoutinesWithRealData(t *testing.T
 	cells := rows[0].(map[string]any)["f"].([]any)
 	if cells[2].(map[string]any)["v"] != "double_it" || cells[3].(map[string]any)["v"] != "SCALAR_FUNCTION" {
 		t.Fatalf("unexpected routine row: %v", cells)
+	}
+}
+
+func TestJobsSyncQuerySupportsInformationSchemaParametersWithRealData(t *testing.T) {
+	s := newTestServer()
+
+	insertReq := httptest.NewRequest(http.MethodPost, "/bigquery/v2/projects/p1/datasets/analytics/routines", strings.NewReader(`{"routineReference":{"routineId":"add_two"},"routineType":"SCALAR_FUNCTION","definitionBody":"x + y","arguments":[{"name":"x","dataType":"INT64"},{"name":"y","dataType":"INT64"}]}`))
+	insertReq.Header.Set("Content-Type", "application/json")
+	insertRes := httptest.NewRecorder()
+	s.Handler().ServeHTTP(insertRes, insertReq)
+	if insertRes.Code != http.StatusOK {
+		t.Fatalf("expected 200 creating routine, got %d: %s", insertRes.Code, insertRes.Body.String())
+	}
+
+	body := `{"query":"SELECT * FROM p1.analytics.INFORMATION_SCHEMA.PARAMETERS"}`
+	req := httptest.NewRequest(http.MethodPost, "/bigquery/v2/projects/p1/queries", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	res := httptest.NewRecorder()
+	s.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", res.Code)
+	}
+
+	var out map[string]any
+	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+		t.Fatalf("decode parameters response: %v", err)
+	}
+	rows, ok := out["rows"].([]any)
+	if !ok || len(rows) != 2 {
+		t.Fatalf("expected 2 real parameter rows, got %v", out["rows"])
+	}
+	firstCells := rows[0].(map[string]any)["f"].([]any)
+	// specific_name, ordinal_position, parameter_mode, parameter_name, data_type
+	if firstCells[2].(map[string]any)["v"] != "add_two" ||
+		firstCells[3].(map[string]any)["v"] != "1" ||
+		firstCells[4].(map[string]any)["v"] != "IN" ||
+		firstCells[5].(map[string]any)["v"] != "x" ||
+		firstCells[6].(map[string]any)["v"] != "INT64" {
+		t.Fatalf("unexpected first parameter row: %v", firstCells)
+	}
+	secondCells := rows[1].(map[string]any)["f"].([]any)
+	if secondCells[3].(map[string]any)["v"] != "2" || secondCells[5].(map[string]any)["v"] != "y" {
+		t.Fatalf("unexpected second parameter row: %v", secondCells)
 	}
 }
 
