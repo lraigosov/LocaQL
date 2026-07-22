@@ -571,6 +571,7 @@ body[data-theme="dark"] .workspace-topbar {
 }
 
 textarea,
+select,
 input {
   width: 100%;
   border: 1px solid var(--line);
@@ -583,6 +584,7 @@ input {
 }
 
 textarea:focus,
+select:focus,
 input:focus {
   outline: none;
   border-color: rgba(26, 115, 232, 0.45);
