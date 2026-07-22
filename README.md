@@ -23,6 +23,7 @@ This repository currently implements incremental scope from the master plan:
 - [Extract Jobs: Real Table Export (NDJSON / CSV / Avro / Parquet)](#extract-jobs-real-table-export-ndjson--csv--avro--parquet)
 - [Dataset Lifecycle: Delete Contents and Undelete](#dataset-lifecycle-delete-contents-and-undelete)
 - [Routines and Models: Metadata CRUD](#routines-and-models-metadata-crud)
+- [External Tables: Query Local Files Without Loading](#external-tables-query-local-files-without-loading)
 - [Conformance Baseline](#conformance-baseline)
 - [Test](#test)
 - [LocaQL Console (Standalone UI)](#locaql-console-standalone-ui)
@@ -77,6 +78,7 @@ Registry file:
 | requestId idempotency | Partial | Implemented for `jobs.insert` and `projects.queries` with TTL |
 | Job executors (query/load/extract/copy) | Partial | Query jobs report real `outputRows`/`processedBytes` from the resolved result (`totalSlotMs` stays synthetic by design); copy jobs create real destination table data; load jobs materialize destination schema and ingest real rows from `sourceUris` (`NEWLINE_DELIMITED_JSON`, `CSV`, `AVRO` or `PARQUET`); extract jobs read a real source table and write `destinationUris` in the same four formats, single-shard wildcards resolved. `sourceUris`/`destinationUris` are local paths by default; `gs://` resolves onto a local directory only when `LOCAQL_FAKE_GCS_ROOT` is set (multi-wildcard shards and `ORC` are rejected explicitly) |
 | Routines and Models | Supported | `routines`/`models` `insert`/`get`/`list`/`patch`/`delete` are metadata-only (no SQL execution or ML training/inference backend exists; nothing is fabricated beyond stored fields) |
+| External tables | Partial | `tables.insert` accepts `externalDataConfiguration` (`NEWLINE_DELIMITED_JSON`/`CSV`/`AVRO`/`PARQUET`, explicit schema, no autodetect); `sourceUris` are read fresh from disk/fake-GCS on every query/`tabledata.list`/copy/extract access rather than materialized at creation. Patching `externalDataConfiguration`, autodetect, Hive partitioning and compression options are not supported |
 | Job persistence across restart | Partial | Optional local file persistence |
 | Job concurrency limit | Partial | Controlled with `LOCAQL_JOB_WORKERS` |
 | Storage Write backpressure | Partial | `load/copy` jobs throttled by `LOCAQL_STORAGE_WRITE_WORKERS` |
@@ -90,7 +92,7 @@ Registry file:
 | Workspace apply mutate | Supported | `locaql workspace apply --dry-run=false` applies planned changes; deletes require explicit `--delete-missing=true --confirm-delete=DELETE` |
 | IAM and policies | Unsupported | Deliberately out of scope for local emulator parity; treated as cloud control-plane concerns |
 | Standalone UI service | Partial | `cmd/locaql-ui` with dynamic capability-driven console and API proxy |
-| UI resource forms | Partial | Explorer can create, update and delete datasets, create tables, and edit basic table metadata against emulator REST endpoints |
+| UI resource forms | Partial | Explorer can create/update/delete datasets (with `deleteContents` retry and Undelete), create tables (native and external) and edit basic table metadata, and create/select/delete real Routines and Models, all against emulator REST endpoints; a dedicated Load/Extract tab submits real load and extract jobs |
 
 ## Runtime Architecture
 
@@ -238,6 +240,31 @@ curl -X POST http://localhost:9050/bigquery/v2/projects/p1/datasets/analytics/ro
   }'
 ```
 
+## External Tables: Query Local Files Without Loading
+
+`tables.insert` accepts an `externalDataConfiguration` (`sourceUris`, `sourceFormat`, plus `fieldDelimiter`/`skipLeadingRows` for CSV) instead of ingesting rows into an internal table. An explicit `schema.fields` is required — there is no autodetect. The resulting table's `type` is `EXTERNAL` (a plain internal table's `type` is `TABLE`).
+
+Unlike load jobs, **nothing is copied into the catalog at creation time**: `sourceUris` are re-read fresh from disk (or fake-GCS via `LOCAQL_FAKE_GCS_ROOT`) on every access — `SELECT`, `tabledata.list`, `INFORMATION_SCHEMA`, and using the table as a `copy`/`extract` source — so an external table always reflects the current file contents, matching real BigQuery external table semantics. If the files can't be read when data is actually requested, the request fails explicitly (a 400 for `tabledata.list`/sync queries, a job `errorResult` for async query/copy/extract jobs) rather than silently returning stale or empty data.
+
+```bash
+curl -X POST http://localhost:9050/bigquery/v2/projects/p1/datasets/analytics/tables \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "tableReference": {"tableId": "events_external"},
+    "schema": {"fields": [
+      {"name": "event_id", "type": "INT64"},
+      {"name": "event_name", "type": "STRING"}
+    ]},
+    "externalDataConfiguration": {
+      "sourceUris": ["/data/events.csv"],
+      "sourceFormat": "CSV",
+      "skipLeadingRows": 1
+    }
+  }'
+```
+
+Supported `sourceFormat` values are the same four covered by load/extract: `NEWLINE_DELIMITED_JSON`, `CSV`, `AVRO`, `PARQUET` (`ORC` and other formats are rejected). Deleting an external table (or its dataset) only removes the LocaQL catalog entry — the underlying file is never touched. Patching `externalDataConfiguration` after creation, autodetect, Hive partitioning, and compression options are not supported yet.
+
 ## Conformance Baseline
 
 Run the foundation conformance suite and generate reports:
@@ -339,11 +366,13 @@ UI notes:
 
 Current UI scope:
 
-- Studio-style layout with navigation, a resource Explorer, and a tabbed workspace (Query, Jobs, Capabilities).
+- Studio-style layout with navigation, a resource Explorer, and a tabbed workspace (Query, Jobs, Load / Extract, Capabilities).
 - Explorer with a hierarchical Project > Dataset > Table tree, local resource search, and capability-status badges (`SUPPORTED`, `PARTIAL`, `UNSUPPORTED`, `CONTEXT`) with a persisted filter and legend.
-- Explicit `Routines` and `Models` placeholders in the Explorer tree; the emulator backend now supports metadata CRUD for both (see [Routines and Models: Metadata CRUD](#routines-and-models-metadata-crud)), but the Explorer UI has not been wired to those endpoints yet — it still renders them as unsupported-category placeholders.
-- Dataset create/update/delete with labels editing, plus a selected-dataset summary panel (ID, friendly name, location, table count, labels) and quick actions to draft a dataset query, draft a table listing query, or copy the dataset ID.
+- Real `Routines` and `Models` nodes in the Explorer tree, wired to the emulator's metadata CRUD endpoints (see [Routines and Models: Metadata CRUD](#routines-and-models-metadata-crud)): sidebar forms create a routine (type, language, `definitionBody`) or a model (`modelType`) under a dataset, and selecting a node opens a resource details panel with raw JSON, a `friendlyName`/`description` editor, and delete.
+- Dataset create/update/delete (with labels and `defaultTableExpirationMs` editing), plus a **Dataset Undelete** form that restores a soft-deleted dataset's metadata from its tombstone (see [Dataset Lifecycle: Delete Contents and Undelete](#dataset-lifecycle-delete-contents-and-undelete)); deleting a non-empty dataset surfaces the backend's `deleteContents` requirement and offers to retry with it. A selected-dataset summary panel (ID, friendly name, location, table count, labels) adds quick actions to draft a dataset query, draft a table listing query, or copy the dataset ID.
 - Table creation and metadata patch (`friendlyName`, `description`, labels), with a table details panel offering Schema, Preview, and JSON tabs plus query, copy-job, and delete actions.
+- **External table creation** (schema.fields, `sourceUris`, source format — NDJSON/CSV/AVRO/PARQUET, CSV field delimiter/skip rows) alongside native table creation (see [External Tables](#external-tables-query-local-files-without-loading)); the table details panel shows `Type: EXTERNAL` plus an External Data Configuration block, and the Explorer tree marks external tables with an `(external)` suffix. Preview/query/copy/extract read the same live file contents an API client would see.
+- **Load / Extract tab**: submit real Load jobs (`sourceUris`, schema fields, source format — NDJSON/CSV/AVRO/PARQUET, write disposition, CSV field delimiter and skip-leading-rows) and real Extract jobs (`destinationUris`, destination format, CSV field delimiter, `printHeader`) directly from forms, backed by the same `jobs.insert` executors described in [Load Jobs](#load-jobs-real-row-ingestion-ndjson--csv--avro--parquet) and [Extract Jobs](#extract-jobs-real-table-export-ndjson--csv--avro--parquet); each submission shows the immediate job-creation response and points to the Jobs tab for final `DONE`-state statistics.
 - SQL editor with keyboard shortcuts (`Ctrl+Enter` to run, `Ctrl`/`Cmd+S` to save) and query submission as async jobs.
 - Query results panel with Table, JSON, and Execution Details tabs.
 - Jobs Explorer with personal/project history tabs, selection, detail refresh, and cancellation.
