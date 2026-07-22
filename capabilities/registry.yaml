@@ -30,12 +30,15 @@ capabilities:
       - unit/server/dataset_undelete_fails_if_dataset_already_exists
     reason: "LocaQL-only convenience endpoint at /_emulator/datasets/undelete (POST), deliberately outside /bigquery/v2/ since BigQuery's REST API has no public dataset undelete contract; restores friendlyName/location/labels/defaultTableExpirationMs from the most recent delete's tombstone, never table contents"
   rest.datasets.patch:
-    status: partial
+    status: supported
     fidelity: medium
     tests:
       - unit/server/datasets_patch
       - unit/server/datasets_default_table_expiration_ms_round_trip
-    reason: partial update for friendlyName, location, labels and defaultTableExpirationMs is supported; defaultTableExpirationMs is stored and round-tripped (accepts both string and number input, rendered as a string per the BigQuery int64-as-string convention) but not yet enforced — no expiry sweep exists, since that needs an injectable clock (tracked separately)
+      - unit/server/tables_inherits_dataset_default_table_expiration_ms
+      - unit/server/tables_expire_and_are_purged_after_expiration_time
+      - unit/server/dataset_delete_table_count_excludes_expired_tables
+    reason: partial update for friendlyName, location, labels and defaultTableExpirationMs is supported; defaultTableExpirationMs is stored and round-tripped (accepts both string and number input, rendered as a string per the BigQuery int64-as-string convention) and now enforced — every table created without an explicit expirationTime inherits an absolute expiration computed from the dataset's default at creation time via a swappable clock (tableService.now, real time.Now in production, overridable in tests), and any table access (get/list/tabledata/dataset-empty-check) lazily purges an expired table the first time it is touched rather than running a background sweep goroutine. This is a narrowly-scoped clock for table expiration specifically, not the general injectable-clock/observability infrastructure envisioned in the master plan's Fase quince (logging, time travel, sessions still use real wall-clock time directly)
   rest.jobs.query:
     status: supported
     fidelity: high
@@ -61,6 +64,7 @@ capabilities:
     fidelity: medium
     tests:
       - unit/server/tables_insert
+      - unit/server/tables_explicit_expiration_time_overrides_dataset_default
   rest.tables.delete:
     status: supported
     fidelity: medium
@@ -71,6 +75,7 @@ capabilities:
     fidelity: medium
     tests:
       - unit/server/tables_patch
+      - unit/server/tables_patch_expiration_time_round_trip
   rest.tables.update:
     status: supported
     fidelity: medium
@@ -90,6 +95,18 @@ capabilities:
       - unit/server/external_table_information_schema_tables_marks_type_external
       - unit/server/external_table_copy_job_materializes_into_destination
     reason: "tables.insert accepts externalDataConfiguration (sourceUris/sourceFormat/fieldDelimiter/skipLeadingRows, mirroring configuration.load's flat field layout instead of real BigQuery's nested csvOptions) with an explicit schema.fields required (no autodetect); nothing is materialized at creation time — every consumer of real row data (query execution, tabledata.list, copy/extract job sources, INFORMATION_SCHEMA.PARTITIONS row counts) re-reads sourceUris fresh through a single resolveTableRows choke point, so external tables always reflect current file contents. An unreadable source fails the request/job explicitly instead of silently falling back to empty or simulated data. Supported sourceFormat values are the same four as load/extract (NEWLINE_DELIMITED_JSON/CSV/AVRO/PARQUET); ORC and other formats, patching externalDataConfiguration after creation, autodetect, Hive partitioning and compression options are not supported"
+  rest.fake_gcs.json_api:
+    status: partial
+    fidelity: medium
+    tests:
+      - unit/server/gcs_buckets_insert_and_list
+      - unit/server/gcs_object_upload_get_download_delete
+      - unit/server/gcs_object_name_with_slashes_acts_as_pseudo_directory
+      - unit/server/gcs_list_objects_with_prefix
+      - unit/server/gcs_and_load_extract_gs_uris_interoperate
+      - unit/server/gcs_requires_fake_gcs_root_configured
+      - unit/server/gcs_upload_rejects_unsupported_upload_type
+    reason: "a minimal, real-contract-compatible subset of the Google Cloud Storage JSON API is exposed on the same host:port as the rest of this server (/storage/v1/b and /upload/storage/v1/b), backed by LOCAQL_FAKE_GCS_ROOT using the same bucket/object path-join convention as resolveFakeGCSPath (bigquery.go), so it interoperates with gs:// sourceUris/destinationUris in load/extract/external tables — verified with a test that uploads via this API and loads the same object via a gs:// job. Implemented: buckets.insert/list/get; objects.insert via both media (uploadType=media, data-only body) and multipart (uploadType=multipart, multipart/related body) upload variants, objects.get (metadata and ?alt=media download), objects.list (with optional prefix filter), objects.delete. Verified against the real cloud.google.com/go/storage client via STORAGE_EMULATOR_HOST, not just this project's own tests: bucket create and object upload work as-is, and that run is what proved multipart had to be implemented — the official client's ObjectHandle.NewWriter does not default to media. object.NewReader (download) failed in that same run, but the request never reached this server: the official client has an open, P1-tagged upstream bug where NewReader ignores STORAGE_EMULATOR_HOST/endpoint overrides and calls real GCS instead (googleapis/google-cloud-go#1619), unrelated to this server's correctness — the download/list/delete paths are instead verified directly via this project's own HTTP-level test suite. Not implemented, matching real fields/paths rather than inventing partial ones: resumable uploads (explicit 501), IAM/ACLs, object versioning/generations, lifecycle rules, notifications, signed URLs"
   rest.jobs.list.pagination:
     status: supported
     fidelity: medium
@@ -128,7 +145,15 @@ capabilities:
     tests:
       - unit/server/jobs_executor_type_and_statistics
       - unit/server/jobs_copy_real_destination_data
-    reason: query jobs resolve against the live in-memory catalog and report real outputRows/processedBytes (totalSlotMs stays a synthetic constant by design, since real slot/reservation timing is a declared non-goal); copy jobs materialize destination rows; load jobs materialize destination table schema and, when sourceUris are given, ingest real rows from NEWLINE_DELIMITED_JSON, CSV, AVRO or PARQUET (sourceFormat-dispatched, with fieldDelimiter/skipLeadingRows for CSV); extract jobs read a real source table and write destinationUris in the same four formats (fieldDelimiter/printHeader for CSV), with single-shard wildcard destinationUris resolved to the BigQuery 000000000000 convention. Avro uses github.com/linkedin/goavro/v2 (Apache 2.0); Parquet uses github.com/parquet-go/parquet-go (Apache 2.0, requires Go 1.24.9+, bumped from 1.22 explicitly for this). sourceUris/destinationUris are local file paths by default; gs:// URIs resolve onto a local directory only when LOCAQL_FAKE_GCS_ROOT is set (a LocaQL-only local-disk mapping, not a GCS-compatible API), otherwise gs:// is rejected explicitly. Multi-wildcard destinationUris and ORC are rejected explicitly, not silently ignored
+      - unit/server/extract_job_compression_shrinks_avro_and_parquet_output
+      - unit/server/extract_job_compression_shrinks_gzipped_csv
+      - unit/server/extract_job_rejects_unsupported_compression_for_format
+      - unit/server/load_job_round_trips_gzip_compressed_csv_source_rows
+      - unit/server/load_job_rejects_compression_for_avro_and_parquet_source_format
+      - unit/server/extract_job_splits_into_multiple_shards_when_over_threshold
+      - unit/server/extract_job_rejects_multi_shard_result_without_wildcard_uri
+      - unit/server/extract_job_rejects_multi_shard_result_with_multiple_literal_uris
+    reason: query jobs resolve against the live in-memory catalog and report real outputRows/processedBytes (totalSlotMs stays a synthetic constant by design, since real slot/reservation timing is a declared non-goal); copy jobs materialize destination rows; load jobs materialize destination table schema and, when sourceUris are given, ingest real rows from NEWLINE_DELIMITED_JSON, CSV, AVRO or PARQUET (sourceFormat-dispatched, with fieldDelimiter/skipLeadingRows for CSV); extract jobs read a real source table and write destinationUris in the same four formats (fieldDelimiter/printHeader for CSV). Avro uses github.com/linkedin/goavro/v2 (Apache 2.0); Parquet uses github.com/parquet-go/parquet-go (Apache 2.0, requires Go 1.24.9+, bumped from 1.22 explicitly for this). sourceUris/destinationUris are local file paths by default; gs:// URIs resolve onto a local directory only when LOCAQL_FAKE_GCS_ROOT is set (a LocaQL-only local-disk mapping, not a GCS-compatible API), otherwise gs:// is rejected explicitly. Multi-wildcard destinationUris and ORC are rejected explicitly, not silently ignored. configuration.load.compression and configuration.extract.compression are now wired — GZIP for CSV/NDJSON (both directions); on extract only, SNAPPY/DEFLATE for AVRO (goavro OCF codecs) and SNAPPY/GZIP for PARQUET (parquet-go codecs), verified by comparing extracted file sizes with/without compression rather than just checking the file decodes (both libraries decode any codec transparently regardless of what was requested, so decoding alone wouldn't prove the codec was honored). AVRO/PARQUET on load never accept a non-NONE compression value, since their codec is embedded in the file and auto-detected on read, so the field would be a silent no-op there and is rejected explicitly instead. External tables' externalDataConfiguration does not expose compression yet. A single '*' wildcard in destinationUris now resolves to a real multi-shard writer instead of always forcing a single 000000000000 file — by default (LOCAQL_EXTRACT_SHARD_MAX_BYTES unset) every row still lands in one shard, unchanged; once that env var is set, exceeding it splits the encoded result across sequentially-numbered shard files, each independently valid per format (CSV repeats its header per shard when printHeader is set). A result that needs splitting but has no wildcard, or more than one destinationUris entry, fails explicitly rather than silently picking one destination or duplicating shards. There is still no size-based split for the LOCAQL_FAKE_GCS_ROOT/gs:// case beyond the same local-path mapping, and the threshold is local-only tuning, not BigQuery's real ~1GB-per-file behavior
   rest.routines.crud:
     status: supported
     fidelity: medium
@@ -136,7 +161,8 @@ capabilities:
       - unit/server/routines_insert_get_patch_delete_lifecycle
       - unit/server/routines_insert_requires_definition_body
       - unit/server/routines_require_existing_dataset
-    reason: "insert/get/list/patch/delete for bigquery/v2/.../routines are metadata-only: there is no SQL execution engine behind routines, so definitionBody/routineType/language round-trip without ever being executed"
+      - unit/server/routines_insert_and_patch_round_trip_arguments
+    reason: "insert/get/list/patch/delete for bigquery/v2/.../routines are metadata-only: there is no SQL execution engine behind routines, so definitionBody/routineType/language round-trip without ever being executed. Routines also accept an optional arguments array ([{name, dataType}]), stored and returned as-is and surfaced via INFORMATION_SCHEMA.PARAMETERS; dataType is a flat scalar type name rather than real BigQuery's nested StandardSqlDataType, the same flat-shape simplification already used for schema.fields/externalDataConfiguration elsewhere. A patch that omits arguments leaves existing ones untouched; a patch that includes arguments replaces them wholesale"
   rest.models.crud:
     status: supported
     fidelity: medium
@@ -195,7 +221,8 @@ capabilities:
       - unit/server/information_schema_priority_tables_columns
       - unit/server/information_schema_priority_jobs
       - unit/server/information_schema_priority_partitions
-    reason: SCHEMATA, SCHEMATA_OPTIONS, TABLES, COLUMNS, TABLE_OPTIONS, JOBS, JOBS_BY_PROJECT, JOBS_BY_USER, PARTITIONS, ROUTINES and MODELS query emulation is backed by the live in-memory catalog. JOBS_BY_USER scopes to the UserEmail of the job running the JOBS_BY_USER query itself (the only real "calling user" available; the emulator is anonymous-only and has no broader auth model), returning zero rows rather than all jobs when that job has no UserEmail. VIEWS returns a structurally correct empty result since views are not a real resource yet; broader semantic parity is still pending
+      - unit/server/jobs_sync_query_supports_information_schema_parameters_with_real_data
+    reason: SCHEMATA, SCHEMATA_OPTIONS, TABLES, COLUMNS, TABLE_OPTIONS, JOBS, JOBS_BY_PROJECT, JOBS_BY_USER, PARTITIONS, ROUTINES, PARAMETERS and MODELS query emulation is backed by the live in-memory catalog. JOBS_BY_USER scopes to the UserEmail of the job running the JOBS_BY_USER query itself (the only real "calling user" available; the emulator is anonymous-only and has no broader auth model), returning zero rows rather than all jobs when that job has no UserEmail. PARAMETERS lists each routine's arguments (ordinal_position/parameter_name/data_type) with parameter_mode always "IN", since there is no execution engine to observe a real OUT/INOUT distinction for procedures. VIEWS returns a structurally correct empty result since views are not a real resource yet; MATERIALIZED_VIEWS and SESSIONS are not implemented; broader semantic parity is still pending
   console.ui.resource_forms.basic:
     status: supported
     fidelity: medium
@@ -277,13 +304,13 @@ capabilities:
     fidelity: medium
     tests:
       - e2e/ui/routines_models_crud
-    reason: explorer renders real routine and model nodes per dataset (backed by rest.routines.crud/rest.models.crud), with sidebar forms to create either, a selection flow that opens a resource details panel (raw JSON, friendlyName/description edit, delete); the underlying routines and models remain metadata-only (see rest.routines.crud/rest.models.crud), not executable, which is out of scope by design rather than a UI gap; verified end-to-end against a real headless-Chrome console, not just by reading the code
+    reason: explorer renders real routine and model nodes per dataset (backed by rest.routines.crud/rest.models.crud), with sidebar forms to create either — the routine form includes an optional arguments JSON field (round-tripped through INFORMATION_SCHEMA.PARAMETERS, see rest.routines.crud) — a selection flow that opens a resource details panel (raw JSON, friendlyName/description edit, delete); the underlying routines and models remain metadata-only (see rest.routines.crud/rest.models.crud), not executable, which is out of scope by design rather than a UI gap; verified end-to-end against a real headless-Chrome console, not just by reading the code
   console.ui.load_extract_workspace:
     status: supported
     fidelity: medium
     tests:
       - e2e/ui/load_extract_workspace
-    reason: dedicated Load / Extract tab submits real load jobs (NDJSON/CSV/AVRO/PARQUET sourceUris, schema, write disposition, CSV delimiter/skip rows) and real extract jobs (destination format, field delimiter, printHeader) through jobs.insert, showing the immediate job-creation response with a hint to check the Jobs tab for final DONE-state statistics; verified end-to-end, including the real extracted file on disk, against a real headless-Chrome console, not just by reading the code
+    reason: dedicated Load / Extract tab submits real load jobs (NDJSON/CSV/AVRO/PARQUET sourceUris, schema, write disposition, CSV delimiter/skip rows, optional compression) and real extract jobs (destination format, field delimiter, printHeader, optional compression) through jobs.insert, showing the immediate job-creation response with a hint to check the Jobs tab for final DONE-state statistics; verified end-to-end, including a real gzip-compressed extracted file on disk, against a real headless-Chrome console, not just by reading the code. The form does not expose LOCAQL_EXTRACT_SHARD_MAX_BYTES multi-shard splitting since that is a server-side env var, not a per-job field
   console.ui.table_actions.query_copy_delete:
     status: supported
     fidelity: medium

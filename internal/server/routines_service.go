@@ -7,6 +7,21 @@ import (
 	"time"
 )
 
+// routineArgument is metadata-only, same as the rest of routineRecord: it
+// documents a parameter's name and declared type for introspection
+// (INFORMATION_SCHEMA.PARAMETERS) without any execution engine validating or
+// binding it. DataType is a flat scalar type name (e.g. "INT64"), mirroring
+// this codebase's existing flat externalDataConfiguration/schema.fields
+// shapes rather than real BigQuery's nested StandardSqlDataType
+// ({"typeKind": "INT64"}) — the same declared simplification already used
+// elsewhere, not an oversight. There is no parameter_mode distinction
+// (IN/OUT/INOUT): every argument is treated as IN, since nothing executes a
+// routine to observe or enforce a different mode.
+type routineArgument struct {
+	Name     string
+	DataType string
+}
+
 // routineRecord is metadata-only: there is no SQL execution engine behind it,
 // so insert/get/list/patch/delete round-trip the routine definition without
 // ever calling it. This matches the master plan's own scoping for routines
@@ -19,6 +34,7 @@ type routineRecord struct {
 	Language       string
 	DefinitionBody string
 	Description    string
+	Arguments      []routineArgument
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
 	Version        int
@@ -32,6 +48,7 @@ type routineInsert struct {
 	Language       string
 	DefinitionBody string
 	Description    string
+	Arguments      []routineArgument
 }
 
 type routinePatch struct {
@@ -42,10 +59,12 @@ type routinePatch struct {
 	Language          string
 	DefinitionBody    string
 	Description       string
+	Arguments         []routineArgument
 	HasRoutineType    bool
 	HasLanguage       bool
 	HasDefinitionBody bool
 	HasDescription    bool
+	HasArguments      bool
 }
 
 type routineService struct {
@@ -129,6 +148,7 @@ func (s *routineService) insert(input routineInsert) (*routineRecord, bool) {
 		Language:       normalizeRoutineLanguage(input.Language),
 		DefinitionBody: input.DefinitionBody,
 		Description:    strings.TrimSpace(input.Description),
+		Arguments:      input.Arguments,
 		CreatedAt:      now,
 		UpdatedAt:      now,
 		Version:        1,
@@ -166,6 +186,9 @@ func (s *routineService) patch(input routinePatch) (*routineRecord, bool) {
 	}
 	if input.HasDescription {
 		rec.Description = strings.TrimSpace(input.Description)
+	}
+	if input.HasArguments {
+		rec.Arguments = input.Arguments
 	}
 	rec.UpdatedAt = time.Now().UTC()
 	rec.Version++

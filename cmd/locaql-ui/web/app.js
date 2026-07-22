@@ -2185,19 +2185,33 @@ if (createRoutineForm) {
     const routineType = document.getElementById("newRoutineType").value;
     const language = document.getElementById("newRoutineLanguage").value;
     const definitionBody = document.getElementById("newRoutineDefinitionBody").value.trim();
+    const argumentsRaw = document.getElementById("newRoutineArguments").value.trim();
     if (!datasetId || !routineId || !definitionBody) {
       return;
     }
 
+    let routineArguments;
+    if (argumentsRaw) {
+      try {
+        routineArguments = JSON.parse(argumentsRaw);
+      } catch (err) {
+        alert(`Invalid arguments JSON: ${err.message}`);
+        return;
+      }
+    }
+
     try {
+      const payload = { routineReference: { routineId }, routineType, language, definitionBody };
+      if (routineArguments) payload.arguments = routineArguments;
       await fetchJson(`/api/bigquery/v2/projects/${encodeURIComponent(projectId)}/datasets/${encodeURIComponent(datasetId)}/routines`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ routineReference: { routineId }, routineType, language, definitionBody }),
+        body: JSON.stringify(payload),
       });
       document.getElementById("newRoutineDatasetId").value = datasetId;
       document.getElementById("newRoutineId").value = "";
       document.getElementById("newRoutineDefinitionBody").value = "";
+      document.getElementById("newRoutineArguments").value = "";
       selectedDatasetId = datasetId;
       await refreshAll();
       await selectRoutine(projectId, datasetId, routineId);
@@ -2277,6 +2291,7 @@ if (loadJobForm) {
     const writeDisposition = document.getElementById("loadWriteDisposition").value;
     const fieldDelimiter = document.getElementById("loadFieldDelimiter").value.trim();
     const skipLeadingRowsRaw = document.getElementById("loadSkipLeadingRows").value.trim();
+    const compression = document.getElementById("loadCompression").value.trim();
 
     const load = {
       destinationTable: { projectId, datasetId, tableId },
@@ -2289,6 +2304,7 @@ if (loadJobForm) {
     }
     if (fieldDelimiter) load.fieldDelimiter = fieldDelimiter;
     if (skipLeadingRowsRaw) load.skipLeadingRows = Number(skipLeadingRowsRaw);
+    if (compression) load.compression = compression;
 
     if (loadJobStatus) loadJobStatus.textContent = "submitting...";
     try {
@@ -2321,6 +2337,7 @@ if (extractJobForm) {
     const destinationFormat = document.getElementById("extractDestinationFormat").value;
     const fieldDelimiter = document.getElementById("extractFieldDelimiter").value.trim();
     const printHeader = document.getElementById("extractPrintHeader").checked;
+    const compression = document.getElementById("extractCompression").value.trim();
 
     const extract = {
       sourceTable: { projectId, datasetId, tableId },
@@ -2329,6 +2346,7 @@ if (extractJobForm) {
       printHeader,
     };
     if (fieldDelimiter) extract.fieldDelimiter = fieldDelimiter;
+    if (compression) extract.compression = compression;
 
     if (extractJobStatus) extractJobStatus.textContent = "submitting...";
     try {

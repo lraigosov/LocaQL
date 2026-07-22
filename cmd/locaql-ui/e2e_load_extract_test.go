@@ -3,6 +3,9 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -83,6 +86,47 @@ func TestE2E_LoadExtractWorkspace(t *testing.T) {
 	if !strings.Contains(string(written), "alpha") || !strings.Contains(string(written), "beta") {
 		t.Errorf("expected extracted CSV to contain the real table rows, got %q", string(written))
 	}
+
+	// --- compression: extract the same table again, gzip-compressed, via
+	// the new UI field, and confirm the file on disk is really gzip. ---
+	gzipOutPath := filepath.Join(env.dir, "extract-out.csv.gz")
+	if err := run(ctx,
+		setValue("extractDestinationUris", gzipOutPath),
+		setValue("extractCompression", "GZIP"),
+		submitForm("extractJobForm"),
+		pollTrue(`document.getElementById("extractJobStatus").textContent.includes("job submitted")`),
+	); err != nil {
+		t.Fatalf("submit gzip-compressed extract job: %v", err)
+	}
+	waitForFileExists(t, gzipOutPath, 10*time.Second)
+
+	gzipData, err := os.ReadFile(gzipOutPath)
+	if err != nil {
+		t.Fatalf("read gzip-compressed extracted file: %v", err)
+	}
+	reader, err := gzip.NewReader(bytes.NewReader(gzipData))
+	if err != nil {
+		t.Fatalf("expected extractCompression=GZIP to produce a real gzip file: %v", err)
+	}
+	decompressed, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("decompress gzip-extracted file: %v", err)
+	}
+	if !strings.Contains(string(decompressed), "alpha") || !strings.Contains(string(decompressed), "beta") {
+		t.Errorf("expected decompressed CSV to contain the real table rows, got %q", string(decompressed))
+	}
+}
+
+func waitForFileExists(t *testing.T, path string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if info, err := os.Stat(path); err == nil && info.Size() > 0 {
+			return
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s to exist", path)
 }
 
 func waitForFileContent(t *testing.T, path, substr string, timeout time.Duration) {
