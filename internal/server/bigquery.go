@@ -588,6 +588,31 @@ func (s *Server) insertTable(w http.ResponseWriter, r *http.Request, projectID, 
 		}
 	}
 
+	var schema []tableField
+	var external *externalTableConfig
+	if rawExternal, ok := raw["externalDataConfiguration"].(map[string]any); ok {
+		parsed := parseExternalDataConfig(rawExternal)
+		if len(parsed.SourceURIs) == 0 {
+			writeError(w, http.StatusBadRequest, "externalDataConfiguration.sourceUris is required", "required")
+			return
+		}
+		if parsed.SourceFormat == "" {
+			writeError(w, http.StatusBadRequest, "externalDataConfiguration.sourceFormat is required", "required")
+			return
+		}
+		schema = parseTableSchemaFields(raw["schema"])
+		if len(schema) == 0 {
+			writeError(w, http.StatusBadRequest, "schema.fields is required for external tables; autodetect is not supported", "required")
+			return
+		}
+		external = &externalTableConfig{
+			SourceURIs:      parsed.SourceURIs,
+			SourceFormat:    parsed.SourceFormat,
+			FieldDelimiter:  parsed.FieldDelimiter,
+			SkipLeadingRows: parsed.SkipLeadingRows,
+		}
+	}
+
 	item, created := s.tables.insert(tableInsert{
 		ProjectID:    projectID,
 		DatasetID:    datasetID,
@@ -595,6 +620,8 @@ func (s *Server) insertTable(w http.ResponseWriter, r *http.Request, projectID, 
 		FriendlyName: friendlyName,
 		Description:  description,
 		Labels:       labels,
+		Schema:       schema,
+		External:     external,
 	})
 	if !created {
 		writeError(w, http.StatusConflict, fmt.Sprintf("Already Exists: Table %s:%s.%s", projectID, datasetID, tableID), "duplicate")
@@ -800,7 +827,50 @@ func renderTableResource(t *tableRecord) map[string]any {
 	if len(t.Labels) > 0 {
 		resp["labels"] = t.Labels
 	}
+	if t.External != nil {
+		resp["type"] = "EXTERNAL"
+		external := map[string]any{
+			"sourceUris":   t.External.SourceURIs,
+			"sourceFormat": t.External.SourceFormat,
+		}
+		if t.External.FieldDelimiter != "" {
+			external["fieldDelimiter"] = t.External.FieldDelimiter
+		}
+		if t.External.SkipLeadingRows > 0 {
+			external["skipLeadingRows"] = t.External.SkipLeadingRows
+		}
+		resp["externalDataConfiguration"] = external
+	} else {
+		resp["type"] = "TABLE"
+	}
 	return resp
+}
+
+type externalDataConfigParsed struct {
+	SourceURIs      []string
+	SourceFormat    string
+	FieldDelimiter  string
+	SkipLeadingRows int
+}
+
+// parseExternalDataConfig mirrors parseLoadConfig's flat field layout
+// (sourceUris/sourceFormat/fieldDelimiter/skipLeadingRows) instead of real
+// BigQuery's nested csvOptions, for consistency with how load jobs already
+// parse the same concepts in this codebase.
+func parseExternalDataConfig(raw map[string]any) externalDataConfigParsed {
+	out := externalDataConfigParsed{
+		SourceURIs: extractStringList(raw["sourceUris"]),
+	}
+	if value, ok := raw["sourceFormat"].(string); ok {
+		out.SourceFormat = strings.TrimSpace(value)
+	}
+	if value, ok := raw["fieldDelimiter"].(string); ok {
+		out.FieldDelimiter = value
+	}
+	if value, ok := raw["skipLeadingRows"].(float64); ok {
+		out.SkipLeadingRows = int(value)
+	}
+	return out
 }
 
 func (s *Server) listJobs(w http.ResponseWriter, r *http.Request, projectID string) {
@@ -1133,7 +1203,11 @@ func (s *Server) writeQueryResults(w http.ResponseWriter, r *http.Request, proje
 	}
 
 	start, size := parsePagination(r, 20, 1000)
-	schema, values := s.simulateQueryResultTable(projectID, j.QueryText, j.UserEmail)
+	schema, values, err := s.simulateQueryResultTable(projectID, j.QueryText, j.UserEmail)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error(), "invalid")
+		return
+	}
 	end := clampEnd(start, size, len(values))
 
 	rows := make([]map[string]any, 0, end-start)
@@ -1168,23 +1242,23 @@ func (s *Server) writeQueryResults(w http.ResponseWriter, r *http.Request, proje
 	writeJSON(w, http.StatusOK, resp)
 }
 
-func (s *Server) simulateQueryResultTable(projectID, queryText, callingUserEmail string) ([]map[string]string, [][]string) {
+func (s *Server) simulateQueryResultTable(projectID, queryText, callingUserEmail string) ([]map[string]string, [][]string, error) {
 	trimmed := strings.TrimSpace(queryText)
 	if trimmed == "" {
-		return []map[string]string{{"name": "result", "type": "STRING"}}, [][]string{{"query job executed"}}
+		return []map[string]string{{"name": "result", "type": "STRING"}}, [][]string{{"query job executed"}}, nil
 	}
 
 	lower := strings.ToLower(trimmed)
 	if schema, rows, ok := s.simulateInformationSchemaQuery(projectID, trimmed, lower, callingUserEmail); ok {
-		return schema, rows
+		return schema, rows, nil
 	}
-	if schema, rows, ok := s.simulateTableSelectQuery(projectID, trimmed); ok {
-		return schema, rows
+	if schema, rows, ok, err := s.simulateTableSelectQuery(projectID, trimmed); ok {
+		return schema, rows, err
 	}
 	if strings.HasPrefix(lower, "select") && !strings.Contains(lower, " from ") {
 		expr := strings.TrimSpace(trimmed[len("select"):])
 		if expr == "" {
-			return []map[string]string{{"name": "result", "type": "STRING"}}, [][]string{{"empty select"}}
+			return []map[string]string{{"name": "result", "type": "STRING"}}, [][]string{{"empty select"}}, nil
 		}
 		parts := strings.Split(expr, ",")
 		schema := make([]map[string]string, 0, len(parts))
@@ -1204,7 +1278,7 @@ func (s *Server) simulateQueryResultTable(projectID, queryText, callingUserEmail
 			schema = append(schema, map[string]string{"name": name, "type": "STRING"})
 			row = append(row, value)
 		}
-		return schema, [][]string{row}
+		return schema, [][]string{row}, nil
 	}
 
 	return []map[string]string{
@@ -1214,13 +1288,17 @@ func (s *Server) simulateQueryResultTable(projectID, queryText, callingUserEmail
 			{"1", "Simulated query result row"},
 			{"2", "Add SQL engine integration for full fidelity"},
 			{"3", "Current mode returns deterministic preview"},
-		}
+		}, nil
 }
 
 func (s *Server) listTableData(w http.ResponseWriter, r *http.Request, projectID, datasetID, tableID string) {
-	_, rawRows, ok := s.tables.getData(projectID, datasetID, tableID)
+	_, rawRows, ok, err := s.resolveTableRows(projectID, datasetID, tableID)
 	if !ok {
 		writeError(w, http.StatusNotFound, fmt.Sprintf("Not found: Table %s:%s.%s", projectID, datasetID, tableID), "notFound")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error(), "invalid")
 		return
 	}
 	rows := make([]tableRow, 0, len(rawRows))
@@ -1423,10 +1501,16 @@ func parseTableSchemaFields(v any) []tableField {
 var fromTablePattern = regexp.MustCompile("(?is)\\bfrom\\s+`?([a-zA-Z0-9_\\-\\.]+)`?")
 var informationSchemaPattern = regexp.MustCompile("(?is)(?:`?([a-zA-Z0-9_\\-]+)`?\\.)?(?:`?([a-zA-Z0-9_\\-]+)`?\\.)?information_schema\\.(schemata_options|schemata|table_options|tables|columns|jobs_by_project|jobs_by_user|jobs|partitions|routines|models|views)")
 
-func (s *Server) simulateTableSelectQuery(projectID, queryText string) ([]map[string]string, [][]string, bool) {
+// simulateTableSelectQuery's bool return means "this looked like a table
+// scan" (a FROM clause matched a real table), independent of whether the read
+// succeeded. Callers must check err whenever ok is true: ok=true/err!=nil
+// means the table exists (likely external) but its data could not be read,
+// and must propagate as a query failure rather than falling through to the
+// generic preview simulation below in simulateQueryResultTable.
+func (s *Server) simulateTableSelectQuery(projectID, queryText string) ([]map[string]string, [][]string, bool, error) {
 	matches := fromTablePattern.FindStringSubmatch(queryText)
 	if len(matches) < 2 {
-		return nil, nil, false
+		return nil, nil, false, nil
 	}
 	parts := strings.Split(strings.TrimSpace(matches[1]), ".")
 	ref := tableReference{ProjectID: projectID}
@@ -1436,13 +1520,16 @@ func (s *Server) simulateTableSelectQuery(projectID, queryText string) ([]map[st
 	case 2:
 		ref.DatasetID, ref.TableID = parts[0], parts[1]
 	default:
-		return nil, nil, false
+		return nil, nil, false, nil
 	}
-	fields, rows, ok := s.tables.getData(ref.ProjectID, ref.DatasetID, ref.TableID)
+	fields, rows, ok, err := s.resolveTableRows(ref.ProjectID, ref.DatasetID, ref.TableID)
 	if !ok {
-		return nil, nil, false
+		return nil, nil, false, nil
 	}
-	return renderTableSchemaFields(fields), rows, true
+	if err != nil {
+		return nil, nil, true, err
+	}
+	return renderTableSchemaFields(fields), rows, true, nil
 }
 
 func (s *Server) simulateInformationSchemaQuery(projectID, queryText, lower, callingUserEmail string) ([]map[string]string, [][]string, bool) {
@@ -1569,7 +1656,11 @@ func buildInformationSchemaSchemataOptions(scope informationSchemaScope) ([]map[
 func buildInformationSchemaTables(scope informationSchemaScope) ([]map[string]string, [][]string) {
 	rows := [][]string{}
 	scope.forEachTable(func(datasetID string, table *tableRecord) {
-		rows = append(rows, []string{scope.targetProjectID, datasetID, table.TableID, "BASE TABLE"})
+		tableType := "BASE TABLE"
+		if table.External != nil {
+			tableType = "EXTERNAL"
+		}
+		rows = append(rows, []string{scope.targetProjectID, datasetID, table.TableID, tableType})
 	})
 	return []map[string]string{{"name": "table_catalog", "type": "STRING"}, {"name": "table_schema", "type": "STRING"}, {"name": "table_name", "type": "STRING"}, {"name": "table_type", "type": "STRING"}}, rows
 }
@@ -1630,11 +1721,17 @@ func jobRecordsToInformationSchemaRows(items []*jobRecord) [][]string {
 	return rows
 }
 
+// buildInformationSchemaPartitions skips a table (rather than failing the
+// whole INFORMATION_SCHEMA.PARTITIONS scan) whenever its row count can't be
+// resolved, which for an external table means its sourceUris could not be
+// read right now. A broad metadata scan across a whole dataset returning
+// partial results for one broken external table beats hard-failing every
+// other table in it.
 func buildInformationSchemaPartitions(scope informationSchemaScope) ([]map[string]string, [][]string) {
 	rows := [][]string{}
 	scope.forEachTable(func(datasetID string, table *tableRecord) {
-		_, tableRows, ok := scope.server.tables.getData(scope.targetProjectID, datasetID, table.TableID)
-		if !ok {
+		_, tableRows, ok, err := scope.server.resolveTableRows(scope.targetProjectID, datasetID, table.TableID)
+		if !ok || err != nil {
 			return
 		}
 		rows = append(rows, []string{scope.targetProjectID, datasetID, table.TableID, "__UNPARTITIONED__", strconv.Itoa(len(tableRows))})
@@ -1700,7 +1797,10 @@ func (s *Server) executeQueryJob(job *jobRecord) (jobStatistics, error) {
 	if strings.Contains(strings.ToUpper(job.QueryText), "FORCE_ERROR") {
 		return jobStatistics{Executor: "query", Simulated: false}, fmt.Errorf("simulated forced error from query text")
 	}
-	_, rows := s.simulateQueryResultTable(job.ProjectID, job.QueryText, job.UserEmail)
+	_, rows, err := s.simulateQueryResultTable(job.ProjectID, job.QueryText, job.UserEmail)
+	if err != nil {
+		return jobStatistics{Executor: "query", Simulated: false}, err
+	}
 	return jobStatistics{Executor: "query", Simulated: false, TotalSlotMs: 60, ProcessedBytes: estimateRowsByteSize(rows), OutputRows: int64(len(rows))}, nil
 }
 
@@ -1734,9 +1834,12 @@ func (s *Server) executeCopyJob(job *jobRecord) (jobStatistics, error) {
 		if !s.datasets.exists(source.ProjectID, source.DatasetID) {
 			return jobStatistics{Executor: "copy", Simulated: false}, fmt.Errorf("source dataset not found")
 		}
-		sourceSchema, sourceRows, ok := s.tables.getData(source.ProjectID, source.DatasetID, source.TableID)
+		sourceSchema, sourceRows, ok, err := s.resolveTableRows(source.ProjectID, source.DatasetID, source.TableID)
 		if !ok {
 			return jobStatistics{Executor: "copy", Simulated: false}, fmt.Errorf("source table not found")
+		}
+		if err != nil {
+			return jobStatistics{Executor: "copy", Simulated: false}, err
 		}
 		if idx == 0 {
 			schema = sourceSchema
@@ -1819,9 +1922,12 @@ func (s *Server) executeExtractJob(job *jobRecord) (jobStatistics, error) {
 		return jobStatistics{Executor: "extract", Simulated: false}, fmt.Errorf("destinationUris is required")
 	}
 
-	schema, rows, ok := s.tables.getData(source.ProjectID, source.DatasetID, source.TableID)
+	schema, rows, ok, err := s.resolveTableRows(source.ProjectID, source.DatasetID, source.TableID)
 	if !ok {
 		return jobStatistics{Executor: "extract", Simulated: false}, fmt.Errorf("source table not found")
+	}
+	if err != nil {
+		return jobStatistics{Executor: "extract", Simulated: false}, err
 	}
 
 	format := job.ExtractDestinationFormat
@@ -2248,26 +2354,61 @@ func resolveExtractShardPath(uri string) (string, error) {
 // dispatching on job.LoadSourceFormat. Unsupported formats fail explicitly
 // rather than silently falling back to schema-only materialization.
 func loadRowsFromSourceURIs(job *jobRecord, schema []tableField) ([][]string, int64, error) {
-	switch job.LoadSourceFormat {
+	return readRowsFromURIs(job.LoadSourceFormat, job.LoadSourceURIs, job.LoadFieldDelimiter, job.LoadSkipLeadingRows, schema)
+}
+
+// readRowsFromURIs is the shared format-dispatch reader behind both load jobs
+// (loadRowsFromSourceURIs) and external tables (resolveTableRows): it reads
+// and parses NEWLINE_DELIMITED_JSON/CSV/AVRO/PARQUET rows from local sourceUris
+// (or fake-GCS via LOCAQL_FAKE_GCS_ROOT). Kept as a single source of truth for
+// which sourceFormat values are actually supported.
+func readRowsFromURIs(sourceFormat string, sourceURIs []string, fieldDelimiter string, skipLeadingRows int, schema []tableField) ([][]string, int64, error) {
+	switch sourceFormat {
 	case "NEWLINE_DELIMITED_JSON":
-		return loadRowsAcrossURIs(job.LoadSourceURIs, func(uri string, data []byte) ([][]string, error) {
+		return loadRowsAcrossURIs(sourceURIs, func(uri string, data []byte) ([][]string, error) {
 			return parseNDJSONLines(uri, data, schema)
 		})
 	case "CSV":
-		return loadRowsAcrossURIs(job.LoadSourceURIs, func(uri string, data []byte) ([][]string, error) {
-			return parseCSVRows(uri, data, schema, job.LoadFieldDelimiter, job.LoadSkipLeadingRows)
+		return loadRowsAcrossURIs(sourceURIs, func(uri string, data []byte) ([][]string, error) {
+			return parseCSVRows(uri, data, schema, fieldDelimiter, skipLeadingRows)
 		})
 	case "AVRO":
-		return loadRowsAcrossURIs(job.LoadSourceURIs, func(uri string, data []byte) ([][]string, error) {
+		return loadRowsAcrossURIs(sourceURIs, func(uri string, data []byte) ([][]string, error) {
 			return parseAvroRows(uri, data, schema)
 		})
 	case "PARQUET":
-		return loadRowsAcrossURIs(job.LoadSourceURIs, func(uri string, data []byte) ([][]string, error) {
+		return loadRowsAcrossURIs(sourceURIs, func(uri string, data []byte) ([][]string, error) {
 			return parseParquetRows(uri, data, schema)
 		})
 	default:
-		return nil, 0, fmt.Errorf("sourceFormat %q is not supported; local sourceUris ingestion currently supports NEWLINE_DELIMITED_JSON, CSV, AVRO and PARQUET", job.LoadSourceFormat)
+		return nil, 0, fmt.Errorf("sourceFormat %q is not supported; local sourceUris ingestion currently supports NEWLINE_DELIMITED_JSON, CSV, AVRO and PARQUET", sourceFormat)
 	}
+}
+
+// resolveTableRows is the single choke point every consumer of real row data
+// (query execution, tabledata.list, copy/extract job sources, partition row
+// counts) goes through. For a normal table it is a thin pass-through to
+// tableService.getData. For an external table it re-reads sourceUris fresh on
+// every call — nothing is cached in tableRecord.Rows — so external tables
+// always reflect the current file contents, matching real BigQuery external
+// table semantics. ok mirrors getData's meaning (table exists); err is only
+// ever set when ok is true and the table is external but its files could not
+// be read.
+func (s *Server) resolveTableRows(projectID, datasetID, tableID string) ([]tableField, [][]string, bool, error) {
+	record, ok, _ := s.tables.get(projectID, datasetID, tableID)
+	if !ok {
+		return nil, nil, false, nil
+	}
+	if record.External == nil {
+		fields, rows, ok := s.tables.getData(projectID, datasetID, tableID)
+		return fields, rows, ok, nil
+	}
+	ext := record.External
+	rows, _, err := readRowsFromURIs(ext.SourceFormat, ext.SourceURIs, ext.FieldDelimiter, ext.SkipLeadingRows, record.Schema)
+	if err != nil {
+		return nil, nil, true, fmt.Errorf("failed to read external table %s.%s from sourceUris: %w", datasetID, tableID, err)
+	}
+	return cloneTableFields(record.Schema), rows, true, nil
 }
 
 // loadRowsAcrossURIs reads and concatenates rows from each local sourceUri,
