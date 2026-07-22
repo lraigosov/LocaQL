@@ -20,18 +20,19 @@ type tableReference struct {
 }
 
 type tableRecord struct {
-	ProjectID    string
-	DatasetID    string
-	TableID      string
-	FriendlyName string
-	Description  string
-	Labels       map[string]string
-	Schema       []tableField
-	Rows         [][]string
-	External     *externalTableConfig
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
-	Version      int
+	ProjectID      string
+	DatasetID      string
+	TableID        string
+	FriendlyName   string
+	Description    string
+	Labels         map[string]string
+	Schema         []tableField
+	Rows           [][]string
+	External       *externalTableConfig
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+	Version        int
+	ExpirationTime time.Time // zero value means "never expires"
 }
 
 // externalTableConfig marks a table as backed by local files (or fake-GCS via
@@ -56,36 +57,43 @@ func cloneExternalConfig(c *externalTableConfig) *externalTableConfig {
 }
 
 type tableInsert struct {
-	ProjectID    string
-	DatasetID    string
-	TableID      string
-	FriendlyName string
-	Description  string
-	Labels       map[string]string
-	Schema       []tableField
-	Rows         [][]string
-	External     *externalTableConfig
+	ProjectID      string
+	DatasetID      string
+	TableID        string
+	FriendlyName   string
+	Description    string
+	Labels         map[string]string
+	Schema         []tableField
+	Rows           [][]string
+	External       *externalTableConfig
+	ExpirationTime time.Time
 }
 
 type tablePatch struct {
-	ProjectID       string
-	DatasetID       string
-	TableID         string
-	FriendlyName    string
-	Description     string
-	Labels          map[string]string
-	HasFriendlyName bool
-	HasDescription  bool
-	HasLabels       bool
+	ProjectID         string
+	DatasetID         string
+	TableID           string
+	FriendlyName      string
+	Description       string
+	Labels            map[string]string
+	ExpirationTime    time.Time
+	HasFriendlyName   bool
+	HasDescription    bool
+	HasLabels         bool
+	HasExpirationTime bool
 }
 
+// tableUpdate mirrors real BigQuery PUT semantics: every field is fully
+// replaced by whatever the request carries, including clearing a field left
+// out of the body (no partial-patch Has* flags here, unlike tablePatch).
 type tableUpdate struct {
-	ProjectID    string
-	DatasetID    string
-	TableID      string
-	FriendlyName string
-	Description  string
-	Labels       map[string]string
+	ProjectID      string
+	DatasetID      string
+	TableID        string
+	FriendlyName   string
+	Description    string
+	Labels         map[string]string
+	ExpirationTime time.Time
 }
 
 type tableService struct {
@@ -93,6 +101,10 @@ type tableService struct {
 	defaults        []string
 	projects        map[string]map[string]map[string]*tableRecord
 	datasetVersions map[string]int
+	// now is swappable so expiration enforcement can be tested with a fake
+	// clock instead of waiting on wall-clock time; production code never
+	// overrides it.
+	now func() time.Time
 }
 
 func newTableService() *tableService {
@@ -100,7 +112,29 @@ func newTableService() *tableService {
 		defaults:        []string{"events", "daily_metrics", "users", "raw_import"},
 		projects:        make(map[string]map[string]map[string]*tableRecord),
 		datasetVersions: make(map[string]int),
+		now:             time.Now,
 	}
+}
+
+// purgeExpiredLocked deletes any table in tables whose ExpirationTime has
+// passed according to s.now(), matching real BigQuery's behavior of a table
+// simply ceasing to exist once expired (not a soft/reversible state — unlike
+// dataset undelete, there is no tombstone for an expired table). Callers
+// already hold s.mu. Returns whether anything was purged, so callers can
+// decide whether to bump the dataset's version/ETag.
+func (s *tableService) purgeExpiredLocked(tables map[string]*tableRecord) bool {
+	if len(tables) == 0 {
+		return false
+	}
+	now := s.now()
+	purged := false
+	for id, t := range tables {
+		if !t.ExpirationTime.IsZero() && !t.ExpirationTime.After(now) {
+			delete(tables, id)
+			purged = true
+		}
+	}
+	return purged
 }
 
 func (s *tableService) list(projectID, datasetID string, start, size int) ([]*tableRecord, int, int) {
@@ -108,6 +142,9 @@ func (s *tableService) list(projectID, datasetID string, start, size int) ([]*ta
 	defer s.mu.Unlock()
 
 	tables := s.ensureDatasetLocked(projectID, datasetID)
+	if s.purgeExpiredLocked(tables) {
+		s.datasetVersions[s.datasetKey(projectID, datasetID)]++
+	}
 	version := s.datasetVersions[s.datasetKey(projectID, datasetID)]
 	ids := make([]string, 0, len(tables))
 	for id := range tables {
@@ -142,6 +179,9 @@ func (s *tableService) get(projectID, datasetID, tableID string) (*tableRecord, 
 	defer s.mu.Unlock()
 
 	tables := s.ensureDatasetLocked(projectID, datasetID)
+	if s.purgeExpiredLocked(tables) {
+		s.datasetVersions[s.datasetKey(projectID, datasetID)]++
+	}
 	t := tables[tableID]
 	if t == nil {
 		return nil, false, 0
@@ -169,20 +209,21 @@ func (s *tableService) insert(input tableInsert) (*tableRecord, bool) {
 	if _, exists := tables[tableID]; exists {
 		return nil, false
 	}
-	now := time.Now().UTC()
+	now := s.now().UTC()
 	t := &tableRecord{
-		ProjectID:    projectID,
-		DatasetID:    datasetID,
-		TableID:      tableID,
-		FriendlyName: strings.TrimSpace(input.FriendlyName),
-		Description:  strings.TrimSpace(input.Description),
-		Labels:       cloneLabels(input.Labels),
-		Schema:       cloneTableFields(input.Schema),
-		Rows:         cloneTableRows(input.Rows),
-		External:     cloneExternalConfig(input.External),
-		CreatedAt:    now,
-		UpdatedAt:    now,
-		Version:      1,
+		ProjectID:      projectID,
+		DatasetID:      datasetID,
+		TableID:        tableID,
+		FriendlyName:   strings.TrimSpace(input.FriendlyName),
+		Description:    strings.TrimSpace(input.Description),
+		Labels:         cloneLabels(input.Labels),
+		Schema:         cloneTableFields(input.Schema),
+		Rows:           cloneTableRows(input.Rows),
+		External:       cloneExternalConfig(input.External),
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		Version:        1,
+		ExpirationTime: input.ExpirationTime,
 	}
 	if len(t.Schema) == 0 && len(t.Rows) > 0 {
 		t.Schema = inferSchemaFromRows(t.Rows)
@@ -235,8 +276,11 @@ func (s *tableService) patch(input tablePatch) (*tableRecord, bool) {
 	if input.HasLabels {
 		t.Labels = cloneLabels(input.Labels)
 	}
+	if input.HasExpirationTime {
+		t.ExpirationTime = input.ExpirationTime
+	}
 
-	t.UpdatedAt = time.Now().UTC()
+	t.UpdatedAt = s.now().UTC()
 	t.Version++
 	s.datasetVersions[s.datasetKey(projectID, datasetID)]++
 
@@ -267,7 +311,8 @@ func (s *tableService) update(input tableUpdate) (*tableRecord, bool) {
 	t.FriendlyName = strings.TrimSpace(input.FriendlyName)
 	t.Description = strings.TrimSpace(input.Description)
 	t.Labels = cloneLabels(input.Labels)
-	t.UpdatedAt = time.Now().UTC()
+	t.ExpirationTime = input.ExpirationTime
+	t.UpdatedAt = s.now().UTC()
 	t.Version++
 	s.datasetVersions[s.datasetKey(projectID, datasetID)]++
 
@@ -283,6 +328,9 @@ func (s *tableService) getData(projectID, datasetID, tableID string) ([]tableFie
 	defer s.mu.Unlock()
 
 	tables := s.ensureDatasetLocked(projectID, datasetID)
+	if s.purgeExpiredLocked(tables) {
+		s.datasetVersions[s.datasetKey(projectID, datasetID)]++
+	}
 	t := tables[tableID]
 	if t == nil {
 		return nil, nil, false
@@ -310,7 +358,7 @@ func (s *tableService) upsertCopyDestination(dest tableReference, schema []table
 		if createDisposition == "CREATE_NEVER" {
 			return 0, fmt.Errorf("destination table not found with CREATE_NEVER")
 		}
-		now := time.Now().UTC()
+		now := s.now().UTC()
 		existing = &tableRecord{
 			ProjectID: projectID,
 			DatasetID: datasetID,
@@ -342,7 +390,7 @@ func (s *tableService) upsertCopyDestination(dest tableReference, schema []table
 	if len(existing.Schema) == 0 && len(existing.Rows) > 0 {
 		existing.Schema = inferSchemaFromRows(existing.Rows)
 	}
-	existing.UpdatedAt = time.Now().UTC()
+	existing.UpdatedAt = s.now().UTC()
 	existing.Version++
 	s.datasetVersions[s.datasetKey(projectID, datasetID)]++
 	return len(rows), nil
@@ -353,14 +401,18 @@ func (s *tableService) upsertCopyDestination(dest tableReference, schema []table
 // that was never touched via the tables service reports 0, even though a
 // later read would auto-seed default demo tables.
 func (s *tableService) datasetTableCount(projectID, datasetID string) int {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	proj := s.projects[projectID]
 	if proj == nil {
 		return 0
 	}
-	return len(proj[datasetID])
+	tables := proj[datasetID]
+	if s.purgeExpiredLocked(tables) {
+		s.datasetVersions[s.datasetKey(projectID, datasetID)]++
+	}
+	return len(tables)
 }
 
 // deleteAllForDataset removes every table tracked for projectID/datasetID
@@ -393,7 +445,7 @@ func (s *tableService) ensureDatasetLocked(projectID, datasetID string) map[stri
 	}
 
 	tables = make(map[string]*tableRecord)
-	now := time.Now().UTC()
+	now := s.now().UTC()
 	for _, id := range s.defaults {
 		schema, rows := defaultTableData(id)
 		tables[id] = &tableRecord{

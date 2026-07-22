@@ -90,6 +90,7 @@ Keep the subject line concise and in English; avoid referencing internal tooling
    - `go vet ./...`
    - `go test ./...`
    - `CGO_ENABLED=1 go test -race ./internal/server` for anything touching concurrency-sensitive code (jobs, tables, datasets services).
+   - `go test -tags e2e ./cmd/locaql-ui/...` for anything touching `cmd/locaql-ui` (see [End-to-End Console Tests](README.md#end-to-end-console-tests)) — requires a local Chrome/Chromium/Edge binary and is not part of the default `go test ./...` run.
 3. Update `capabilities/registry.yaml` and the [Current Scope Matrix](README.md#current-scope-matrix) if the change adds, closes, or changes the status of a capability.
 4. Update the relevant `README.md` section (and its Table of Contents entry) if you add or rename a documented feature or endpoint.
 5. Fill in the pull request template (`.github/PULL_REQUEST_TEMPLATE.md`).

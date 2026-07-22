@@ -49,6 +49,9 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/_emulator/capabilities", s.capabilities)
 	s.mux.HandleFunc("/_emulator/datasets/undelete", s.undeleteDataset)
 	s.mux.HandleFunc("/bigquery/v2/projects/", s.bigQueryV2)
+	s.mux.HandleFunc("/storage/v1/b", s.gcsBucketsCollection)
+	s.mux.HandleFunc("/storage/v1/b/", s.gcsBucketScope)
+	s.mux.HandleFunc("/upload/storage/v1/b/", s.gcsObjectUpload)
 }
 
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {

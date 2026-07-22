@@ -3,6 +3,7 @@ package server
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"encoding/base64"
 	"encoding/csv"
 	"encoding/json"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/linkedin/goavro/v2"
 	"github.com/parquet-go/parquet-go"
+	pqcompress "github.com/parquet-go/parquet-go/compress"
 )
 
 type dataset struct {
@@ -276,6 +278,24 @@ func parseFlexibleInt64FromAny(v any) (int64, bool) {
 	default:
 		return 0, false
 	}
+}
+
+// parseExpirationTimeField parses a table's expirationTime field (accepts a
+// numeric string or number, same flexible int64 convention already used for
+// defaultTableExpirationMs) as an ABSOLUTE Unix-millis timestamp, matching
+// real BigQuery's table-level expirationTime contract. This is a different
+// unit of meaning than dataset.defaultTableExpirationMs, which is a DURATION
+// relative to table creation time, not an absolute instant. A nil/non-positive
+// value clears any expiration (zero time.Time).
+func parseExpirationTimeField(v any) (time.Time, bool) {
+	ms, ok := parseFlexibleInt64FromAny(v)
+	if !ok {
+		return time.Time{}, false
+	}
+	if ms <= 0 {
+		return time.Time{}, true
+	}
+	return time.UnixMilli(ms).UTC(), true
 }
 
 func (s *Server) getDataset(w http.ResponseWriter, projectID, datasetID string) {
@@ -613,15 +633,30 @@ func (s *Server) insertTable(w http.ResponseWriter, r *http.Request, projectID, 
 		}
 	}
 
+	// An explicit expirationTime overrides the dataset's defaultTableExpirationMs
+	// (a duration relative to creation), matching real BigQuery precedence.
+	var expirationTime time.Time
+	if v, ok := raw["expirationTime"]; ok {
+		et, ok := parseExpirationTimeField(v)
+		if !ok {
+			writeError(w, http.StatusBadRequest, "expirationTime must be a numeric string or number", "invalid")
+			return
+		}
+		expirationTime = et
+	} else if ds, ok := s.datasets.get(projectID, datasetID); ok && ds.DefaultTableExpirationMs > 0 {
+		expirationTime = s.tables.now().UTC().Add(time.Duration(ds.DefaultTableExpirationMs) * time.Millisecond)
+	}
+
 	item, created := s.tables.insert(tableInsert{
-		ProjectID:    projectID,
-		DatasetID:    datasetID,
-		TableID:      tableID,
-		FriendlyName: friendlyName,
-		Description:  description,
-		Labels:       labels,
-		Schema:       schema,
-		External:     external,
+		ProjectID:      projectID,
+		DatasetID:      datasetID,
+		TableID:        tableID,
+		FriendlyName:   friendlyName,
+		Description:    description,
+		Labels:         labels,
+		Schema:         schema,
+		External:       external,
+		ExpirationTime: expirationTime,
 	})
 	if !created {
 		writeError(w, http.StatusConflict, fmt.Sprintf("Already Exists: Table %s:%s.%s", projectID, datasetID, tableID), "duplicate")
@@ -698,8 +733,17 @@ func (s *Server) patchTable(w http.ResponseWriter, r *http.Request, projectID, d
 			patch.Labels = labels
 		}
 	}
+	if v, ok := raw["expirationTime"]; ok {
+		et, ok := parseExpirationTimeField(v)
+		if !ok {
+			writeError(w, http.StatusBadRequest, "expirationTime must be a numeric string or number", "invalid")
+			return
+		}
+		patch.HasExpirationTime = true
+		patch.ExpirationTime = et
+	}
 
-	if !patch.HasFriendlyName && !patch.HasDescription && !patch.HasLabels {
+	if !patch.HasFriendlyName && !patch.HasDescription && !patch.HasLabels && !patch.HasExpirationTime {
 		writeError(w, http.StatusBadRequest, "at least one patchable field is required", "required")
 		return
 	}
@@ -778,13 +822,24 @@ func (s *Server) updateTable(w http.ResponseWriter, r *http.Request, projectID, 
 		}
 	}
 
+	var expirationTime time.Time
+	if v, ok := raw["expirationTime"]; ok {
+		et, ok := parseExpirationTimeField(v)
+		if !ok {
+			writeError(w, http.StatusBadRequest, "expirationTime must be a numeric string or number", "invalid")
+			return
+		}
+		expirationTime = et
+	}
+
 	item, ok := s.tables.update(tableUpdate{
-		ProjectID:    projectID,
-		DatasetID:    datasetID,
-		TableID:      tableID,
-		FriendlyName: friendlyName,
-		Description:  description,
-		Labels:       labels,
+		ProjectID:      projectID,
+		DatasetID:      datasetID,
+		TableID:        tableID,
+		FriendlyName:   friendlyName,
+		Description:    description,
+		Labels:         labels,
+		ExpirationTime: expirationTime,
 	})
 	if !ok {
 		writeError(w, http.StatusNotFound, fmt.Sprintf("Not found: Table %s:%s.%s", projectID, datasetID, tableID), "notFound")
@@ -826,6 +881,9 @@ func renderTableResource(t *tableRecord) map[string]any {
 	}
 	if len(t.Labels) > 0 {
 		resp["labels"] = t.Labels
+	}
+	if !t.ExpirationTime.IsZero() {
+		resp["expirationTime"] = strconv.FormatInt(t.ExpirationTime.UnixMilli(), 10)
 	}
 	if t.External != nil {
 		resp["type"] = "EXTERNAL"
@@ -937,11 +995,13 @@ func (s *Server) insertJob(w http.ResponseWriter, r *http.Request, projectID str
 	loadSourceFormat := ""
 	loadFieldDelimiter := ""
 	loadSkipLeadingRows := 0
+	loadCompression := ""
 	extractSourceTable := tableReference{}
 	extractDestinationURIs := []string(nil)
 	extractDestinationFormat := ""
 	extractFieldDelimiter := ""
 	extractPrintHeader := true
+	extractCompression := ""
 	createDisposition := ""
 	writeDisposition := ""
 	priority := "INTERACTIVE"
@@ -966,6 +1026,7 @@ func (s *Server) insertJob(w http.ResponseWriter, r *http.Request, projectID str
 							loadSourceFormat = parsed.SourceFormat
 							loadFieldDelimiter = parsed.FieldDelimiter
 							loadSkipLeadingRows = parsed.SkipLeadingRows
+							loadCompression = parsed.Compression
 							createDisposition = parsed.CreateDisposition
 							writeDisposition = parsed.WriteDisposition
 						}
@@ -979,6 +1040,7 @@ func (s *Server) insertJob(w http.ResponseWriter, r *http.Request, projectID str
 							extractDestinationFormat = parsed.DestinationFormat
 							extractFieldDelimiter = parsed.FieldDelimiter
 							extractPrintHeader = parsed.PrintHeader
+							extractCompression = parsed.Compression
 						}
 					}
 					if copyRaw, ok := conf["copy"]; ok {
@@ -1034,11 +1096,13 @@ func (s *Server) insertJob(w http.ResponseWriter, r *http.Request, projectID str
 		LoadSourceFormat: loadSourceFormat,
 		LoadFieldDelimiter: loadFieldDelimiter,
 		LoadSkipLeadingRows: loadSkipLeadingRows,
+		LoadCompression: loadCompression,
 		ExtractSourceTable: extractSourceTable,
 		ExtractDestinationURIs: extractDestinationURIs,
 		ExtractDestinationFormat: extractDestinationFormat,
 		ExtractFieldDelimiter: extractFieldDelimiter,
 		ExtractPrintHeader: extractPrintHeader,
+		ExtractCompression: extractCompression,
 		CreateDisposition: createDisposition,
 		WriteDisposition:  writeDisposition,
 		TargetDataset: targetDataset,
@@ -1387,6 +1451,7 @@ type loadConfigParsed struct {
 	SourceFormat      string
 	FieldDelimiter    string
 	SkipLeadingRows   int
+	Compression       string
 	CreateDisposition string
 	WriteDisposition  string
 }
@@ -1408,6 +1473,9 @@ func parseLoadConfig(loadCfg map[string]any, projectID string) loadConfigParsed 
 	if value, ok := loadCfg["skipLeadingRows"].(float64); ok {
 		out.SkipLeadingRows = int(value)
 	}
+	if value, ok := loadCfg["compression"].(string); ok {
+		out.Compression = value
+	}
 	if value, ok := loadCfg["createDisposition"].(string); ok {
 		out.CreateDisposition = value
 	}
@@ -1423,6 +1491,7 @@ type extractConfigParsed struct {
 	DestinationFormat string
 	FieldDelimiter    string
 	PrintHeader       bool
+	Compression       string
 }
 
 func parseExtractConfig(extractCfg map[string]any, projectID string) extractConfigParsed {
@@ -1439,6 +1508,9 @@ func parseExtractConfig(extractCfg map[string]any, projectID string) extractConf
 	}
 	if value, ok := extractCfg["printHeader"].(bool); ok {
 		out.PrintHeader = value
+	}
+	if value, ok := extractCfg["compression"].(string); ok {
+		out.Compression = value
 	}
 	return out
 }
@@ -1499,7 +1571,7 @@ func parseTableSchemaFields(v any) []tableField {
 }
 
 var fromTablePattern = regexp.MustCompile("(?is)\\bfrom\\s+`?([a-zA-Z0-9_\\-\\.]+)`?")
-var informationSchemaPattern = regexp.MustCompile("(?is)(?:`?([a-zA-Z0-9_\\-]+)`?\\.)?(?:`?([a-zA-Z0-9_\\-]+)`?\\.)?information_schema\\.(schemata_options|schemata|table_options|tables|columns|jobs_by_project|jobs_by_user|jobs|partitions|routines|models|views)")
+var informationSchemaPattern = regexp.MustCompile("(?is)(?:`?([a-zA-Z0-9_\\-]+)`?\\.)?(?:`?([a-zA-Z0-9_\\-]+)`?\\.)?information_schema\\.(schemata_options|schemata|table_options|tables|columns|jobs_by_project|jobs_by_user|jobs|partitions|routines|parameters|models|views)")
 
 // simulateTableSelectQuery's bool return means "this looked like a table
 // scan" (a FROM clause matched a real table), independent of whether the read
@@ -1618,6 +1690,7 @@ var informationSchemaBuilders = map[string]informationSchemaBuilder{
 	"jobs_by_user":     buildInformationSchemaJobsByUser,
 	"partitions":       buildInformationSchemaPartitions,
 	"routines":         buildInformationSchemaRoutines,
+	"parameters":       buildInformationSchemaParameters,
 	"models":           buildInformationSchemaModels,
 	"table_options":    buildInformationSchemaTableOptions,
 	"views":            buildInformationSchemaViews,
@@ -1751,6 +1824,26 @@ func buildInformationSchemaRoutines(scope informationSchemaScope) ([]map[string]
 		}
 	}
 	return []map[string]string{{"name": "routine_catalog", "type": "STRING"}, {"name": "routine_schema", "type": "STRING"}, {"name": "routine_name", "type": "STRING"}, {"name": "routine_type", "type": "STRING"}}, rows
+}
+
+// buildInformationSchemaParameters documents each routine argument's
+// name/type/position. parameter_mode is always "IN": there is no execution
+// engine to observe or enforce OUT/INOUT semantics for procedures, so a
+// distinct mode per argument would be fabricated rather than real.
+func buildInformationSchemaParameters(scope informationSchemaScope) ([]map[string]string, [][]string) {
+	rows := [][]string{}
+	for _, ds := range scope.datasets {
+		if !scope.filterDataset(ds.DatasetID) {
+			continue
+		}
+		items, _, _ := scope.server.routines.list(scope.targetProjectID, ds.DatasetID, 0, 1000)
+		for _, rt := range items {
+			for i, arg := range rt.Arguments {
+				rows = append(rows, []string{scope.targetProjectID, ds.DatasetID, rt.RoutineID, strconv.Itoa(i + 1), "IN", arg.Name, arg.DataType})
+			}
+		}
+	}
+	return []map[string]string{{"name": "specific_catalog", "type": "STRING"}, {"name": "specific_schema", "type": "STRING"}, {"name": "specific_name", "type": "STRING"}, {"name": "ordinal_position", "type": "INT64"}, {"name": "parameter_mode", "type": "STRING"}, {"name": "parameter_name", "type": "STRING"}, {"name": "data_type", "type": "STRING"}}, rows
 }
 
 func buildInformationSchemaModels(scope informationSchemaScope) ([]map[string]string, [][]string) {
@@ -1935,7 +2028,12 @@ func (s *Server) executeExtractJob(job *jobRecord) (jobStatistics, error) {
 		format = "CSV"
 	}
 
-	totalBytes, err := writeExtractDestinations(job.ExtractDestinationURIs, format, schema, rows, job.ExtractFieldDelimiter, job.ExtractPrintHeader)
+	compression, err := normalizeExtractCompression(format, job.ExtractCompression)
+	if err != nil {
+		return jobStatistics{Executor: "extract", Simulated: false}, err
+	}
+
+	totalBytes, err := writeExtractDestinations(job.ExtractDestinationURIs, format, schema, rows, job.ExtractFieldDelimiter, job.ExtractPrintHeader, compression)
 	if err != nil {
 		return jobStatistics{Executor: "extract", Simulated: false}, err
 	}
@@ -1943,43 +2041,194 @@ func (s *Server) executeExtractJob(job *jobRecord) (jobStatistics, error) {
 	return jobStatistics{Executor: "extract", Simulated: false, TotalSlotMs: 45, ProcessedBytes: totalBytes, OutputRows: int64(len(rows))}, nil
 }
 
-func writeExtractDestinations(uris []string, format string, schema []tableField, rows [][]string, fieldDelimiter string, printHeader bool) (int64, error) {
-	payload, err := encodeExtractPayload(format, schema, rows, fieldDelimiter, printHeader)
+// normalizeExtractCompression validates configuration.extract.compression
+// against the destination format's actually-supported codec set, defaulting
+// to "NONE" when omitted. An unsupported combination (e.g. GZIP for AVRO)
+// fails explicitly rather than silently falling back to uncompressed output.
+func normalizeExtractCompression(format, compression string) (string, error) {
+	c := strings.ToUpper(strings.TrimSpace(compression))
+	if c == "" {
+		c = "NONE"
+	}
+	var supported []string
+	switch format {
+	case "NEWLINE_DELIMITED_JSON", "CSV":
+		supported = []string{"NONE", "GZIP"}
+	case "AVRO":
+		supported = []string{"NONE", "SNAPPY", "DEFLATE"}
+	case "PARQUET":
+		supported = []string{"NONE", "SNAPPY", "GZIP"}
+	default:
+		return c, nil // unsupported destinationFormat itself surfaces elsewhere
+	}
+	for _, s := range supported {
+		if c == s {
+			return c, nil
+		}
+	}
+	return "", fmt.Errorf("compression %q is not supported for destinationFormat %q; supported: %s", compression, format, strings.Join(supported, ", "))
+}
+
+// maybeGzip wraps payload in gzip when compression is "GZIP", matching real
+// BigQuery's CSV/NEWLINE_DELIMITED_JSON extract compression contract; any
+// other normalized value (only "NONE" reaches here after
+// normalizeExtractCompression) returns payload unchanged.
+func maybeGzip(payload []byte, compression string) ([]byte, error) {
+	if compression != "GZIP" {
+		return payload, nil
+	}
+	var buf bytes.Buffer
+	gw := gzip.NewWriter(&buf)
+	if _, err := gw.Write(payload); err != nil {
+		return nil, fmt.Errorf("failed to gzip extract payload: %w", err)
+	}
+	if err := gw.Close(); err != nil {
+		return nil, fmt.Errorf("failed to finalize gzip extract payload: %w", err)
+	}
+	return buf.Bytes(), nil
+}
+
+// avroCodecNameFor maps a normalized compression value to the OCF codec name
+// goavro understands; GZIP never reaches here since normalizeExtractCompression
+// only allows NONE/SNAPPY/DEFLATE for AVRO.
+func avroCodecNameFor(compression string) string {
+	switch compression {
+	case "SNAPPY":
+		return goavro.CompressionSnappyLabel
+	case "DEFLATE":
+		return goavro.CompressionDeflateLabel
+	default:
+		return goavro.CompressionNullLabel
+	}
+}
+
+// parquetCodecFor maps a normalized compression value to a parquet-go codec;
+// DEFLATE never reaches here since normalizeExtractCompression only allows
+// NONE/SNAPPY/GZIP for PARQUET.
+func parquetCodecFor(compression string) pqcompress.Codec {
+	switch compression {
+	case "SNAPPY":
+		return &parquet.Snappy
+	case "GZIP":
+		return &parquet.Gzip
+	default:
+		return &parquet.Uncompressed
+	}
+}
+
+// writeExtractDestinations encodes the result once to measure its size, and
+// only splits into multiple shard files when LOCAQL_EXTRACT_SHARD_MAX_BYTES
+// is configured and exceeded — by default (env var unset) this always writes
+// a single shard, unchanged from before multi-shard support existed.
+func writeExtractDestinations(uris []string, format string, schema []tableField, rows [][]string, fieldDelimiter string, printHeader bool, compression string) (int64, error) {
+	fullPayload, err := encodeExtractPayload(format, schema, rows, fieldDelimiter, printHeader, compression)
 	if err != nil {
 		return 0, err
 	}
 
-	var totalBytes int64
-	for _, uri := range uris {
-		path, err := resolveExtractShardPath(uri)
+	maxShardBytes := readExtractShardMaxBytes()
+	if maxShardBytes <= 0 || int64(len(fullPayload)) <= maxShardBytes || len(rows) <= 1 {
+		return writeExtractShards(uris, []extractShard{{index: 0, payload: fullPayload}})
+	}
+
+	// Splitting is required: mirror real BigQuery's contract that a
+	// multi-shard result requires exactly one destinationUri carrying a
+	// single '*' wildcard, rather than silently picking one of several
+	// literal URIs or duplicating shards across all of them.
+	if len(uris) != 1 || strings.Count(uris[0], "*") != 1 {
+		return 0, fmt.Errorf("result is %d bytes, over the %d byte LOCAQL_EXTRACT_SHARD_MAX_BYTES threshold, so it must be split across multiple shard files; provide exactly one destinationUri containing a single '*' wildcard instead of %d", len(fullPayload), maxShardBytes, len(uris))
+	}
+
+	shardCount := int(math.Ceil(float64(len(fullPayload)) / float64(maxShardBytes)))
+	if shardCount < 1 {
+		shardCount = 1
+	}
+	if shardCount > len(rows) {
+		shardCount = len(rows)
+	}
+	rowsPerShard := int(math.Ceil(float64(len(rows)) / float64(shardCount)))
+
+	shards := make([]extractShard, 0, shardCount)
+	for start, shardIndex := 0, 0; start < len(rows); start, shardIndex = start+rowsPerShard, shardIndex+1 {
+		end := start + rowsPerShard
+		if end > len(rows) {
+			end = len(rows)
+		}
+		shardPayload, err := encodeExtractPayload(format, schema, rows[start:end], fieldDelimiter, printHeader, compression)
 		if err != nil {
 			return 0, err
 		}
-		// GCS (real or fake-local) has no real directory concept: object
-		// paths like "out/events.csv" don't require a pre-existing "out"
-		// folder, so the parent directory is created on write rather than
-		// requiring callers to pre-create it themselves.
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-			return 0, fmt.Errorf("failed to create parent directory for destinationUri %q: %w", uri, err)
+		shards = append(shards, extractShard{index: shardIndex, payload: shardPayload})
+	}
+	return writeExtractShards(uris, shards)
+}
+
+func readExtractShardMaxBytes() int64 {
+	raw := strings.TrimSpace(os.Getenv("LOCAQL_EXTRACT_SHARD_MAX_BYTES"))
+	if raw == "" {
+		return 0
+	}
+	n, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
+}
+
+type extractShard struct {
+	index   int
+	payload []byte
+}
+
+// writeExtractShards writes each shard to every destinationUri, substituting
+// the shard's index for that URI's '*' wildcard (or writing as-is when there
+// is none). With a single shard (the common, pre-existing case) and multiple
+// literal URIs, every URI receives the same shard 0 content — unchanged from
+// before multi-shard support existed. A real multi-shard result always has
+// exactly one URI (validated by the caller), so each shard lands in its own
+// numbered file next to the others.
+func writeExtractShards(uris []string, shards []extractShard) (int64, error) {
+	var totalBytes int64
+	for _, shard := range shards {
+		for _, uri := range uris {
+			path, err := resolveNumberedShardPath(uri, shard.index)
+			if err != nil {
+				return 0, err
+			}
+			// GCS (real or fake-local) has no real directory concept: object
+			// paths like "out/events.csv" don't require a pre-existing "out"
+			// folder, so the parent directory is created on write rather than
+			// requiring callers to pre-create it themselves.
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				return 0, fmt.Errorf("failed to create parent directory for destinationUri %q: %w", uri, err)
+			}
+			if err := os.WriteFile(path, shard.payload, 0o644); err != nil {
+				return 0, fmt.Errorf("failed to write destinationUri %q: %w", uri, err)
+			}
+			totalBytes += int64(len(shard.payload))
 		}
-		if err := os.WriteFile(path, payload, 0o644); err != nil {
-			return 0, fmt.Errorf("failed to write destinationUri %q: %w", uri, err)
-		}
-		totalBytes += int64(len(payload))
 	}
 	return totalBytes, nil
 }
 
-func encodeExtractPayload(format string, schema []tableField, rows [][]string, fieldDelimiter string, printHeader bool) ([]byte, error) {
+func encodeExtractPayload(format string, schema []tableField, rows [][]string, fieldDelimiter string, printHeader bool, compression string) ([]byte, error) {
 	switch format {
 	case "NEWLINE_DELIMITED_JSON":
-		return encodeNDJSON(schema, rows)
+		payload, err := encodeNDJSON(schema, rows)
+		if err != nil {
+			return nil, err
+		}
+		return maybeGzip(payload, compression)
 	case "CSV":
-		return encodeCSV(schema, rows, fieldDelimiter, printHeader)
+		payload, err := encodeCSV(schema, rows, fieldDelimiter, printHeader)
+		if err != nil {
+			return nil, err
+		}
+		return maybeGzip(payload, compression)
 	case "AVRO":
-		return encodeAvro(schema, rows)
+		return encodeAvro(schema, rows, avroCodecNameFor(compression))
 	case "PARQUET":
-		return encodeParquet(schema, rows)
+		return encodeParquet(schema, rows, parquetCodecFor(compression))
 	default:
 		return nil, fmt.Errorf("destinationFormat %q is not supported; local extract currently supports NEWLINE_DELIMITED_JSON, CSV, AVRO and PARQUET", format)
 	}
@@ -2093,14 +2342,14 @@ func parseAvroRows(uri string, data []byte, schema []tableField) ([][]string, er
 // bound as NDJSON/CSV rather than inventing null support only here. A row
 // value that fails to parse as its declared type falls back to that type's
 // zero value instead of failing the whole encode.
-func encodeAvro(schema []tableField, rows [][]string) ([]byte, error) {
+func encodeAvro(schema []tableField, rows [][]string, codecName string) ([]byte, error) {
 	schemaJSON, err := buildAvroSchemaJSON(schema)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build Avro schema: %w", err)
 	}
 
 	var buf bytes.Buffer
-	writer, err := goavro.NewOCFWriter(goavro.OCFConfig{W: &buf, Schema: schemaJSON})
+	writer, err := goavro.NewOCFWriter(goavro.OCFConfig{W: &buf, Schema: schemaJSON, CompressionName: codecName})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Avro writer: %w", err)
 	}
@@ -2268,11 +2517,11 @@ func parseParquetRows(uri string, data []byte, schema []tableField) ([][]string,
 
 // encodeParquet writes rows as a Parquet file using a schema derived from
 // schema field names/types.
-func encodeParquet(schema []tableField, rows [][]string) ([]byte, error) {
+func encodeParquet(schema []tableField, rows [][]string, codec pqcompress.Codec) ([]byte, error) {
 	parquetSchema := buildParquetSchema(schema)
 
 	var buf bytes.Buffer
-	writer := parquet.NewWriter(&buf, parquetSchema)
+	writer := parquet.NewWriter(&buf, parquetSchema, parquet.Compression(codec))
 	for _, row := range rows {
 		record := make(map[string]any, len(schema))
 		for i, field := range schema {
@@ -2330,12 +2579,12 @@ func resolveFakeGCSPath(uri string) (string, error) {
 	return joined, nil
 }
 
-// resolveExtractShardPath resolves a destinationUri that may contain a single
-// '*' wildcard to the BigQuery convention for a single-shard result: the
-// wildcard becomes the first shard index, zero-padded to 12 digits
-// ("000000000000"). The emulator does not split large results into multiple
-// physical shards yet, so every row always lands in that one file.
-func resolveExtractShardPath(uri string) (string, error) {
+// resolveNumberedShardPath resolves a destinationUri that may contain a
+// single '*' wildcard to the BigQuery shard-file convention: the wildcard
+// becomes shardIndex, zero-padded to 12 digits (e.g. "000000000001"). A URI
+// without a wildcard is returned unchanged regardless of shardIndex, matching
+// real BigQuery's behavior for a literal (non-wildcarded) destinationUri.
+func resolveNumberedShardPath(uri string, shardIndex int) (string, error) {
 	path, err := resolveLocalFilePath(uri)
 	if err != nil {
 		return "", err
@@ -2344,7 +2593,7 @@ func resolveExtractShardPath(uri string) (string, error) {
 	case 0:
 		return path, nil
 	case 1:
-		return strings.Replace(path, "*", "000000000000", 1), nil
+		return strings.Replace(path, "*", fmt.Sprintf("%012d", shardIndex), 1), nil
 	default:
 		return "", fmt.Errorf("destinationUri %q must contain at most one '*' wildcard", uri)
 	}
@@ -2354,7 +2603,35 @@ func resolveExtractShardPath(uri string) (string, error) {
 // dispatching on job.LoadSourceFormat. Unsupported formats fail explicitly
 // rather than silently falling back to schema-only materialization.
 func loadRowsFromSourceURIs(job *jobRecord, schema []tableField) ([][]string, int64, error) {
-	return readRowsFromURIs(job.LoadSourceFormat, job.LoadSourceURIs, job.LoadFieldDelimiter, job.LoadSkipLeadingRows, schema)
+	return readRowsFromURIs(job.LoadSourceFormat, job.LoadSourceURIs, job.LoadFieldDelimiter, job.LoadSkipLeadingRows, schema, job.LoadCompression)
+}
+
+// normalizeLoadCompression validates configuration.load.compression against
+// what's actually meaningful for the given sourceFormat: GZIP is a real
+// pre-processing step for CSV/NEWLINE_DELIMITED_JSON, but AVRO/PARQUET files
+// carry their own codec in the file itself (decoded automatically by
+// goavro/parquet-go regardless of what value would be passed here), so a
+// non-NONE value for those formats is rejected explicitly instead of being
+// silently accepted as a no-op the caller might mistake for having an effect.
+func normalizeLoadCompression(sourceFormat, compression string) (string, error) {
+	c := strings.ToUpper(strings.TrimSpace(compression))
+	if c == "" {
+		c = "NONE"
+	}
+	switch sourceFormat {
+	case "NEWLINE_DELIMITED_JSON", "CSV":
+		if c == "NONE" || c == "GZIP" {
+			return c, nil
+		}
+		return "", fmt.Errorf("compression %q is not supported for sourceFormat %q; supported: NONE, GZIP", compression, sourceFormat)
+	case "AVRO", "PARQUET":
+		if c == "NONE" {
+			return c, nil
+		}
+		return "", fmt.Errorf("compression %q is not applicable to sourceFormat %q: its codec is embedded in the file and decoded automatically, so configuration.load.compression must be left unset or NONE", compression, sourceFormat)
+	default:
+		return c, nil // unsupported sourceFormat itself surfaces elsewhere
+	}
 }
 
 // readRowsFromURIs is the shared format-dispatch reader behind both load jobs
@@ -2362,14 +2639,26 @@ func loadRowsFromSourceURIs(job *jobRecord, schema []tableField) ([][]string, in
 // and parses NEWLINE_DELIMITED_JSON/CSV/AVRO/PARQUET rows from local sourceUris
 // (or fake-GCS via LOCAQL_FAKE_GCS_ROOT). Kept as a single source of truth for
 // which sourceFormat values are actually supported.
-func readRowsFromURIs(sourceFormat string, sourceURIs []string, fieldDelimiter string, skipLeadingRows int, schema []tableField) ([][]string, int64, error) {
+func readRowsFromURIs(sourceFormat string, sourceURIs []string, fieldDelimiter string, skipLeadingRows int, schema []tableField, compression string) ([][]string, int64, error) {
+	normalizedCompression, err := normalizeLoadCompression(sourceFormat, compression)
+	if err != nil {
+		return nil, 0, err
+	}
 	switch sourceFormat {
 	case "NEWLINE_DELIMITED_JSON":
 		return loadRowsAcrossURIs(sourceURIs, func(uri string, data []byte) ([][]string, error) {
+			data, err := maybeGunzip(data, normalizedCompression)
+			if err != nil {
+				return nil, fmt.Errorf("sourceUri %q: %w", uri, err)
+			}
 			return parseNDJSONLines(uri, data, schema)
 		})
 	case "CSV":
 		return loadRowsAcrossURIs(sourceURIs, func(uri string, data []byte) ([][]string, error) {
+			data, err := maybeGunzip(data, normalizedCompression)
+			if err != nil {
+				return nil, fmt.Errorf("sourceUri %q: %w", uri, err)
+			}
 			return parseCSVRows(uri, data, schema, fieldDelimiter, skipLeadingRows)
 		})
 	case "AVRO":
@@ -2383,6 +2672,25 @@ func readRowsFromURIs(sourceFormat string, sourceURIs []string, fieldDelimiter s
 	default:
 		return nil, 0, fmt.Errorf("sourceFormat %q is not supported; local sourceUris ingestion currently supports NEWLINE_DELIMITED_JSON, CSV, AVRO and PARQUET", sourceFormat)
 	}
+}
+
+// maybeGunzip reverses maybeGzip: when compression is "GZIP" it decompresses
+// data before format-specific parsing; any other normalized value ("NONE")
+// returns data unchanged.
+func maybeGunzip(data []byte, compression string) ([]byte, error) {
+	if compression != "GZIP" {
+		return data, nil
+	}
+	reader, err := gzip.NewReader(bytes.NewReader(data))
+	if err != nil {
+		return nil, fmt.Errorf("failed to open gzip reader: %w", err)
+	}
+	defer reader.Close()
+	decompressed, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decompress gzip data: %w", err)
+	}
+	return decompressed, nil
 }
 
 // resolveTableRows is the single choke point every consumer of real row data
@@ -2404,7 +2712,7 @@ func (s *Server) resolveTableRows(projectID, datasetID, tableID string) ([]table
 		return fields, rows, ok, nil
 	}
 	ext := record.External
-	rows, _, err := readRowsFromURIs(ext.SourceFormat, ext.SourceURIs, ext.FieldDelimiter, ext.SkipLeadingRows, record.Schema)
+	rows, _, err := readRowsFromURIs(ext.SourceFormat, ext.SourceURIs, ext.FieldDelimiter, ext.SkipLeadingRows, record.Schema, "")
 	if err != nil {
 		return nil, nil, true, fmt.Errorf("failed to read external table %s.%s from sourceUris: %w", datasetID, tableID, err)
 	}

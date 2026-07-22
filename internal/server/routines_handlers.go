@@ -69,6 +69,10 @@ func (s *Server) insertRoutine(w http.ResponseWriter, r *http.Request, projectID
 		RoutineReference struct {
 			RoutineID string `json:"routineId"`
 		} `json:"routineReference"`
+		Arguments []struct {
+			Name     string `json:"name"`
+			DataType string `json:"dataType"`
+		} `json:"arguments"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 		writeError(w, http.StatusBadRequest, "Invalid request body", "invalid")
@@ -92,6 +96,7 @@ func (s *Server) insertRoutine(w http.ResponseWriter, r *http.Request, projectID
 		Language:       payload.Language,
 		DefinitionBody: payload.DefinitionBody,
 		Description:    payload.Description,
+		Arguments:      parseRoutineArguments(payload.Arguments),
 	})
 	if !created {
 		writeError(w, http.StatusConflict, fmt.Sprintf("Already Exists: Routine %s:%s.%s", projectID, datasetID, routineID), "duplicate")
@@ -127,7 +132,7 @@ func (s *Server) patchRoutine(w http.ResponseWriter, r *http.Request, projectID,
 		writeError(w, http.StatusBadRequest, errMsg, "invalid")
 		return
 	}
-	if !patch.HasRoutineType && !patch.HasLanguage && !patch.HasDefinitionBody && !patch.HasDescription {
+	if !patch.HasRoutineType && !patch.HasLanguage && !patch.HasDefinitionBody && !patch.HasDescription && !patch.HasArguments {
 		writeError(w, http.StatusBadRequest, "at least one patchable field is required", "required")
 		return
 	}
@@ -171,10 +176,60 @@ func applyRoutinePatchFields(patch *routinePatch, raw map[string]any) string {
 		*field.has = true
 		*field.target = str
 	}
+	if v, ok := raw["arguments"]; ok {
+		args, errMsg := decodeRoutineArguments(v)
+		if errMsg != "" {
+			return errMsg
+		}
+		patch.HasArguments = true
+		patch.Arguments = args
+	}
 	return ""
 }
 
+// parseRoutineArguments converts the JSON-decoded arguments payload (already
+// typed via json.Decoder into insertRoutine's anonymous struct slice) into
+// routineArgument records.
+func parseRoutineArguments(items []struct {
+	Name     string `json:"name"`
+	DataType string `json:"dataType"`
+}) []routineArgument {
+	if len(items) == 0 {
+		return nil
+	}
+	out := make([]routineArgument, 0, len(items))
+	for _, item := range items {
+		out = append(out, routineArgument{Name: strings.TrimSpace(item.Name), DataType: strings.TrimSpace(item.DataType)})
+	}
+	return out
+}
+
+// decodeRoutineArguments handles the patch path, where the body is decoded
+// into a generic map[string]any instead of a typed struct, so "arguments"
+// arrives as []any of map[string]any entries that need manual type assertion.
+func decodeRoutineArguments(v any) ([]routineArgument, string) {
+	list, ok := v.([]any)
+	if !ok {
+		return nil, "arguments must be an array"
+	}
+	out := make([]routineArgument, 0, len(list))
+	for _, raw := range list {
+		entry, ok := raw.(map[string]any)
+		if !ok {
+			return nil, "arguments entries must be objects with name/dataType"
+		}
+		name, _ := entry["name"].(string)
+		dataType, _ := entry["dataType"].(string)
+		out = append(out, routineArgument{Name: strings.TrimSpace(name), DataType: strings.TrimSpace(dataType)})
+	}
+	return out, ""
+}
+
 func renderRoutineResource(rt *routineRecord) map[string]any {
+	arguments := make([]map[string]string, 0, len(rt.Arguments))
+	for _, arg := range rt.Arguments {
+		arguments = append(arguments, map[string]string{"name": arg.Name, "dataType": arg.DataType})
+	}
 	return map[string]any{
 		"kind": "bigquery#routine",
 		"routineReference": map[string]string{
@@ -186,6 +241,7 @@ func renderRoutineResource(rt *routineRecord) map[string]any {
 		"language":         rt.Language,
 		"definitionBody":   rt.DefinitionBody,
 		"description":      rt.Description,
+		"arguments":        arguments,
 		"creationTime":     formatUnixMillis(rt.CreatedAt),
 		"lastModifiedTime": formatUnixMillis(rt.UpdatedAt),
 		"etag":             fmt.Sprintf("\"v%d\"", rt.Version),

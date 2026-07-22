@@ -33,11 +33,13 @@ type jobRecord struct {
 	LoadSourceFormat string
 	LoadFieldDelimiter string
 	LoadSkipLeadingRows int
+	LoadCompression string
 	ExtractSourceTable      tableReference
 	ExtractDestinationURIs  []string
 	ExtractDestinationFormat string
 	ExtractFieldDelimiter   string
 	ExtractPrintHeader      bool
+	ExtractCompression      string
 	TargetDataset   string
 	TargetTable     string
 	CreateDisposition string
@@ -90,11 +92,13 @@ type jobInsertOptions struct {
 	LoadSourceFormat string
 	LoadFieldDelimiter string
 	LoadSkipLeadingRows int
+	LoadCompression string
 	ExtractSourceTable      tableReference
 	ExtractDestinationURIs  []string
 	ExtractDestinationFormat string
 	ExtractFieldDelimiter   string
 	ExtractPrintHeader      bool
+	ExtractCompression      string
 	CreateDisposition string
 	WriteDisposition  string
 	TargetDataset string
@@ -233,11 +237,13 @@ func (s *jobService) insert(opts jobInsertOptions) (*jobRecord, bool) {
 		LoadSourceFormat: strings.TrimSpace(opts.LoadSourceFormat),
 		LoadFieldDelimiter: opts.LoadFieldDelimiter,
 		LoadSkipLeadingRows: opts.LoadSkipLeadingRows,
+		LoadCompression: strings.TrimSpace(opts.LoadCompression),
 		ExtractSourceTable: opts.ExtractSourceTable,
 		ExtractDestinationURIs: cloneStringSlice(opts.ExtractDestinationURIs),
 		ExtractDestinationFormat: strings.TrimSpace(opts.ExtractDestinationFormat),
 		ExtractFieldDelimiter: opts.ExtractFieldDelimiter,
 		ExtractPrintHeader: opts.ExtractPrintHeader,
+		ExtractCompression: strings.TrimSpace(opts.ExtractCompression),
 		TargetDataset: strings.TrimSpace(opts.TargetDataset),
 		TargetTable: strings.TrimSpace(opts.TargetTable),
 		CreateDisposition: normalizeCreateDisposition(opts.CreateDisposition),

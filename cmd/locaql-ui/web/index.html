@@ -86,6 +86,8 @@
           <span class="cap-badge cap-partial">PARTIAL</span>
           <span class="cap-badge cap-unsupported">UNSUPPORTED</span>
           <span class="cap-badge cap-context">CONTEXT</span>
+          <span class="cap-badge cap-badge-sub cap-partial">UI PARTIAL</span>
+          <span style="font-size: 0.72rem; color: var(--muted);">— UI fidelity note, not filtered</span>
         </div>
         <form id="createDatasetForm" class="compact-form">
           <input id="newDatasetId" placeholder="new dataset id" required />
@@ -137,6 +139,7 @@
             <option value="JAVASCRIPT">JAVASCRIPT</option>
           </select>
           <textarea id="newRoutineDefinitionBody" placeholder="definitionBody (e.g. x + 1)" rows="2" required></textarea>
+          <textarea id="newRoutineArguments" rows="2" placeholder="arguments JSON, e.g. [{&quot;name&quot;:&quot;x&quot;,&quot;dataType&quot;:&quot;INT64&quot;}] (optional)"></textarea>
           <button type="submit">Add Routine</button>
         </form>
         <form id="createModelForm" class="compact-form">
@@ -441,6 +444,7 @@
               <input id="loadFieldDelimiter" placeholder="fieldDelimiter (CSV only, default ,)" />
               <input id="loadSkipLeadingRows" placeholder="skipLeadingRows (CSV only, default 0)" />
             </div>
+            <input id="loadCompression" placeholder="compression (CSV/NDJSON: GZIP; default NONE — Avro/Parquet codec is auto-detected on read, must stay NONE)" />
             <div class="row-actions">
               <button type="submit">Submit Load Job</button>
               <span id="loadJobStatus" class="meta-text">ready</span>
@@ -467,6 +471,7 @@
               </select>
               <input id="extractFieldDelimiter" placeholder="fieldDelimiter (CSV only, default ,)" />
             </div>
+            <input id="extractCompression" placeholder="compression (CSV/NDJSON: GZIP; AVRO: SNAPPY/DEFLATE; PARQUET: SNAPPY/GZIP; default NONE)" />
             <label class="meta-text"><input type="checkbox" id="extractPrintHeader" checked /> printHeader (CSV only)</label>
             <div class="row-actions">
               <button type="submit">Submit Extract Job</button>
@@ -486,6 +491,6 @@
     </section>
   </main>
 
-  <script src="/web/app.js?v=21" type="module"></script>
+  <script src="/web/app.js?v=23" type="module"></script>
 </body>
 </html>
