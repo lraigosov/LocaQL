@@ -835,6 +835,13 @@ body[data-theme="dark"] .list li {
   color: var(--muted);
 }
 
+.cap-badge-sub {
+  opacity: 0.75;
+  font-size: 0.6rem;
+  padding: 1px 6px;
+  margin-left: 4px;
+}
+
 body[data-theme="dark"] .cap-unsupported {
   background: rgba(255, 113, 113, 0.16);
   border-color: rgba(255, 113, 113, 0.35);

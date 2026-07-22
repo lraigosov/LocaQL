@@ -339,7 +339,6 @@ function updateExplorerCapabilityFilterOptions() {
     const datasetStatus = combineCapabilityStatus([
       "rest.datasets.get",
       "rest.datasets.patch",
-      "console.ui.resource_forms.basic",
     ]);
     if (isDatasetDirectMatch) {
       counts[datasetStatus] = (counts[datasetStatus] || 0) + 1;
@@ -350,7 +349,6 @@ function updateExplorerCapabilityFilterOptions() {
     const tableStatus = combineCapabilityStatus([
       "rest.tables.get",
       "rest.tabledata.list.pagination",
-      "console.ui.table_details.preview_schema_metadata",
     ]);
     counts[tableStatus] = (counts[tableStatus] || 0) + filteredTables.length;
 
@@ -380,10 +378,21 @@ function statusBadgeLabel(status) {
   return "PARTIAL";
 }
 
-function buildCapabilityBadge(status, titleText) {
+function capabilityTitle(keys, fallback) {
+  const parts = keys
+    .map((k) => {
+      const entry = capabilityStatusByKey.get(k);
+      if (!entry) return null;
+      return entry.reason ? `${k}: ${entry.reason}` : k;
+    })
+    .filter(Boolean);
+  return parts.length ? parts.join("\n") : fallback;
+}
+
+function buildCapabilityBadge(status, titleText, prefix) {
   const badge = document.createElement("span");
-  badge.className = `cap-badge cap-${status}`;
-  badge.textContent = statusBadgeLabel(status);
+  badge.className = prefix ? `cap-badge cap-badge-sub cap-${status}` : `cap-badge cap-${status}`;
+  badge.textContent = `${prefix || ""}${statusBadgeLabel(status)}`;
   if (titleText) {
     badge.title = titleText;
   }
@@ -849,8 +858,8 @@ async function renderExplorerTree(projectId) {
     const datasetStatus = combineCapabilityStatus([
       "rest.datasets.get",
       "rest.datasets.patch",
-      "console.ui.resource_forms.basic",
     ]);
+    const datasetUiStatus = combineCapabilityStatus(["console.ui.resource_forms.basic"]);
 
     let filteredTables = tables;
     if (searchTerm && !projectMatches && !datasetMatches) {
@@ -868,9 +877,9 @@ async function renderExplorerTree(projectId) {
         const status = combineCapabilityStatus([
           "rest.tables.get",
           "rest.tabledata.list.pagination",
-          "console.ui.table_details.preview_schema_metadata",
         ]);
-        return { table: t, tableId, status };
+        const uiStatus = combineCapabilityStatus(["console.ui.table_details.preview_schema_metadata"]);
+        return { table: t, tableId, status, uiStatus };
       })
       .filter((entry) => matchesCapabilityFilter(entry.status));
 
@@ -919,8 +928,15 @@ async function renderExplorerTree(projectId) {
       : "context";
     const datasetBadgeTitle = datasetBadgeStatus === "context"
       ? "Dataset shown as parent container for matching child resources"
-      : "Dataset capabilities";
+      : capabilityTitle(["rest.datasets.get", "rest.datasets.patch"], "Dataset REST capability");
     datasetTitle.appendChild(buildCapabilityBadge(datasetBadgeStatus, datasetBadgeTitle));
+    if (datasetBadgeStatus !== "context") {
+      datasetTitle.appendChild(buildCapabilityBadge(
+        datasetUiStatus,
+        capabilityTitle(["console.ui.resource_forms.basic"], "Console UI fidelity — informational, not counted in the capability filter"),
+        "UI ",
+      ));
+    }
 
     const datasetMeta = document.createElement("span");
     datasetMeta.className = "dataset-meta";
@@ -980,7 +996,15 @@ async function renderExplorerTree(projectId) {
       tableName.textContent = t.type === "EXTERNAL" ? `${tableId} (external)` : tableId;
       tableNode.appendChild(tableName);
 
-      tableNode.appendChild(buildCapabilityBadge(entry.status, "Table capabilities"));
+      tableNode.appendChild(buildCapabilityBadge(
+        entry.status,
+        capabilityTitle(["rest.tables.get", "rest.tabledata.list.pagination"], "Table REST capability"),
+      ));
+      tableNode.appendChild(buildCapabilityBadge(
+        entry.uiStatus,
+        capabilityTitle(["console.ui.table_details.preview_schema_metadata"], "Console UI fidelity — informational, not counted in the capability filter"),
+        "UI ",
+      ));
 
       tableNode.addEventListener("click", async () => {
         await selectTable(projectId, datasetId, tableId);
