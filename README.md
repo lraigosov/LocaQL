@@ -22,10 +22,13 @@ This repository currently implements incremental scope from the master plan:
 - [Load Jobs: Real Row Ingestion (NDJSON / CSV / Avro / Parquet)](#load-jobs-real-row-ingestion-ndjson--csv--avro--parquet)
 - [Extract Jobs: Real Table Export (NDJSON / CSV / Avro / Parquet)](#extract-jobs-real-table-export-ndjson--csv--avro--parquet)
 - [Dataset Lifecycle: Delete Contents and Undelete](#dataset-lifecycle-delete-contents-and-undelete)
+- [Table Expiration: defaultTableExpirationMs Enforcement](#table-expiration-defaulttableexpirationms-enforcement)
 - [Routines and Models: Metadata CRUD](#routines-and-models-metadata-crud)
 - [External Tables: Query Local Files Without Loading](#external-tables-query-local-files-without-loading)
+- [Fake GCS: A Real Cloud Storage JSON API, Locally](#fake-gcs-a-real-cloud-storage-json-api-locally)
 - [Conformance Baseline](#conformance-baseline)
 - [Test](#test)
+- [End-to-End Console Tests](#end-to-end-console-tests)
 - [LocaQL Console (Standalone UI)](#locaql-console-standalone-ui)
 - [Contributing](#contributing)
 - [License](#license)
@@ -71,34 +74,36 @@ Registry file:
 | Area | Status | Notes |
 | --- | --- | --- |
 | Emulator internal endpoints | Supported | `/_emulator/health`, `/_emulator/readiness`, `/_emulator/version`, `/_emulator/capabilities` |
-| Dataset management | Partial | `datasets.list`, `datasets.get`, `datasets.insert`, `datasets.delete` (requires `deleteContents=true` to remove a non-empty dataset's tables), `datasets.patch` (`friendlyName`, `location`, `labels`, `defaultTableExpirationMs` — stored/returned but not yet enforced) |
+| Dataset management | Supported | `datasets.list`, `datasets.get`, `datasets.insert`, `datasets.delete` (requires `deleteContents=true` to remove a non-empty dataset's tables), `datasets.patch` (`friendlyName`, `location`, `labels`, `defaultTableExpirationMs` — now enforced: tables lazily expire and are purged based on it, or on an explicit per-table `expirationTime` override) |
 | REST pagination baseline | Supported | `datasets.list`, `tables.list`, `jobs.list`, `tabledata.list` |
 | Opaque pagination tokens | Supported | `nextPageToken` is opaque; legacy numeric token input remains accepted |
 | Jobs lifecycle | Supported | `PENDING -> RUNNING -> DONE`, cancel before/during run |
 | requestId idempotency | Partial | Implemented for `jobs.insert` and `projects.queries` with TTL |
-| Job executors (query/load/extract/copy) | Partial | Query jobs report real `outputRows`/`processedBytes` from the resolved result (`totalSlotMs` stays synthetic by design); copy jobs create real destination table data; load jobs materialize destination schema and ingest real rows from `sourceUris` (`NEWLINE_DELIMITED_JSON`, `CSV`, `AVRO` or `PARQUET`); extract jobs read a real source table and write `destinationUris` in the same four formats, single-shard wildcards resolved. `sourceUris`/`destinationUris` are local paths by default; `gs://` resolves onto a local directory only when `LOCAQL_FAKE_GCS_ROOT` is set (multi-wildcard shards and `ORC` are rejected explicitly) |
+| Job executors (query/load/extract/copy) | Partial | Query jobs report real `outputRows`/`processedBytes` from the resolved result (`totalSlotMs` stays synthetic by design); copy jobs create real destination table data; load jobs materialize destination schema and ingest real rows from `sourceUris` (`NEWLINE_DELIMITED_JSON`, `CSV`, `AVRO` or `PARQUET`, with optional `GZIP` decompression for CSV/NDJSON); extract jobs read a real source table and write `destinationUris` in the same four formats with optional `compression` (`GZIP` for CSV/NDJSON, `SNAPPY`/`DEFLATE` for Avro, `SNAPPY`/`GZIP` for Parquet), and split into multiple real shard files once `LOCAQL_EXTRACT_SHARD_MAX_BYTES` is set and exceeded (single shard by default). `sourceUris`/`destinationUris` are local paths by default; `gs://` resolves onto a local directory only when `LOCAQL_FAKE_GCS_ROOT` is set (multi-wildcard `destinationUris` and `ORC` are rejected explicitly) |
 | Routines and Models | Supported | `routines`/`models` `insert`/`get`/`list`/`patch`/`delete` are metadata-only (no SQL execution or ML training/inference backend exists; nothing is fabricated beyond stored fields) |
 | External tables | Partial | `tables.insert` accepts `externalDataConfiguration` (`NEWLINE_DELIMITED_JSON`/`CSV`/`AVRO`/`PARQUET`, explicit schema, no autodetect); `sourceUris` are read fresh from disk/fake-GCS on every query/`tabledata.list`/copy/extract access rather than materialized at creation. Patching `externalDataConfiguration`, autodetect, Hive partitioning and compression options are not supported |
+| Fake GCS JSON API | Partial | Buckets (insert/list/get) and objects (insert via media or multipart upload, get/download/list/delete) on the real endpoint paths, backed by `LOCAQL_FAKE_GCS_ROOT`; verified against `cloud.google.com/go/storage`. No resumable uploads, IAM, versioning, lifecycle rules, notifications, or signed URLs |
 | Job persistence across restart | Partial | Optional local file persistence |
 | Job concurrency limit | Partial | Controlled with `LOCAQL_JOB_WORKERS` |
 | Storage Write backpressure | Partial | `load/copy` jobs throttled by `LOCAQL_STORAGE_WRITE_WORKERS` |
 | Concurrent reads safety | Partial | `jobs.get` and `jobs.list` use read locks (`RWMutex`) |
 | Resource mutation serialization | Partial | Conflicting mutations serialized by `project:dataset.table` |
 | Catalog snapshot atomicity | Partial | Optional persisted state uses temp file replace to avoid partial commits |
-| INFORMATION_SCHEMA priority | Partial | `SCHEMATA`, `SCHEMATA_OPTIONS`, `TABLES`, `COLUMNS`, `TABLE_OPTIONS`, `JOBS`, `JOBS_BY_PROJECT`, `JOBS_BY_USER`, `PARTITIONS`, `ROUTINES` and `MODELS` are served from the in-memory catalog; `VIEWS` returns an empty but structurally correct result (views are not a real resource yet) |
+| INFORMATION_SCHEMA priority | Partial | `SCHEMATA`, `SCHEMATA_OPTIONS`, `TABLES`, `COLUMNS`, `TABLE_OPTIONS`, `JOBS`, `JOBS_BY_PROJECT`, `JOBS_BY_USER`, `PARTITIONS`, `ROUTINES`, `PARAMETERS` and `MODELS` are served from the in-memory catalog; `VIEWS` returns an empty but structurally correct result (views are not a real resource yet); `MATERIALIZED_VIEWS` and `SESSIONS` are not implemented |
 | Workspace validation | Supported | `locaql workspace validate` checks required portable workspace structure before promotion |
 | Workspace planning and diff | Supported | `locaql workspace plan` and `locaql workspace diff` provide portable inventory and deterministic source-target delta |
 | Workspace apply dry-run | Supported | `locaql workspace apply --dry-run=true` returns planned actions without mutating target |
 | Workspace apply mutate | Supported | `locaql workspace apply --dry-run=false` applies planned changes; deletes require explicit `--delete-missing=true --confirm-delete=DELETE` |
 | IAM and policies | Unsupported | Deliberately out of scope for local emulator parity; treated as cloud control-plane concerns |
-| Standalone UI service | Partial | `cmd/locaql-ui` with dynamic capability-driven console and API proxy |
-| UI resource forms | Partial | Explorer can create/update/delete datasets (with `deleteContents` retry and Undelete), create tables (native and external) and edit basic table metadata, and create/select/delete real Routines and Models, all against emulator REST endpoints; a dedicated Load/Extract tab submits real load and extract jobs |
+| Standalone UI service | Supported | `cmd/locaql-ui` with dynamic capability-driven console and API proxy |
+| UI resource forms | Supported | Explorer can create/update/delete datasets (with `deleteContents` retry and Undelete), create tables (native and external) and edit basic table metadata, and create/select/delete real Routines and Models, all against emulator REST endpoints; a dedicated Load/Extract tab submits real load and extract jobs. All `console.ui.*` capabilities are verified by a headless-Chrome e2e suite (see [End-to-End Console Tests](#end-to-end-console-tests)), not just by reading the code |
 
 ## Runtime Architecture
 
 ```mermaid
 flowchart LR
 	Client[Client SDK or CLI] --> REST[BigQuery REST v2 handler]
+	Client --> GCSApi["Fake GCS JSON API (/storage/v1/b)"]
 	REST --> JobService[jobService]
 	REST --> Registry[Capability registry]
 	JobService --> WorkerSlots[Worker slots by LOCAQL_JOB_WORKERS]
@@ -106,6 +111,8 @@ flowchart LR
 	JobService --> ResourceSlots[Per-resource serialization slots]
 	JobService --> StateStore[(In-memory state)]
 	JobService --> Persist[(Optional file persistence)]
+	JobService -->|"gs:// sourceUris / destinationUris"| FakeGCSRoot[(LOCAQL_FAKE_GCS_ROOT)]
+	GCSApi --> FakeGCSRoot
 ```
 
 ## Concurrency and Isolation Notes
@@ -155,6 +162,8 @@ flowchart LR
 
 `sourceUris` resolve to local file paths by default (optionally prefixed with `file://`). Setting `LOCAQL_FAKE_GCS_ROOT=/some/dir` before starting the emulator makes `gs://bucket/object` URIs resolve onto `/some/dir/bucket/object` instead — a local-disk convenience mapping, **not** a GCS-compatible API. Without that env var, `gs://` is rejected explicitly.
 
+`configuration.load.compression` (optional, default `NONE`) decompresses the source file before parsing: `GZIP` is accepted for `CSV`/`NEWLINE_DELIMITED_JSON`. Avro and Parquet already carry their own codec inside the file and are decoded transparently regardless of which one was used to write them, so `compression` is not applicable there — setting it to anything other than `NONE` for those two formats fails the job explicitly instead of silently doing nothing.
+
 Known limitations, declared explicitly rather than silently ignored:
 
 - Only `NEWLINE_DELIMITED_JSON`, `CSV`, `AVRO` and `PARQUET` are supported; other formats (`ORC`, the BigQuery default when `sourceFormat` is omitted) fail the job explicitly.
@@ -187,13 +196,24 @@ curl -X POST http://localhost:9050/bigquery/v2/projects/p1/jobs \
 - `AVRO`: an Avro Object Container File with a record schema derived from `schema.fields` (`INT64`→`long`, `FLOAT64`→`double`, `BOOL`→`boolean`, else `string`).
 - `PARQUET`: a Parquet file written via `parquet-go/parquet-go` using the same type mapping as Avro (`INT64`, `FLOAT64`, `BOOL`, else string).
 
-A single `*` wildcard in `destinationUris` resolves to the BigQuery single-shard convention (`part-*.csv` -> `part-000000000000.csv`); every row still lands in that one file since there is no size-based multi-shard writer yet. The same `LOCAQL_FAKE_GCS_ROOT` mapping described above for load jobs applies to `destinationUris` too.
+A single `*` wildcard in `destinationUris` resolves to the BigQuery shard convention (`part-*.csv` -> `part-000000000000.csv`, `part-000000000001.csv`, ...). By default every row lands in that one shard, matching the BigQuery default of a single file when the result is small. Setting `LOCAQL_EXTRACT_SHARD_MAX_BYTES` (bytes, server-side env var, unset/`<=0` disables splitting) makes the emulator split the encoded result across multiple shard files once it exceeds that size — mirroring real BigQuery's real-size-based splitting, just with a size threshold you control locally instead of BigQuery's fixed ~1GB. A result that needs splitting requires exactly one `destinationUris` entry with a single `*`; providing a literal path (no wildcard) or more than one URI fails the job explicitly instead of silently picking one destination or writing every shard's content into the same file. The same `LOCAQL_FAKE_GCS_ROOT` mapping described above for load jobs applies to `destinationUris` too.
+
+`configuration.extract.compression` (optional, default `NONE`) compresses the written file, with the valid codec set depending on `destinationFormat`:
+
+| `destinationFormat` | Supported `compression` values |
+| --- | --- |
+| `CSV` / `NEWLINE_DELIMITED_JSON` | `NONE`, `GZIP` |
+| `AVRO` | `NONE`, `SNAPPY`, `DEFLATE` (goavro's built-in OCF codecs) |
+| `PARQUET` | `NONE`, `SNAPPY`, `GZIP` (`parquet-go/parquet-go`'s codec set) |
+
+An unsupported combination (e.g. `GZIP` for `AVRO`) fails the job explicitly rather than silently falling back to uncompressed output.
 
 Known limitations, declared explicitly rather than silently ignored:
 
 - Only `CSV`, `NEWLINE_DELIMITED_JSON`, `AVRO` and `PARQUET` are supported as `destinationFormat`.
 - `destinationUris` must be local paths, or `gs://` when `LOCAQL_FAKE_GCS_ROOT` is set; otherwise `gs://` is rejected explicitly.
 - `destinationUris` with more than one `*` are rejected explicitly (only a single wildcard, resolved to one shard, is supported).
+- `AVRO`'s `DEFLATE` and `PARQUET`'s `GZIP`/`SNAPPY` are the only codecs exposed; `parquet-go/parquet-go` also supports `ZSTD`/`BROTLI`/`LZ4RAW` internally but those aren't wired up as accepted `compression` values yet.
 
 ```bash
 curl -X POST http://localhost:9050/bigquery/v2/projects/p1/jobs \
@@ -225,9 +245,37 @@ curl -X POST http://localhost:9070/_emulator/datasets/undelete \
   -d '{"projectId": "p1", "datasetId": "warehouse"}'
 ```
 
+## Table Expiration: defaultTableExpirationMs Enforcement
+
+A dataset's `defaultTableExpirationMs` (a duration, in milliseconds, relative to creation time) is now enforced, not just stored. Every table created without its own explicit `expirationTime` inherits an absolute expiration computed at creation time from the dataset's default. A table can also set its own `expirationTime` (an absolute Unix-millis timestamp) via `tables.insert`/`tables.patch`/`tables.update`, which overrides the dataset default, matching real BigQuery precedence.
+
+```mermaid
+flowchart LR
+	Insert["tables.insert (no expirationTime)"] --> Inherit["expirationTime = now + defaultTableExpirationMs"]
+	InsertExplicit["tables.insert / patch / update (expirationTime set)"] --> Override[expirationTime overrides dataset default]
+	Inherit --> Stored[(Table catalog)]
+	Override --> Stored
+	Stored --> Touch["Any access: get, list, tabledata, query, dataset-empty check"]
+	Touch --> Check{now >= expirationTime?}
+	Check -->|yes| Purge["Purge permanently, no undelete"]
+	Check -->|no| Serve[Serve table normally]
+```
+
+Enforcement is lazy, not a background sweep: the first time an expired table is touched through any path (`tables.get`, `tables.list`, `tabledata.list`, query resolution, or the "is this dataset empty" check before a `deleteContents`-less delete), it is purged from the catalog and treated as if it never existed — permanently, with no undelete, matching real BigQuery (unlike dataset undelete, which does have a tombstone). A table ID freed by expiration can be reused immediately.
+
+```bash
+curl -X POST http://localhost:9050/bigquery/v2/projects/p1/datasets/warehouse/tables \
+  -H 'Content-Type: application/json' \
+  -d '{"tableReference": {"tableId": "temp_import"}, "expirationTime": "1798761600000"}'
+```
+
+Time is read through a swappable clock local to the table service (real `time.Now()` in production), which is how the test suite verifies expiration deterministically instead of sleeping in wall-clock time. This is a narrowly-scoped clock for table expiration specifically, not a project-wide injectable-clock abstraction — logging, sessions and time travel (all still unimplemented) would need their own.
+
 ## Routines and Models: Metadata CRUD
 
 `routines` and `models` support `insert`/`get`/`list`/`patch`/`delete` under `bigquery/v2/projects/{p}/datasets/{d}/routines` and `.../models`. Both are **metadata-only**: there is no SQL execution engine behind routines and no ML training/inference backend behind models, so `definitionBody`/`routineType`/`language` and `modelType`/`friendlyName`/`description`/`labels` round-trip without ever being executed, trained, or scored. `trainingRuns` and evaluation metrics are never fabricated for models.
+
+Routines also accept an optional `arguments` array (`[{"name": "x", "dataType": "INT64"}]`), surfaced through `INFORMATION_SCHEMA.PARAMETERS`. `dataType` is a flat scalar type name rather than real BigQuery's nested `StandardSqlDataType` (`{"typeKind": "INT64"}`) — the same flat-shape simplification already used for `schema.fields` and `externalDataConfiguration` elsewhere in this emulator. Every argument reports `parameter_mode = "IN"`; there is no execution engine to observe or enforce a real `OUT`/`INOUT` distinction for procedures.
 
 ```bash
 curl -X POST http://localhost:9050/bigquery/v2/projects/p1/datasets/analytics/routines \
@@ -236,7 +284,8 @@ curl -X POST http://localhost:9050/bigquery/v2/projects/p1/datasets/analytics/ro
     "routineReference": {"routineId": "add_one"},
     "routineType": "SCALAR_FUNCTION",
     "language": "SQL",
-    "definitionBody": "x + 1"
+    "definitionBody": "x + 1",
+    "arguments": [{"name": "x", "dataType": "INT64"}]
   }'
 ```
 
@@ -264,6 +313,34 @@ curl -X POST http://localhost:9050/bigquery/v2/projects/p1/datasets/analytics/ta
 ```
 
 Supported `sourceFormat` values are the same four covered by load/extract: `NEWLINE_DELIMITED_JSON`, `CSV`, `AVRO`, `PARQUET` (`ORC` and other formats are rejected). Deleting an external table (or its dataset) only removes the LocaQL catalog entry — the underlying file is never touched. Patching `externalDataConfiguration` after creation, autodetect, Hive partitioning, and compression options are not supported yet.
+
+## Fake GCS: A Real Cloud Storage JSON API, Locally
+
+Beyond the local-disk `gs://` path mapping described above, the emulator also exposes a minimal, real-contract-compatible subset of the **Google Cloud Storage JSON API** on the same host:port as the rest of this REST surface (`:9050` by default). This lets a user's own code that already uses the official Cloud Storage client library point `STORAGE_EMULATOR_HOST` at this emulator instead of real GCS — the same "same code, different endpoint" idea this whole project is built around, just for GCS instead of BigQuery.
+
+```bash
+export STORAGE_EMULATOR_HOST=http://localhost:9050
+```
+
+Implemented, matching the real endpoint paths (verified against `cloud.google.com/go/storage`, not assumed):
+
+| Operation | Method + path |
+| --- | --- |
+| `buckets.insert` | `POST /storage/v1/b` (body `{"name": "..."}`, requires `?project=`) |
+| `buckets.list` | `GET /storage/v1/b?project=...` |
+| `buckets.get` | `GET /storage/v1/b/{bucket}` |
+| `objects.insert` (media) | `POST /upload/storage/v1/b/{bucket}/o?uploadType=media&name=...` — body is the raw object bytes |
+| `objects.insert` (multipart) | `POST /upload/storage/v1/b/{bucket}/o?uploadType=multipart` — `multipart/related` body (JSON metadata part, then data part) |
+| `objects.get` | `GET /storage/v1/b/{bucket}/o/{object}` |
+| `objects.get` (download) | `GET /storage/v1/b/{bucket}/o/{object}?alt=media` |
+| `objects.list` | `GET /storage/v1/b/{bucket}/o` (optional `?prefix=`) |
+| `objects.delete` | `DELETE /storage/v1/b/{bucket}/o/{object}` |
+
+Storage is local disk under `LOCAQL_FAKE_GCS_ROOT` (required — without it, every route above returns a `503` naming the missing env var), using the **same** bucket/object path-join convention as the `gs://` mapping used by load/extract/external tables. This means the two mechanisms interoperate: a file uploaded through this JSON API is immediately readable via a `gs://` `sourceUris` load job, and a file already sitting under `LOCAQL_FAKE_GCS_ROOT` is immediately visible through this API.
+
+**Verified against the real client, not just this project's own tests:** running `cloud.google.com/go/storage` with `STORAGE_EMULATOR_HOST` against a live instance of this emulator confirmed `bucket.Create` and `object.NewWriter` (upload) work as-is. That test also surfaced a real, non-obvious fact: the official Go client's `NewWriter` does **not** default to the simple media upload — it sends a `multipart/related` request, which is why multipart is implemented here rather than media alone. `object.NewReader` (download) failed in that same run, but not due to a bug here: the request never reached this server at all, because the official client has a known, currently-open upstream issue where `NewReader` ignores `STORAGE_EMULATOR_HOST`/endpoint overrides and calls real GCS instead ([googleapis/google-cloud-go#1619](https://github.com/googleapis/google-cloud-go/issues/1619), filed P1). Download/get/list/delete are covered directly by this project's own test suite instead, which talks to the HTTP handlers directly and isn't affected by that client-side bug.
+
+Explicitly **not** implemented, matching real fields/paths rather than inventing partial ones: resumable uploads (`uploadType=resumable`), IAM/ACLs, object versioning/generations, lifecycle rules, notifications, signed URLs. A resumable upload attempt fails explicitly (`501`) instead of silently mishandling the request.
 
 ## Conformance Baseline
 
@@ -327,6 +404,31 @@ Race validation for server concurrency:
 wsl -d Ubuntu-24.04 -- bash -lc 'cd /mnt/f/GitHub/LocaQL && CGO_ENABLED=1 go test -race ./internal/server'
 ```
 
+## End-to-End Console Tests
+
+All `console.ui.*` capabilities in `capabilities/registry.yaml` are backed by real browser tests, not just code review: `cmd/locaql-ui/e2e_*_test.go` boot the real emulator and UI proxy in-process, drive them with a headless Chrome instance via [chromedp](https://github.com/chromedp/chromedp), and assert on the live DOM (form submissions, explorer tree updates, real file downloads/uploads, clipboard content, real load/extract jobs writing to disk).
+
+These tests are gated behind the `e2e` build tag, so they never run as part of a plain `go test ./...` and never require Chrome for a normal contribution:
+
+```bash
+go test -tags e2e ./cmd/locaql-ui/...
+```
+
+That command needs a Chrome/Chromium/Edge binary reachable on the machine actually executing the test process (auto-detected via `PATH` on Linux/macOS, or common install locations on Windows). On a Linux CI runner with `google-chrome`/`chromium` preinstalled, the command above just works.
+
+On a Windows dev machine where Go only runs inside WSL (per [Requirements](#requirements)), Chrome itself is a native Windows process, and the DevTools protocol only works within a single OS network namespace — so the test binary must be cross-compiled and executed as a native Windows binary rather than run from WSL directly:
+
+```bash
+# from WSL: cross-compile the e2e-tagged test binary for Windows
+wsl -d Ubuntu-24.04 -- bash -lc 'cd /mnt/f/GitHub/LocaQL && GOOS=windows GOARCH=amd64 go test -tags e2e -c -o /tmp/e2e.exe ./cmd/locaql-ui && cp /tmp/e2e.exe /mnt/c/path/reachable/from/windows/e2e.exe'
+```
+
+```powershell
+# from PowerShell, with cwd set to cmd/locaql-ui (relative paths like the registry resolve from there):
+Set-Location "F:\GitHub\LocaQL\cmd\locaql-ui"
+& "C:\path\reachable\from\windows\e2e.exe" "-test.v"
+```
+
 ## LocaQL Console (Standalone UI)
 
 Run the emulator first:
@@ -367,12 +469,12 @@ UI notes:
 Current UI scope:
 
 - Studio-style layout with navigation, a resource Explorer, and a tabbed workspace (Query, Jobs, Load / Extract, Capabilities).
-- Explorer with a hierarchical Project > Dataset > Table tree, local resource search, and capability-status badges (`SUPPORTED`, `PARTIAL`, `UNSUPPORTED`, `CONTEXT`) with a persisted filter and legend.
-- Real `Routines` and `Models` nodes in the Explorer tree, wired to the emulator's metadata CRUD endpoints (see [Routines and Models: Metadata CRUD](#routines-and-models-metadata-crud)): sidebar forms create a routine (type, language, `definitionBody`) or a model (`modelType`) under a dataset, and selecting a node opens a resource details panel with raw JSON, a `friendlyName`/`description` editor, and delete.
+- Explorer with a hierarchical Project > Dataset > Table tree, local resource search, and capability-status badges (`SUPPORTED`, `PARTIAL`, `UNSUPPORTED`, `CONTEXT`) with a persisted filter and legend. Dataset and Table nodes additionally show a smaller `UI ...` badge reflecting the console-only `console.ui.*` registry entry for that resource; it is informational (tooltip shows the underlying `reason`) and is not counted by the capability filter, which reflects REST capability only.
+- Real `Routines` and `Models` nodes in the Explorer tree, wired to the emulator's metadata CRUD endpoints (see [Routines and Models: Metadata CRUD](#routines-and-models-metadata-crud)): sidebar forms create a routine (type, language, `definitionBody`, optional `arguments` JSON) or a model (`modelType`) under a dataset, and selecting a node opens a resource details panel with raw JSON, a `friendlyName`/`description` editor, and delete.
 - Dataset create/update/delete (with labels and `defaultTableExpirationMs` editing), plus a **Dataset Undelete** form that restores a soft-deleted dataset's metadata from its tombstone (see [Dataset Lifecycle: Delete Contents and Undelete](#dataset-lifecycle-delete-contents-and-undelete)); deleting a non-empty dataset surfaces the backend's `deleteContents` requirement and offers to retry with it. A selected-dataset summary panel (ID, friendly name, location, table count, labels) adds quick actions to draft a dataset query, draft a table listing query, or copy the dataset ID.
 - Table creation and metadata patch (`friendlyName`, `description`, labels), with a table details panel offering Schema, Preview, and JSON tabs plus query, copy-job, and delete actions.
 - **External table creation** (schema.fields, `sourceUris`, source format — NDJSON/CSV/AVRO/PARQUET, CSV field delimiter/skip rows) alongside native table creation (see [External Tables](#external-tables-query-local-files-without-loading)); the table details panel shows `Type: EXTERNAL` plus an External Data Configuration block, and the Explorer tree marks external tables with an `(external)` suffix. Preview/query/copy/extract read the same live file contents an API client would see.
-- **Load / Extract tab**: submit real Load jobs (`sourceUris`, schema fields, source format — NDJSON/CSV/AVRO/PARQUET, write disposition, CSV field delimiter and skip-leading-rows) and real Extract jobs (`destinationUris`, destination format, CSV field delimiter, `printHeader`) directly from forms, backed by the same `jobs.insert` executors described in [Load Jobs](#load-jobs-real-row-ingestion-ndjson--csv--avro--parquet) and [Extract Jobs](#extract-jobs-real-table-export-ndjson--csv--avro--parquet); each submission shows the immediate job-creation response and points to the Jobs tab for final `DONE`-state statistics.
+- **Load / Extract tab**: submit real Load jobs (`sourceUris`, schema fields, source format — NDJSON/CSV/AVRO/PARQUET, write disposition, CSV field delimiter and skip-leading-rows, optional `compression`) and real Extract jobs (`destinationUris`, destination format, CSV field delimiter, `printHeader`, optional `compression`) directly from forms, backed by the same `jobs.insert` executors described in [Load Jobs](#load-jobs-real-row-ingestion-ndjson--csv--avro--parquet) and [Extract Jobs](#extract-jobs-real-table-export-ndjson--csv--avro--parquet); each submission shows the immediate job-creation response and points to the Jobs tab for final `DONE`-state statistics. The form does not expose multi-shard extract splitting (`LOCAQL_EXTRACT_SHARD_MAX_BYTES`) since that is a server-side env var, not a per-job field.
 - SQL editor with keyboard shortcuts (`Ctrl+Enter` to run, `Ctrl`/`Cmd+S` to save) and query submission as async jobs.
 - Query results panel with Table, JSON, and Execution Details tabs.
 - Jobs Explorer with personal/project history tabs, selection, detail refresh, and cancellation.
