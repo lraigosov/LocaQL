@@ -26,6 +26,7 @@ This repository currently implements incremental scope from the master plan:
 - [External Tables: Query Local Files Without Loading](#external-tables-query-local-files-without-loading)
 - [Conformance Baseline](#conformance-baseline)
 - [Test](#test)
+- [End-to-End Console Tests](#end-to-end-console-tests)
 - [LocaQL Console (Standalone UI)](#locaql-console-standalone-ui)
 - [Contributing](#contributing)
 - [License](#license)
@@ -91,8 +92,8 @@ Registry file:
 | Workspace apply dry-run | Supported | `locaql workspace apply --dry-run=true` returns planned actions without mutating target |
 | Workspace apply mutate | Supported | `locaql workspace apply --dry-run=false` applies planned changes; deletes require explicit `--delete-missing=true --confirm-delete=DELETE` |
 | IAM and policies | Unsupported | Deliberately out of scope for local emulator parity; treated as cloud control-plane concerns |
-| Standalone UI service | Partial | `cmd/locaql-ui` with dynamic capability-driven console and API proxy |
-| UI resource forms | Partial | Explorer can create/update/delete datasets (with `deleteContents` retry and Undelete), create tables (native and external) and edit basic table metadata, and create/select/delete real Routines and Models, all against emulator REST endpoints; a dedicated Load/Extract tab submits real load and extract jobs |
+| Standalone UI service | Supported | `cmd/locaql-ui` with dynamic capability-driven console and API proxy |
+| UI resource forms | Supported | Explorer can create/update/delete datasets (with `deleteContents` retry and Undelete), create tables (native and external) and edit basic table metadata, and create/select/delete real Routines and Models, all against emulator REST endpoints; a dedicated Load/Extract tab submits real load and extract jobs. All `console.ui.*` capabilities are verified by a headless-Chrome e2e suite (see [End-to-End Console Tests](#end-to-end-console-tests)), not just by reading the code |
 
 ## Runtime Architecture
 
@@ -327,6 +328,31 @@ Race validation for server concurrency:
 wsl -d Ubuntu-24.04 -- bash -lc 'cd /mnt/f/GitHub/LocaQL && CGO_ENABLED=1 go test -race ./internal/server'
 ```
 
+## End-to-End Console Tests
+
+All `console.ui.*` capabilities in `capabilities/registry.yaml` are backed by real browser tests, not just code review: `cmd/locaql-ui/e2e_*_test.go` boot the real emulator and UI proxy in-process, drive them with a headless Chrome instance via [chromedp](https://github.com/chromedp/chromedp), and assert on the live DOM (form submissions, explorer tree updates, real file downloads/uploads, clipboard content, real load/extract jobs writing to disk).
+
+These tests are gated behind the `e2e` build tag, so they never run as part of a plain `go test ./...` and never require Chrome for a normal contribution:
+
+```bash
+go test -tags e2e ./cmd/locaql-ui/...
+```
+
+That command needs a Chrome/Chromium/Edge binary reachable on the machine actually executing the test process (auto-detected via `PATH` on Linux/macOS, or common install locations on Windows). On a Linux CI runner with `google-chrome`/`chromium` preinstalled, the command above just works.
+
+On a Windows dev machine where Go only runs inside WSL (per [Requirements](#requirements)), Chrome itself is a native Windows process, and the DevTools protocol only works within a single OS network namespace — so the test binary must be cross-compiled and executed as a native Windows binary rather than run from WSL directly:
+
+```bash
+# from WSL: cross-compile the e2e-tagged test binary for Windows
+wsl -d Ubuntu-24.04 -- bash -lc 'cd /mnt/f/GitHub/LocaQL && GOOS=windows GOARCH=amd64 go test -tags e2e -c -o /tmp/e2e.exe ./cmd/locaql-ui && cp /tmp/e2e.exe /mnt/c/path/reachable/from/windows/e2e.exe'
+```
+
+```powershell
+# from PowerShell, with cwd set to cmd/locaql-ui (relative paths like the registry resolve from there):
+Set-Location "F:\GitHub\LocaQL\cmd\locaql-ui"
+& "C:\path\reachable\from\windows\e2e.exe" "-test.v"
+```
+
 ## LocaQL Console (Standalone UI)
 
 Run the emulator first:
@@ -367,7 +393,7 @@ UI notes:
 Current UI scope:
 
 - Studio-style layout with navigation, a resource Explorer, and a tabbed workspace (Query, Jobs, Load / Extract, Capabilities).
-- Explorer with a hierarchical Project > Dataset > Table tree, local resource search, and capability-status badges (`SUPPORTED`, `PARTIAL`, `UNSUPPORTED`, `CONTEXT`) with a persisted filter and legend.
+- Explorer with a hierarchical Project > Dataset > Table tree, local resource search, and capability-status badges (`SUPPORTED`, `PARTIAL`, `UNSUPPORTED`, `CONTEXT`) with a persisted filter and legend. Dataset and Table nodes additionally show a smaller `UI ...` badge reflecting the console-only `console.ui.*` registry entry for that resource; it is informational (tooltip shows the underlying `reason`) and is not counted by the capability filter, which reflects REST capability only.
 - Real `Routines` and `Models` nodes in the Explorer tree, wired to the emulator's metadata CRUD endpoints (see [Routines and Models: Metadata CRUD](#routines-and-models-metadata-crud)): sidebar forms create a routine (type, language, `definitionBody`) or a model (`modelType`) under a dataset, and selecting a node opens a resource details panel with raw JSON, a `friendlyName`/`description` editor, and delete.
 - Dataset create/update/delete (with labels and `defaultTableExpirationMs` editing), plus a **Dataset Undelete** form that restores a soft-deleted dataset's metadata from its tombstone (see [Dataset Lifecycle: Delete Contents and Undelete](#dataset-lifecycle-delete-contents-and-undelete)); deleting a non-empty dataset surfaces the backend's `deleteContents` requirement and offers to retry with it. A selected-dataset summary panel (ID, friendly name, location, table count, labels) adds quick actions to draft a dataset query, draft a table listing query, or copy the dataset ID.
 - Table creation and metadata patch (`friendlyName`, `description`, labels), with a table details panel offering Schema, Preview, and JSON tabs plus query, copy-job, and delete actions.

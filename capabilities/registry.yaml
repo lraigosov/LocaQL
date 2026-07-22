@@ -197,13 +197,17 @@ capabilities:
       - unit/server/information_schema_priority_partitions
     reason: SCHEMATA, SCHEMATA_OPTIONS, TABLES, COLUMNS, TABLE_OPTIONS, JOBS, JOBS_BY_PROJECT, JOBS_BY_USER, PARTITIONS, ROUTINES and MODELS query emulation is backed by the live in-memory catalog. JOBS_BY_USER scopes to the UserEmail of the job running the JOBS_BY_USER query itself (the only real "calling user" available; the emulator is anonymous-only and has no broader auth model), returning zero rows rather than all jobs when that job has no UserEmail. VIEWS returns a structurally correct empty result since views are not a real resource yet; broader semantic parity is still pending
   console.ui.resource_forms.basic:
-    status: partial
+    status: supported
     fidelity: medium
-    reason: explorer supports validated dataset create/update/delete (with labels and defaultTableExpirationMs), a dataset delete flow that detects non-empty datasets and retries with deleteContents=true, a Dataset Undelete form, basic table creation, table metadata editing, table labels editing and a selected-dataset summary panel against emulator REST endpoints
+    tests:
+      - e2e/ui/dataset_forms_basic_lifecycle
+    reason: explorer supports validated dataset create/update/delete (with labels and defaultTableExpirationMs), a dataset delete flow that detects non-empty datasets and retries with deleteContents=true, a Dataset Undelete form, basic table creation, table metadata editing, table labels editing and a selected-dataset summary panel against emulator REST endpoints; verified end-to-end against a real headless-Chrome console, not just by reading the code
   console.ui.external_tables:
-    status: partial
+    status: supported
     fidelity: medium
-    reason: a dedicated Explorer form creates external tables (schema.fields JSON, sourceUris, sourceFormat select, CSV fieldDelimiter/skipLeadingRows) against tables.insert's externalDataConfiguration (see rest.tables.external_data_configuration); the table details panel shows Type EXTERNAL plus a raw External Data Configuration block, and the Explorer tree marks external table nodes with an "(external)" suffix. Preview/query/copy/extract from the UI read the same live file contents as a direct API call, since they go through the same backend endpoints
+    tests:
+      - e2e/ui/external_tables_form
+    reason: a dedicated Explorer form creates external tables (schema.fields JSON, sourceUris, sourceFormat select, CSV fieldDelimiter/skipLeadingRows) against tables.insert's externalDataConfiguration (see rest.tables.external_data_configuration); the table details panel shows Type EXTERNAL plus a raw External Data Configuration block, and the Explorer tree marks external table nodes with an "(external)" suffix. Preview/query/copy/extract from the UI read the same live file contents as a direct API call, since they go through the same backend endpoints; verified end-to-end against a real headless-Chrome console, not just by reading the code
   emulator.health:
     status: supported
     fidelity: high
@@ -220,56 +224,78 @@ capabilities:
     tests:
       - conformance/foundation/emulator_version
   console.ui.service:
-    status: partial
+    status: supported
     fidelity: medium
     tests:
       - unit/ui/proxy_rewrite
       - unit/ui/config_endpoint
     reason: standalone UI service proxies emulator APIs and adapts views using capabilities
   console.ui.shortcuts:
-    status: partial
+    status: supported
     fidelity: medium
-    reason: keyboard shortcuts for run and save are available in SQL editor with local bindings
+    tests:
+      - e2e/ui/keyboard_shortcuts
+    reason: keyboard shortcuts for run and save are available in SQL editor with local bindings; verified end-to-end against a real headless-Chrome console, not just by reading the code
   console.ui.explorer.search:
-    status: partial
+    status: supported
     fidelity: medium
-    reason: explorer supports local search by project, dataset and table names over cached resources
+    tests:
+      - e2e/ui/explorer_search
+    reason: explorer supports local search by project, dataset and table names over cached resources; verified end-to-end against a real headless-Chrome console, not just by reading the code
   console.ui.saved_queries.versioning:
-    status: partial
+    status: supported
     fidelity: medium
-    reason: saved queries keep local version history per query name and allow navigating versions
+    tests:
+      - e2e/ui/saved_queries_versioning
+    reason: saved queries keep local version history per query name and allow navigating versions; verified end-to-end against a real headless-Chrome console, not just by reading the code
   console.ui.saved_queries.import_export:
-    status: partial
+    status: supported
     fidelity: medium
-    reason: saved queries can be exported and imported as JSON in local console
+    tests:
+      - e2e/ui/saved_queries_import_export
+    reason: saved queries can be exported and imported as JSON in local console; verified end-to-end (real file download + re-import) against a real headless-Chrome console, not just by reading the code
   console.ui.saved_queries.share_link:
-    status: partial
+    status: supported
     fidelity: medium
-    reason: saved query text can be shared via local URL query parameter
+    tests:
+      - e2e/ui/saved_queries_share_link
+    reason: saved query text can be shared via local URL query parameter; verified end-to-end, including a real clipboard read, against a real headless-Chrome console, not just by reading the code
   console.ui.table_details.preview_schema_metadata:
-    status: partial
+    status: supported
     fidelity: medium
-    reason: selecting a table opens metadata, schema, preview rows, labels editor and raw JSON details backed by tables.get and tabledata.list
+    tests:
+      - e2e/ui/table_details_preview_schema_metadata
+    reason: selecting a table opens metadata, schema, preview rows, labels editor and raw JSON details backed by tables.get and tabledata.list; verified end-to-end against a real headless-Chrome console, not just by reading the code
   console.ui.navigation.menus_functional:
-    status: partial
+    status: supported
     fidelity: medium
-    reason: appbar and side navigation actions are wired to emulator-backed views for search, jobs, history and capabilities
+    tests:
+      - e2e/ui/navigation_menus_functional
+    reason: appbar and side navigation actions are wired to emulator-backed views for search, jobs, history and capabilities; verified end-to-end against a real headless-Chrome console, not just by reading the code
   console.ui.explorer.routines_models_crud:
-    status: partial
+    status: supported
     fidelity: medium
-    reason: explorer renders real routine and model nodes per dataset (backed by rest.routines.crud/rest.models.crud), with sidebar forms to create either, a selection flow that opens a resource details panel (raw JSON, friendlyName/description edit, delete), fidelity stays medium/partial because the underlying routines and models are metadata-only, not executable
+    tests:
+      - e2e/ui/routines_models_crud
+    reason: explorer renders real routine and model nodes per dataset (backed by rest.routines.crud/rest.models.crud), with sidebar forms to create either, a selection flow that opens a resource details panel (raw JSON, friendlyName/description edit, delete); the underlying routines and models remain metadata-only (see rest.routines.crud/rest.models.crud), not executable, which is out of scope by design rather than a UI gap; verified end-to-end against a real headless-Chrome console, not just by reading the code
   console.ui.load_extract_workspace:
-    status: partial
+    status: supported
     fidelity: medium
-    reason: dedicated Load / Extract tab submits real load jobs (NDJSON/CSV/AVRO/PARQUET sourceUris, schema, write disposition, CSV delimiter/skip rows) and real extract jobs (destination format, field delimiter, printHeader) through jobs.insert, showing the immediate job-creation response with a hint to check the Jobs tab for final DONE-state statistics
+    tests:
+      - e2e/ui/load_extract_workspace
+    reason: dedicated Load / Extract tab submits real load jobs (NDJSON/CSV/AVRO/PARQUET sourceUris, schema, write disposition, CSV delimiter/skip rows) and real extract jobs (destination format, field delimiter, printHeader) through jobs.insert, showing the immediate job-creation response with a hint to check the Jobs tab for final DONE-state statistics; verified end-to-end, including the real extracted file on disk, against a real headless-Chrome console, not just by reading the code
   console.ui.table_actions.query_copy_delete:
-    status: partial
+    status: supported
     fidelity: medium
-    reason: table details panel provides query draft, copy job submission and delete table actions through emulator endpoints
+    tests:
+      - e2e/ui/table_actions_query_copy_delete
+    reason: table details panel provides query draft, copy job submission and delete table actions through emulator endpoints; verified end-to-end against a real headless-Chrome console, not just by reading the code
   console.ui.jobs.history_tabs:
-    status: partial
+    status: supported
     fidelity: medium
-    reason: jobs explorer supports explicit personal and project history tabs mapped to allUsers behavior
+    tests:
+      - e2e/ui/jobs_history_tabs
+    reason: jobs explorer supports explicit personal and project history tabs mapped to allUsers behavior; verified end-to-end against a real headless-Chrome console, not just by reading the code
   workspace.validate.structure:
     status: supported
     fidelity: medium
