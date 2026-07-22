@@ -105,6 +105,69 @@ func TestRoutinesInsertRequiresDefinitionBody(t *testing.T) {
 	}
 }
 
+func TestRoutinesInsertAndPatchRoundTripArguments(t *testing.T) {
+	s := newTestServer()
+	createDatasetReq := httptest.NewRequest(http.MethodPost, "/bigquery/v2/projects/p1/datasets", strings.NewReader(`{"datasetReference":{"datasetId":"analytics_udfs_args"}}`))
+	s.Handler().ServeHTTP(httptest.NewRecorder(), createDatasetReq)
+
+	insertBody := `{"routineReference":{"routineId":"add_two"},"routineType":"SCALAR_FUNCTION","language":"SQL","definitionBody":"x + y","arguments":[{"name":"x","dataType":"INT64"},{"name":"y","dataType":"INT64"}]}`
+	insertReq := httptest.NewRequest(http.MethodPost, "/bigquery/v2/projects/p1/datasets/analytics_udfs_args/routines", strings.NewReader(insertBody))
+	insertReq.Header.Set("Content-Type", "application/json")
+	insertRes := httptest.NewRecorder()
+	s.Handler().ServeHTTP(insertRes, insertReq)
+	if insertRes.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", insertRes.Code, insertRes.Body.String())
+	}
+	var inserted map[string]any
+	if err := json.NewDecoder(insertRes.Body).Decode(&inserted); err != nil {
+		t.Fatalf("decode insert: %v", err)
+	}
+	args, ok := inserted["arguments"].([]any)
+	if !ok || len(args) != 2 {
+		t.Fatalf("expected 2 arguments in insert response, got %v", inserted["arguments"])
+	}
+	first := args[0].(map[string]any)
+	if first["name"] != "x" || first["dataType"] != "INT64" {
+		t.Fatalf("unexpected first argument: %v", first)
+	}
+
+	// Patching an unrelated field must not clear arguments.
+	patchReq := httptest.NewRequest(http.MethodPatch, "/bigquery/v2/projects/p1/datasets/analytics_udfs_args/routines/add_two", strings.NewReader(`{"description":"adds two numbers"}`))
+	patchReq.Header.Set("Content-Type", "application/json")
+	patchRes := httptest.NewRecorder()
+	s.Handler().ServeHTTP(patchRes, patchReq)
+	if patchRes.Code != http.StatusOK {
+		t.Fatalf("expected 200 on patch, got %d: %s", patchRes.Code, patchRes.Body.String())
+	}
+	var patched map[string]any
+	if err := json.NewDecoder(patchRes.Body).Decode(&patched); err != nil {
+		t.Fatalf("decode patch: %v", err)
+	}
+	if args, ok := patched["arguments"].([]any); !ok || len(args) != 2 {
+		t.Fatalf("expected arguments to survive an unrelated patch, got %v", patched["arguments"])
+	}
+
+	// Explicitly patching arguments replaces them.
+	patchArgsReq := httptest.NewRequest(http.MethodPatch, "/bigquery/v2/projects/p1/datasets/analytics_udfs_args/routines/add_two", strings.NewReader(`{"arguments":[{"name":"z","dataType":"FLOAT64"}]}`))
+	patchArgsReq.Header.Set("Content-Type", "application/json")
+	patchArgsRes := httptest.NewRecorder()
+	s.Handler().ServeHTTP(patchArgsRes, patchArgsReq)
+	if patchArgsRes.Code != http.StatusOK {
+		t.Fatalf("expected 200 on arguments patch, got %d: %s", patchArgsRes.Code, patchArgsRes.Body.String())
+	}
+	var patchedArgs map[string]any
+	if err := json.NewDecoder(patchArgsRes.Body).Decode(&patchedArgs); err != nil {
+		t.Fatalf("decode arguments patch: %v", err)
+	}
+	newArgs, ok := patchedArgs["arguments"].([]any)
+	if !ok || len(newArgs) != 1 {
+		t.Fatalf("expected arguments replaced with 1 entry, got %v", patchedArgs["arguments"])
+	}
+	if newArgs[0].(map[string]any)["name"] != "z" {
+		t.Fatalf("unexpected replaced argument: %v", newArgs[0])
+	}
+}
+
 func TestRoutinesRequireExistingDataset(t *testing.T) {
 	s := newTestServer()
 	req := httptest.NewRequest(http.MethodGet, "/bigquery/v2/projects/p1/datasets/does_not_exist/routines", nil)
