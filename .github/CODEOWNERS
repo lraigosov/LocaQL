@@ -1,0 +1,6 @@
+# Only the repository owner is a code owner for the entire tree.
+# Combined with "Require review from Code Owners" on the main/dev
+# ruleset, this means a pull request cannot merge until the owner
+# specifically approves it — another collaborator's approval alone
+# does not satisfy the code owner requirement.
+* @lraigosov
