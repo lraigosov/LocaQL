@@ -95,14 +95,55 @@
           <input id="datasetMetaDatasetId" placeholder="dataset id" />
           <input id="datasetFriendlyNameInput" placeholder="friendly name" />
           <input id="datasetLocationInput" placeholder="location" />
+          <input id="datasetExpirationInput" placeholder="defaultTableExpirationMs (e.g. 3600000)" />
           <textarea id="datasetLabelsInput" placeholder="labels (JSON: {'k':'v'})" rows="2"></textarea>
           <button type="submit">Save Dataset</button>
           <button id="deleteDatasetBtn" type="button">Delete Dataset</button>
+        </form>
+        <form id="undeleteDatasetForm" class="compact-form">
+          <input id="undeleteDatasetId" placeholder="dataset id to undelete" required />
+          <button type="submit">Undelete Dataset</button>
         </form>
         <form id="createTableForm" class="compact-form">
           <input id="newTableDatasetId" placeholder="dataset id" />
           <input id="newTableId" placeholder="new table id" required />
           <button type="submit">Add Table</button>
+        </form>
+        <form id="createExternalTableForm" class="compact-form">
+          <input id="newExternalTableDatasetId" placeholder="dataset id" />
+          <input id="newExternalTableId" placeholder="new external table id" required />
+          <textarea id="newExternalTableSchemaFields" rows="2" placeholder="schema.fields JSON, e.g. [{&quot;name&quot;:&quot;event_id&quot;,&quot;type&quot;:&quot;INT64&quot;}]" required></textarea>
+          <textarea id="newExternalTableSourceUris" rows="2" placeholder="sourceUris, one local file path per line" required></textarea>
+          <select id="newExternalTableSourceFormat">
+            <option value="NEWLINE_DELIMITED_JSON">NEWLINE_DELIMITED_JSON</option>
+            <option value="CSV">CSV</option>
+            <option value="AVRO">AVRO</option>
+            <option value="PARQUET">PARQUET</option>
+          </select>
+          <input id="newExternalTableFieldDelimiter" placeholder="fieldDelimiter (CSV only, default ,)" />
+          <input id="newExternalTableSkipLeadingRows" placeholder="skipLeadingRows (CSV only, default 0)" />
+          <button type="submit">Add External Table</button>
+        </form>
+        <form id="createRoutineForm" class="compact-form">
+          <input id="newRoutineDatasetId" placeholder="dataset id" />
+          <input id="newRoutineId" placeholder="new routine id" required />
+          <select id="newRoutineType">
+            <option value="SCALAR_FUNCTION">SCALAR_FUNCTION</option>
+            <option value="PROCEDURE">PROCEDURE</option>
+            <option value="TABLE_VALUED_FUNCTION">TABLE_VALUED_FUNCTION</option>
+          </select>
+          <select id="newRoutineLanguage">
+            <option value="SQL">SQL</option>
+            <option value="JAVASCRIPT">JAVASCRIPT</option>
+          </select>
+          <textarea id="newRoutineDefinitionBody" placeholder="definitionBody (e.g. x + 1)" rows="2" required></textarea>
+          <button type="submit">Add Routine</button>
+        </form>
+        <form id="createModelForm" class="compact-form">
+          <input id="newModelDatasetId" placeholder="dataset id" />
+          <input id="newModelId" placeholder="new model id" required />
+          <input id="newModelType" placeholder="modelType (e.g. LOGISTIC_REGRESSION)" />
+          <button type="submit">Add Model</button>
         </form>
         <section id="datasetSummaryCard" class="dataset-summary-card" aria-label="selected dataset summary">
           <div class="section-head dataset-summary-head">
@@ -184,6 +225,7 @@
         <div class="tabs" id="mainTabs">
           <span class="tab active" data-target="query-workspace">Query</span>
           <span class="tab" data-target="jobs-explorer">Jobs</span>
+          <span class="tab" data-target="load-extract-workspace">Load / Extract</span>
           <span class="tab" data-target="capabilities-view">Capabilities</span>
         </div>
         <div class="status-strip">
@@ -263,6 +305,10 @@
                 <p id="tableInfoName" class="detail-value">-</p>
               </article>
               <article class="detail-card">
+                <h4>Type</h4>
+                <p id="tableInfoType" class="detail-value">-</p>
+              </article>
+              <article class="detail-card">
                 <h4>Description</h4>
                 <p id="tableInfoDescription" class="detail-value">-</p>
               </article>
@@ -289,6 +335,10 @@
               <button id="updateTableLabelsBtn" type="button">Save Labels</button>
             </div>
             <pre id="tableInfoLabels" class="code-block small">{}</pre>
+            <div id="tableInfoExternalSection" style="display: none;">
+              <h4>External Data Configuration</h4>
+              <pre id="tableInfoExternal" class="code-block small">{}</pre>
+            </div>
           </div>
 
           <div id="table-schema-view" class="table-details-view" style="display: none;">
@@ -305,6 +355,23 @@
           <div id="table-json-view" class="table-details-view" style="display: none;">
             <pre id="tableDetailsJson" class="code-block"></pre>
           </div>
+        </article>
+
+        <article class="panel panel-wide" id="resource-details-panel" style="display: none;">
+          <div class="panel-head">
+            <h3 id="resourceDetailsTitle">Resource Details</h3>
+            <span id="resourceDetailsMeta" class="meta-text">Select a routine or model from Explorer</span>
+          </div>
+          <div class="row-actions" id="resourceActionsRow">
+            <button id="deleteResourceBtn" type="button">Delete</button>
+            <span id="resourceActionStatus" class="meta-text">select a routine or model to enable actions</span>
+          </div>
+          <form id="updateResourceMetaForm" class="compact-form">
+            <input id="resourceFriendlyNameInput" placeholder="friendlyName (models only)" />
+            <input id="resourceDescriptionInput" placeholder="description" />
+            <button type="submit">Save Meta</button>
+          </form>
+          <pre id="resourceDetailsJson" class="code-block"></pre>
         </article>
 
         <article class="panel jobs-panel" id="jobs-explorer">
@@ -343,6 +410,70 @@
             <span id="selectedJobHint" class="meta-text">selected: none</span>
           </div>
           <pre id="jobDetailsJson" class="code-block"></pre>
+        </article>
+
+        <article class="panel panel-wide" id="load-extract-workspace" style="display: none;">
+          <div class="panel-head">
+            <h3>Load Job</h3>
+            <span class="meta-text">Ingest real rows into a table from local sourceUris (NDJSON, CSV, Avro, or Parquet).</span>
+          </div>
+          <form id="loadJobForm" class="stack-form">
+            <div class="compact-form">
+              <input id="loadDatasetId" placeholder="destination dataset id" required />
+              <input id="loadTableId" placeholder="destination table id" required />
+            </div>
+            <textarea id="loadSchemaFields" rows="2" placeholder="schema.fields JSON, e.g. [{&quot;name&quot;:&quot;event_id&quot;,&quot;type&quot;:&quot;INT64&quot;},{&quot;name&quot;:&quot;event_name&quot;,&quot;type&quot;:&quot;STRING&quot;}]" required></textarea>
+            <textarea id="loadSourceUris" rows="2" placeholder="sourceUris, one local file path per line"></textarea>
+            <div class="compact-form">
+              <select id="loadSourceFormat">
+                <option value="NEWLINE_DELIMITED_JSON">NEWLINE_DELIMITED_JSON</option>
+                <option value="CSV">CSV</option>
+                <option value="AVRO">AVRO</option>
+                <option value="PARQUET">PARQUET</option>
+              </select>
+              <select id="loadWriteDisposition">
+                <option value="WRITE_APPEND">WRITE_APPEND</option>
+                <option value="WRITE_TRUNCATE">WRITE_TRUNCATE</option>
+                <option value="WRITE_EMPTY">WRITE_EMPTY</option>
+              </select>
+            </div>
+            <div class="compact-form">
+              <input id="loadFieldDelimiter" placeholder="fieldDelimiter (CSV only, default ,)" />
+              <input id="loadSkipLeadingRows" placeholder="skipLeadingRows (CSV only, default 0)" />
+            </div>
+            <div class="row-actions">
+              <button type="submit">Submit Load Job</button>
+              <span id="loadJobStatus" class="meta-text">ready</span>
+            </div>
+          </form>
+          <pre id="loadJobResult" class="code-block"></pre>
+
+          <div class="panel-head">
+            <h3>Extract Job</h3>
+            <span class="meta-text">Export a real table to local destinationUris (NDJSON, CSV, Avro, or Parquet).</span>
+          </div>
+          <form id="extractJobForm" class="stack-form">
+            <div class="compact-form">
+              <input id="extractDatasetId" placeholder="source dataset id" required />
+              <input id="extractTableId" placeholder="source table id" required />
+            </div>
+            <textarea id="extractDestinationUris" rows="2" placeholder="destinationUris, one local file path per line (single * wildcard allowed)"></textarea>
+            <div class="compact-form">
+              <select id="extractDestinationFormat">
+                <option value="CSV">CSV</option>
+                <option value="NEWLINE_DELIMITED_JSON">NEWLINE_DELIMITED_JSON</option>
+                <option value="AVRO">AVRO</option>
+                <option value="PARQUET">PARQUET</option>
+              </select>
+              <input id="extractFieldDelimiter" placeholder="fieldDelimiter (CSV only, default ,)" />
+            </div>
+            <label class="meta-text"><input type="checkbox" id="extractPrintHeader" checked /> printHeader (CSV only)</label>
+            <div class="row-actions">
+              <button type="submit">Submit Extract Job</button>
+              <span id="extractJobStatus" class="meta-text">ready</span>
+            </div>
+          </form>
+          <pre id="extractJobResult" class="code-block"></pre>
         </article>
 
         <article class="panel panel-wide" id="capabilities-view">
