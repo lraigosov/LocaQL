@@ -19,12 +19,23 @@ capabilities:
     fidelity: medium
     tests:
       - unit/server/datasets_delete
+      - unit/server/dataset_delete_requires_delete_contents_when_tables_exist
+    reason: deleting a dataset that still has tables requires explicit deleteContents=true, matching the real BigQuery contract; the cascade removes the tables tracked for that dataset
+  rest.datasets.undelete:
+    status: supported
+    fidelity: low
+    tests:
+      - unit/server/dataset_undelete_restores_metadata_not_contents
+      - unit/server/dataset_undelete_fails_without_tombstone
+      - unit/server/dataset_undelete_fails_if_dataset_already_exists
+    reason: "LocaQL-only convenience endpoint at /_emulator/datasets/undelete (POST), deliberately outside /bigquery/v2/ since BigQuery's REST API has no public dataset undelete contract; restores friendlyName/location/labels/defaultTableExpirationMs from the most recent delete's tombstone, never table contents"
   rest.datasets.patch:
     status: partial
     fidelity: medium
     tests:
       - unit/server/datasets_patch
-    reason: partial update for friendlyName, location and labels is supported
+      - unit/server/datasets_default_table_expiration_ms_round_trip
+    reason: partial update for friendlyName, location, labels and defaultTableExpirationMs is supported; defaultTableExpirationMs is stored and round-tripped (accepts both string and number input, rendered as a string per the BigQuery int64-as-string convention) but not yet enforced — no expiry sweep exists, since that needs an injectable clock (tracked separately)
   rest.jobs.query:
     status: supported
     fidelity: high
@@ -103,7 +114,22 @@ capabilities:
     tests:
       - unit/server/jobs_executor_type_and_statistics
       - unit/server/jobs_copy_real_destination_data
-    reason: query and extract remain simulated; copy jobs materialize destination rows and load jobs now materialize destination table schema in the in-memory catalog
+    reason: query jobs resolve against the live in-memory catalog and report real outputRows/processedBytes (totalSlotMs stays a synthetic constant by design, since real slot/reservation timing is a declared non-goal); copy jobs materialize destination rows; load jobs materialize destination table schema and, when sourceUris are given, ingest real rows from NEWLINE_DELIMITED_JSON, CSV, AVRO or PARQUET (sourceFormat-dispatched, with fieldDelimiter/skipLeadingRows for CSV); extract jobs read a real source table and write destinationUris in the same four formats (fieldDelimiter/printHeader for CSV), with single-shard wildcard destinationUris resolved to the BigQuery 000000000000 convention. Avro uses github.com/linkedin/goavro/v2 (Apache 2.0); Parquet uses github.com/parquet-go/parquet-go (Apache 2.0, requires Go 1.24.9+, bumped from 1.22 explicitly for this). sourceUris/destinationUris are local file paths by default; gs:// URIs resolve onto a local directory only when LOCAQL_FAKE_GCS_ROOT is set (a LocaQL-only local-disk mapping, not a GCS-compatible API), otherwise gs:// is rejected explicitly. Multi-wildcard destinationUris and ORC are rejected explicitly, not silently ignored
+  rest.routines.crud:
+    status: supported
+    fidelity: medium
+    tests:
+      - unit/server/routines_insert_get_patch_delete_lifecycle
+      - unit/server/routines_insert_requires_definition_body
+      - unit/server/routines_require_existing_dataset
+    reason: "insert/get/list/patch/delete for bigquery/v2/.../routines are metadata-only: there is no SQL execution engine behind routines, so definitionBody/routineType/language round-trip without ever being executed"
+  rest.models.crud:
+    status: supported
+    fidelity: medium
+    tests:
+      - unit/server/models_insert_get_patch_delete_lifecycle
+      - unit/server/models_require_existing_dataset
+    reason: "insert/get/list/patch/delete for bigquery/v2/.../models are metadata-only: there is no ML training/inference backend, so modelType/friendlyName/description/labels round-trip without ever training or scoring; trainingRuns/evaluation metrics are never fabricated"
   rest.jobs.errors.detailed:
     status: supported
     fidelity: medium
@@ -155,7 +181,7 @@ capabilities:
       - unit/server/information_schema_priority_tables_columns
       - unit/server/information_schema_priority_jobs
       - unit/server/information_schema_priority_partitions
-    reason: basic SCHEMATA, SCHEMATA_OPTIONS, TABLES, COLUMNS, JOBS, PARTITIONS, ROUTINES and MODELS query emulation is backed by the live in-memory catalog; broader semantic parity is still pending
+    reason: SCHEMATA, SCHEMATA_OPTIONS, TABLES, COLUMNS, TABLE_OPTIONS, JOBS, JOBS_BY_PROJECT, JOBS_BY_USER, PARTITIONS, ROUTINES and MODELS query emulation is backed by the live in-memory catalog. JOBS_BY_USER scopes to the UserEmail of the job running the JOBS_BY_USER query itself (the only real "calling user" available; the emulator is anonymous-only and has no broader auth model), returning zero rows rather than all jobs when that job has no UserEmail. VIEWS returns a structurally correct empty result since views are not a real resource yet; broader semantic parity is still pending
   console.ui.resource_forms.basic:
     status: partial
     fidelity: medium

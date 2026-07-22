@@ -321,6 +321,38 @@ func (s *tableService) upsertCopyDestination(dest tableReference, schema []table
 	return len(rows), nil
 }
 
+// datasetTableCount reports how many tables exist for projectID/datasetID
+// WITHOUT triggering ensureDatasetLocked's lazy demo-table seeding. A dataset
+// that was never touched via the tables service reports 0, even though a
+// later read would auto-seed default demo tables.
+func (s *tableService) datasetTableCount(projectID, datasetID string) int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	proj := s.projects[projectID]
+	if proj == nil {
+		return 0
+	}
+	return len(proj[datasetID])
+}
+
+// deleteAllForDataset removes every table tracked for projectID/datasetID
+// without seeding. It is a no-op if the dataset was never materialized.
+func (s *tableService) deleteAllForDataset(projectID, datasetID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	proj := s.projects[projectID]
+	if proj == nil {
+		return
+	}
+	if _, ok := proj[datasetID]; !ok {
+		return
+	}
+	delete(proj, datasetID)
+	s.datasetVersions[s.datasetKey(projectID, datasetID)]++
+}
+
 func (s *tableService) ensureDatasetLocked(projectID, datasetID string) map[string]*tableRecord {
 	proj := s.projects[projectID]
 	if proj == nil {
