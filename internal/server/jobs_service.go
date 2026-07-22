@@ -29,6 +29,15 @@ type jobRecord struct {
 	ResourceKey     string
 	SourceTables    []tableReference
 	LoadSchema      []tableField
+	LoadSourceURIs  []string
+	LoadSourceFormat string
+	LoadFieldDelimiter string
+	LoadSkipLeadingRows int
+	ExtractSourceTable      tableReference
+	ExtractDestinationURIs  []string
+	ExtractDestinationFormat string
+	ExtractFieldDelimiter   string
+	ExtractPrintHeader      bool
 	TargetDataset   string
 	TargetTable     string
 	CreateDisposition string
@@ -77,6 +86,15 @@ type jobInsertOptions struct {
 	Priority      string
 	SourceTables   []tableReference
 	LoadSchema      []tableField
+	LoadSourceURIs  []string
+	LoadSourceFormat string
+	LoadFieldDelimiter string
+	LoadSkipLeadingRows int
+	ExtractSourceTable      tableReference
+	ExtractDestinationURIs  []string
+	ExtractDestinationFormat string
+	ExtractFieldDelimiter   string
+	ExtractPrintHeader      bool
 	CreateDisposition string
 	WriteDisposition  string
 	TargetDataset string
@@ -107,6 +125,8 @@ type jobService struct {
 	persistencePath   string
 	copyExecutor      func(*jobRecord) (jobStatistics, error)
 	loadExecutor      func(*jobRecord) (jobStatistics, error)
+	extractExecutor   func(*jobRecord) (jobStatistics, error)
+	queryExecutor     func(*jobRecord) (jobStatistics, error)
 	counter           int64
 }
 
@@ -209,6 +229,15 @@ func (s *jobService) insert(opts jobInsertOptions) (*jobRecord, bool) {
 		ResourceKey: buildResourceKey(opts),
 		SourceTables: cloneTableReferences(opts.SourceTables),
 		LoadSchema:   cloneTableFields(opts.LoadSchema),
+		LoadSourceURIs: cloneStringSlice(opts.LoadSourceURIs),
+		LoadSourceFormat: strings.TrimSpace(opts.LoadSourceFormat),
+		LoadFieldDelimiter: opts.LoadFieldDelimiter,
+		LoadSkipLeadingRows: opts.LoadSkipLeadingRows,
+		ExtractSourceTable: opts.ExtractSourceTable,
+		ExtractDestinationURIs: cloneStringSlice(opts.ExtractDestinationURIs),
+		ExtractDestinationFormat: strings.TrimSpace(opts.ExtractDestinationFormat),
+		ExtractFieldDelimiter: opts.ExtractFieldDelimiter,
+		ExtractPrintHeader: opts.ExtractPrintHeader,
 		TargetDataset: strings.TrimSpace(opts.TargetDataset),
 		TargetTable: strings.TrimSpace(opts.TargetTable),
 		CreateDisposition: normalizeCreateDisposition(opts.CreateDisposition),
@@ -336,34 +365,9 @@ func (s *jobService) run(jobID, projectID string) {
 	d := executorDuration(jr.JobType)
 	time.Sleep(d)
 
-	var copyStats jobStatistics
-	var copyErr error
-	if jobType == "copy" && s.copyExecutor != nil {
-		s.mu.Lock()
-		jr = s.jobsByProject[projectID][jobID]
-		if jr == nil {
-			s.mu.Unlock()
-			return
-		}
-		jobSnapshot := *jr
-		jobSnapshot.SourceTables = cloneTableReferences(jr.SourceTables)
-		s.mu.Unlock()
-		copyStats, copyErr = s.copyExecutor(&jobSnapshot)
-	}
-
-	var loadStats jobStatistics
-	var loadErr error
-	if jobType == "load" && s.loadExecutor != nil {
-		s.mu.Lock()
-		jr = s.jobsByProject[projectID][jobID]
-		if jr == nil {
-			s.mu.Unlock()
-			return
-		}
-		jobSnapshot := *jr
-		jobSnapshot.LoadSchema = cloneTableFields(jr.LoadSchema)
-		s.mu.Unlock()
-		loadStats, loadErr = s.loadExecutor(&jobSnapshot)
+	outcome, missing := s.runJobExecutors(projectID, jobID, jobType)
+	if missing {
+		return
 	}
 
 	s.mu.Lock()
@@ -381,25 +385,87 @@ func (s *jobService) run(jobID, projectID string) {
 		_ = s.persistLocked()
 		return
 	}
-	if copyErr != nil {
+	switch {
+	case outcome.err != nil:
 		jr.ErrorReason = "invalid"
-		jr.ErrorMessage = copyErr.Error()
-		jr.Errors = []jobError{{Reason: "invalid", Message: copyErr.Error(), Location: "configuration.copy"}}
-	} else if loadErr != nil {
-		jr.ErrorReason = "invalid"
-		jr.ErrorMessage = loadErr.Error()
-		jr.Errors = []jobError{{Reason: "invalid", Message: loadErr.Error(), Location: "configuration.load"}}
-	} else if jobType == "copy" && s.copyExecutor != nil {
-		jr.Statistics = copyStats
-	} else if jobType == "load" && s.loadExecutor != nil {
-		jr.Statistics = loadStats
-	} else {
+		jr.ErrorMessage = outcome.err.Error()
+		jr.Errors = []jobError{{Reason: "invalid", Message: outcome.err.Error(), Location: outcome.location}}
+	case outcome.executed:
+		jr.Statistics = outcome.stats
+	default:
 		applyExecutorResult(jr)
 	}
 	jr.State = jobStateDone
 	jr.EndedAt = time.Now().UTC()
 	s.projectVersions[projectID]++
 	_ = s.persistLocked()
+}
+
+type jobExecutorOutcome struct {
+	stats    jobStatistics
+	err      error
+	location string
+	executed bool
+}
+
+type jobExecutorSpec struct {
+	jobType  string
+	location string
+	execute  func(*jobRecord) (jobStatistics, error)
+	prepare  func(*jobRecord)
+}
+
+// runJobExecutors runs whichever real executor (copy/load/extract) matches
+// jobType, if one is wired. missing is true if the job record disappeared
+// mid-flight (e.g. deleted concurrently), in which case the caller must abort.
+func (s *jobService) runJobExecutors(projectID, jobID, jobType string) (jobExecutorOutcome, bool) {
+	specs := []jobExecutorSpec{
+		{jobType: "copy", location: "configuration.copy", execute: s.copyExecutor, prepare: func(snap *jobRecord) {
+			snap.SourceTables = cloneTableReferences(snap.SourceTables)
+		}},
+		{jobType: "load", location: "configuration.load", execute: s.loadExecutor, prepare: func(snap *jobRecord) {
+			snap.LoadSchema = cloneTableFields(snap.LoadSchema)
+			snap.LoadSourceURIs = cloneStringSlice(snap.LoadSourceURIs)
+		}},
+		{jobType: "extract", location: "configuration.extract", execute: s.extractExecutor, prepare: func(snap *jobRecord) {
+			snap.ExtractDestinationURIs = cloneStringSlice(snap.ExtractDestinationURIs)
+		}},
+		{jobType: "query", location: "configuration.query", execute: s.queryExecutor, prepare: nil},
+	}
+
+	var outcome jobExecutorOutcome
+	for _, spec := range specs {
+		stats, err, missing := s.runExecutor(projectID, jobID, jobType, spec.jobType, spec.execute, spec.prepare)
+		if missing {
+			return jobExecutorOutcome{}, true
+		}
+		if jobType == spec.jobType && spec.execute != nil {
+			outcome = jobExecutorOutcome{stats: stats, err: err, location: spec.location, executed: true}
+		}
+	}
+	return outcome, false
+}
+
+// runExecutor runs executor against a fresh snapshot of the job record when
+// jobType matches wantType. missing is true if the job record disappeared
+// mid-flight, signalling the caller should abort immediately.
+func (s *jobService) runExecutor(projectID, jobID, jobType, wantType string, executor func(*jobRecord) (jobStatistics, error), prepare func(*jobRecord)) (jobStatistics, error, bool) {
+	if jobType != wantType || executor == nil {
+		return jobStatistics{}, nil, false
+	}
+	s.mu.Lock()
+	jr := s.jobsByProject[projectID][jobID]
+	if jr == nil {
+		s.mu.Unlock()
+		return jobStatistics{}, nil, true
+	}
+	snapshot := *jr
+	if prepare != nil {
+		prepare(&snapshot)
+	}
+	s.mu.Unlock()
+	stats, err := executor(&snapshot)
+	return stats, err, false
 }
 
 func (s *jobService) get(projectID, jobID string) (*jobRecord, bool) {
@@ -655,6 +721,15 @@ func cloneTableReferences(refs []tableReference) []tableReference {
 	}
 	out := make([]tableReference, len(refs))
 	copy(out, refs)
+	return out
+}
+
+func cloneStringSlice(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make([]string, len(values))
+	copy(out, values)
 	return out
 }
 
