@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation
+    url: https://github.com/lraigosov/LocaQL#readme
+    about: Check the README's Current Scope Matrix and Table of Contents before filing an issue.

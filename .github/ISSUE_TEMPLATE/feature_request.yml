@@ -1,0 +1,27 @@
+name: Feature request
+description: Propose a BigQuery contract or workflow LocaQL should support.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check `capabilities/registry.yaml` first — if this is already listed as `planned`, comment on the existing tracking instead of opening a duplicate.
+  - type: textarea
+    id: contract
+    attributes:
+      label: BigQuery contract or workflow
+      description: Which REST endpoint, SQL feature, or workflow is this about? Link the official Google Cloud documentation if you have it.
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why does this matter?
+      description: What can't you do today without it, and how would you use it?
+    validations:
+      required: true
+  - type: textarea
+    id: current-behavior
+    attributes:
+      label: Current behavior
+      description: What does LocaQL do today when you try this (error, silent no-op, wrong result)?
