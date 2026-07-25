@@ -40,10 +40,19 @@ capabilities:
       - unit/server/dataset_delete_table_count_excludes_expired_tables
     reason: partial update for friendlyName, location, labels and defaultTableExpirationMs is supported; defaultTableExpirationMs is stored and round-tripped (accepts both string and number input, rendered as a string per the BigQuery int64-as-string convention) and now enforced — every table created without an explicit expirationTime inherits an absolute expiration computed from the dataset's default at creation time via a swappable clock (tableService.now, real time.Now in production, overridable in tests), and any table access (get/list/tabledata/dataset-empty-check) lazily purges an expired table the first time it is touched rather than running a background sweep goroutine. This is a narrowly-scoped clock for table expiration specifically, not the general injectable-clock/observability infrastructure envisioned in the master plan's Fase quince (logging, time travel, sessions still use real wall-clock time directly)
   rest.jobs.query:
-    status: supported
+    status: partial
     fidelity: high
     tests:
-      - conformance/foundation/rest_jobs_query
+      - unit/server/jobs_sync_query
+      - unit/server/jobs_executor_type_and_statistics
+      - unit/server/jobs_sync_query_supports_information_schema_parameters_with_real_data
+      - unit/server/real_sql_engine_where_projection_and_order_by
+      - unit/server/real_sql_engine_group_by_aggregate
+      - unit/server/real_sql_engine_join_across_tables
+      - unit/server/real_sql_engine_limit
+      - unit/server/real_sql_engine_invalid_query_fails_explicitly_instead_of_fabricating_rows
+      - unit/server/real_sql_engine_missing_table_fails_explicitly
+    reason: "async jobs.insert, sync jobs.query and projects.queries all funnel into a real GoogleSQL engine (github.com/goccy/googlesqlite, a pure-Go database/sql driver that parses/analyzes real GoogleSQL and executes against an in-memory SQLite backend — no cgo) as of Sesión 73, replacing the previous regex-matched full-table-dump plus a hardcoded fabricated fallback for anything else. Every table a query references (via FROM/JOIN, extracted with a regex over the query text — see internal/server/sql_engine.go:referencedTables) is materialized into a fresh in-memory instance per query (one SQL schema per dataset, one table per BigQuery table, rows converted from the stored string-per-cell representation to typed values), so WHERE, column projection, JOIN, aggregation (COUNT/SUM/etc. with GROUP BY), ORDER BY and LIMIT are real GoogleSQL semantics now, not simulated — verified with dedicated tests for each. INFORMATION_SCHEMA.X queries are still handled by the separate dedicated builders (see sql.information_schema.priority), since those reflect LocaQL's own catalog metadata rather than user table data. A genuinely invalid query or a reference to a nonexistent table now fails explicitly (a real parser/analyzer error, or 'table not found') instead of returning a fabricated 200. Marked partial, not supported, because of real remaining gaps: a 3-part project.dataset.table reference only resolves when the leading component matches the request's own projectID (cross-project queries are rejected rather than silently misresolved, since the engine has no project-level concept — only dataset-as-schema); result columns of nested STRUCT/ARRAY type report the engine's raw type name rather than BigQuery's RECORD/REPEATED schema shape (see KNOWN-DIVERGENCES.md); DML/DDL executed through a query job (INSERT/UPDATE/DELETE/CREATE TABLE AS SELECT) is not wired to LocaQL's catalog — only SELECT is routed through the real engine, since table mutation still goes through the existing REST job executors (load/copy/extract) by design; and there is no query-plan/cost estimation, so totalSlotMs/dry-run byte estimates remain synthetic as already declared"
   rest.datasets.list.pagination:
     status: supported
     fidelity: medium
@@ -76,6 +85,11 @@ capabilities:
     tests:
       - unit/server/tables_patch
       - unit/server/tables_patch_expiration_time_round_trip
+      - unit/server/tables_patch_schema_evolution_adds_nullable_column
+      - unit/server/tables_patch_schema_evolution_rejects_removing_column
+      - unit/server/tables_patch_schema_evolution_allows_relaxing_required_to_nullable
+      - unit/server/tables_patch_schema_evolution_rejects_tightening_nullable_to_required
+    reason: "tables.patch accepts a schema field (Sesión 76) that evolves the existing schema rather than replacing it blindly: appending new columns (which must be NULLABLE, since existing rows have no value for them) and relaxing an existing column from REQUIRED to NULLABLE are allowed; removing a column, renaming/reordering one, changing its type, or tightening NULLABLE to REQUIRED are all rejected explicitly with a 400 rather than silently applied or ignored — validated in the REST handler (validateSchemaEvolution) before calling the service layer"
   rest.tables.update:
     status: supported
     fidelity: medium
@@ -95,6 +109,29 @@ capabilities:
       - unit/server/external_table_information_schema_tables_marks_type_external
       - unit/server/external_table_copy_job_materializes_into_destination
     reason: "tables.insert accepts externalDataConfiguration (sourceUris/sourceFormat/fieldDelimiter/skipLeadingRows, mirroring configuration.load's flat field layout instead of real BigQuery's nested csvOptions) with an explicit schema.fields required (no autodetect); nothing is materialized at creation time — every consumer of real row data (query execution, tabledata.list, copy/extract job sources, INFORMATION_SCHEMA.PARTITIONS row counts) re-reads sourceUris fresh through a single resolveTableRows choke point, so external tables always reflect current file contents. An unreadable source fails the request/job explicitly instead of silently falling back to empty or simulated data. Supported sourceFormat values are the same four as load/extract (NEWLINE_DELIMITED_JSON/CSV/AVRO/PARQUET); ORC and other formats, patching externalDataConfiguration after creation, autodetect, Hive partitioning and compression options are not supported"
+  rest.tables.views:
+    status: supported
+    fidelity: medium
+    tests:
+      - unit/server/view_insert_derives_schema_and_type
+      - unit/server/view_query_reflects_live_underlying_table_data
+      - unit/server/view_chained_on_another_view_resolves_recursively
+      - unit/server/materialized_view_insert_and_information_schema
+      - unit/server/view_insert_rejects_invalid_query_explicitly
+      - unit/server/view_insert_rejects_self_reference
+      - unit/server/view_insert_rejects_both_view_and_materialized_view
+    reason: "tables.insert accepts view.query or materializedView.query (mutually exclusive with each other and with externalDataConfiguration) as of Sesión 75, now that a real query engine exists to back them (see rest.jobs.query): the query is executed once at creation time via the real engine both to validate it (an invalid query or a reference to a nonexistent table fails the insert explicitly with a 400, the same way real BigQuery validates a view's SQL at creation) and to derive schema.fields, since a view's schema is inferred rather than user-supplied. Data is never materialized into the view's own tableRecord.Rows: every access (query execution via FROM/JOIN, tabledata.list, INFORMATION_SCHEMA.PARTITIONS row counts) re-executes the stored query fresh through resolveTableRowsVisiting, so a view always reflects the current state of whatever it selects from — including chained views (a view selecting from another view resolves recursively), guarded by a visiting-set cycle check that fails a self-referencing or circular view chain explicitly rather than recursing forever. A self-referencing view cannot actually be constructed today since validation happens before the view exists in the catalog; the cycle guard exists for when patch-based redefinition is added. MATERIALIZED_VIEW is accepted and rendered with its own type/field, but real BigQuery's periodic background refresh is not modeled — a materialized view is recomputed live on every access exactly like a plain view, a declared simplification rather than a faked cache. tables.patch/update do not support redefining an existing view's query; INFORMATION_SCHEMA.VIEWS/MATERIALIZED_VIEWS/TABLES.table_type reflect real view resources now (see sql.information_schema.priority)"
+  rest.tables.nested_schema:
+    status: partial
+    fidelity: medium
+    tests:
+      - unit/server/nested_record_schema_insert_and_table_resource_renders_mode_and_fields
+      - unit/server/nested_record_load_query_and_tabledata_round_trip
+      - unit/server/nested_record_extract_to_ndjson_round_trip
+      - unit/server/repeated_scalar_load_query_and_tabledata_round_trip
+      - unit/server/repeated_record_array_of_struct_round_trip
+      - unit/server/csv_load_rejects_nested_schema_fields_explicitly
+    reason: "tableField gained mode (NULLABLE/REQUIRED/REPEATED) and fields (nested schema, for RECORD/STRUCT) as of Sesión 76, with real REST tabledata.list/query-result rendering: a RECORD cell renders as BigQuery's actual nested {\"v\": {\"f\": [...]}} row shape and a REPEATED cell as [{\"v\": ...}, ...], not a JSON-encoded string. NEWLINE_DELIMITED_JSON is the only format with real nested load/extract support (JSON is naturally recursive; the existing scalarValueToString/stringToJSONValue conversion functions already handled arbitrary nested values via their JSON-encode fallback before this even shipped) — CSV, AVRO and PARQUET explicitly reject RECORD/REPEATED schema fields (rejectNestedFields) rather than silently flattening or corrupting them; CSV never will support them (matching real BigQuery), Avro/Parquet could in principle but that is deferred. The real query engine (see rest.jobs.query) materializes and returns nested columns for real: CREATE TABLE emits STRUCT<...>/ARRAY<...> column types, and every scalar leaf of a RECORD/REPEATED value is bound via an explicit CAST(? AS type) inside a literal STRUCT(...)/[...] SQL expression rather than a single bound Go map/slice parameter — verified empirically (a discardable spike run 100 times) that a bare ? placeholder inside an array/struct literal is typed by the engine's analyzer before the bound value is known and silently defaults to INT64, corrupting or rejecting any other type; explicit CAST fixed this with 0/100 mismatches across repeated trials. tables.patch supports schema evolution (see rest.tables.patch) but not changing a column's nested Fields shape once created"
   rest.fake_gcs.json_api:
     status: partial
     fidelity: medium
@@ -214,6 +251,16 @@ capabilities:
     fidelity: medium
     tests:
       - conformance/pagination/rest_tabledata_list_pagination
+  sql.types.core_scalars:
+    status: partial
+    fidelity: medium
+    tests:
+      - unit/server/numeric_preserves_exact_decimal_precision_through_load_query_extract
+      - unit/server/bignumeric_preserves_full_precision
+      - unit/server/date_datetime_time_timestamp_round_trip_through_tabledata_unchanged
+      - unit/server/date_column_to_column_comparison_works_correctly
+      - unit/server/known_upstream_bug_date_string_literal_parsing_is_off_by_one_day
+    reason: "NUMERIC and BIGNUMERIC (Sesión 77) are now real column types in the query engine (added to realSQLScalarTypes) rather than falling back to STRING: exact decimal precision is preserved end to end (verified with a 38-digit BIGNUMERIC value round-tripping unchanged) and real decimal arithmetic works (0.1 + 0.2 = exactly 0.3 through the engine, unlike FLOAT64's binary rounding error). DATE/DATETIME/TIME/TIMESTAMP were already accepted; verified they round-trip unchanged through tabledata.list (never touches the query engine for a plain table) and that comparing two real DATE columns to each other works correctly through the engine. **Known upstream bug, not a LocaQL defect and not workaroundable from LocaQL's side:** constructing a DATE value from a string inside query text — either `DATE 'YYYY-MM-DD'` literal syntax or `CAST('YYYY-MM-DD' AS DATE)` — silently produces a date exactly one calendar day earlier than the string says, verified with multiple distinct dates (including a leap-year boundary) and pinned by a dedicated test documenting the exact wrong value, so a future googlesqlite fix surfaces as a test failure rather than silently going stale. Confirmed NOT to affect DATETIME/TIMESTAMP/TIME literals, CURRENT_DATE(), DATE(<timestamp>) extraction, or DATE column-to-column comparison — only constructing a DATE from a literal string. No known upstream issue filed for this yet. NULL and empty string remain indistinguishable in table row storage (see KNOWN-DIVERGENCES.md) since rows are stored as plain strings; GEOGRAPHY, RANGE and INTERVAL remain out of scope by explicit agreement with the user before this work started"
   sql.information_schema.priority:
     status: partial
     fidelity: medium
@@ -222,7 +269,8 @@ capabilities:
       - unit/server/information_schema_priority_jobs
       - unit/server/information_schema_priority_partitions
       - unit/server/jobs_sync_query_supports_information_schema_parameters_with_real_data
-    reason: SCHEMATA, SCHEMATA_OPTIONS, TABLES, COLUMNS, TABLE_OPTIONS, JOBS, JOBS_BY_PROJECT, JOBS_BY_USER, PARTITIONS, ROUTINES, PARAMETERS and MODELS query emulation is backed by the live in-memory catalog. JOBS_BY_USER scopes to the UserEmail of the job running the JOBS_BY_USER query itself (the only real "calling user" available; the emulator is anonymous-only and has no broader auth model), returning zero rows rather than all jobs when that job has no UserEmail. PARAMETERS lists each routine's arguments (ordinal_position/parameter_name/data_type) with parameter_mode always "IN", since there is no execution engine to observe a real OUT/INOUT distinction for procedures. VIEWS returns a structurally correct empty result since views are not a real resource yet; MATERIALIZED_VIEWS and SESSIONS are not implemented; broader semantic parity is still pending
+      - unit/server/materialized_view_insert_and_information_schema
+    reason: SCHEMATA, SCHEMATA_OPTIONS, TABLES, COLUMNS, TABLE_OPTIONS, JOBS, JOBS_BY_PROJECT, JOBS_BY_USER, PARTITIONS, ROUTINES, PARAMETERS, MODELS, VIEWS and MATERIALIZED_VIEWS query emulation is backed by the live in-memory catalog. JOBS_BY_USER scopes to the UserEmail of the job running the JOBS_BY_USER query itself (the only real "calling user" available; the emulator is anonymous-only and has no broader auth model), returning zero rows rather than all jobs when that job has no UserEmail. PARAMETERS lists each routine's arguments (ordinal_position/parameter_name/data_type) with parameter_mode always "IN", since there is no execution engine to observe a real OUT/INOUT distinction for procedures. VIEWS and MATERIALIZED_VIEWS (Sesión 75) list real view resources (view_definition is the actual stored query) now that tables.insert can create them (see rest.tables.views); TABLES.table_type correspondingly reports VIEW/MATERIALIZED VIEW instead of BASE TABLE for those. SESSIONS is not implemented. None of these builders support column projection yet — a SELECT with an explicit column list still returns every column of the builder's fixed schema, a pre-existing limitation unrelated to views (see KNOWN-DIVERGENCES.md); broader semantic parity is still pending
   console.ui.resource_forms.basic:
     status: supported
     fidelity: medium
@@ -323,6 +371,12 @@ capabilities:
     tests:
       - e2e/ui/jobs_history_tabs
     reason: jobs explorer supports explicit personal and project history tabs mapped to allUsers behavior; verified end-to-end against a real headless-Chrome console, not just by reading the code
+  console.ui.workspace_portability:
+    status: supported
+    fidelity: medium
+    tests:
+      - e2e/ui/workspace_portability
+    reason: dedicated Workspace tab drives validate/plan/diff/apply (including the dryRun-by-default guard and the deleteMissing + confirmDelete="DELETE" mutating-delete confirmation) against real on-disk workspace directories through the new /_emulator/workspace/* REST endpoints, exposing the same operations the locaql CLI's workspace subcommands already provide; verified end-to-end against a real headless-Chrome console, not just by reading the code. Paths are resolved on the machine running the emulator process, matching the established convention for Load/Extract sourceUris/destinationUris — there is no file upload through the browser
   workspace.validate.structure:
     status: supported
     fidelity: medium
@@ -359,6 +413,35 @@ capabilities:
       - unit/cli/workspace_apply_mutating
       - unit/cli/workspace_apply_delete_confirmation
     reason: CLI command `locaql workspace apply --dry-run=false` mutates target with guarded delete support (`--delete-missing` + `--confirm-delete=DELETE`) and optional manifest output
+  rest.workspace.validate:
+    status: supported
+    fidelity: medium
+    tests:
+      - unit/server/workspace_validate_reports_found_and_missing
+      - unit/server/workspace_validate_rejects_missing_path
+    reason: "LocaQL-only convenience endpoint at /_emulator/workspace/validate (POST {path}), deliberately outside /bigquery/v2/ since real BigQuery has no portable-workspace concept at all; a thin REST wrapper around the same internal/workspace.Validate function the locaql CLI's `workspace validate` subcommand already uses (see workspace.validate.structure), so behavior is identical to the CLI, just reachable over HTTP for the console UI"
+  rest.workspace.plan:
+    status: supported
+    fidelity: medium
+    tests:
+      - unit/server/workspace_plan_lists_real_files_with_hashes
+    reason: "LocaQL-only convenience endpoint at /_emulator/workspace/plan (POST {path}), wrapping internal/workspace.BuildPlan (see workspace.plan) — returns the validation result plus the deterministic tracked-file inventory (path/size/sha256) for a workspace root"
+  rest.workspace.diff:
+    status: supported
+    fidelity: medium
+    tests:
+      - unit/server/workspace_diff_detects_added_changed_and_removed_files
+      - unit/server/workspace_diff_requires_target
+    reason: "LocaQL-only convenience endpoint at /_emulator/workspace/diff (POST {source, target}), wrapping internal/workspace.Diff (see workspace.diff) — target is required (400 otherwise); returns onlyInSource/onlyInTarget/changed file lists compared by path, size and sha256"
+  rest.workspace.apply:
+    status: supported
+    fidelity: medium
+    tests:
+      - unit/server/workspace_apply_dry_run_does_not_mutate_target
+      - unit/server/workspace_apply_mutating_copies_real_files
+      - unit/server/workspace_apply_requires_confirm_delete_for_mutating_delete_missing
+      - unit/server/workspace_apply_delete_missing_with_confirm_delete_removes_files
+    reason: "LocaQL-only convenience endpoint at /_emulator/workspace/apply (POST {source, target, dryRun, deleteMissing, confirmDelete}), wrapping internal/workspace.BuildApplyDryRunWithOptions and internal/workspace.Apply (see workspace.apply.dry_run / workspace.apply.mutate) — target is required (400 otherwise); dryRun defaults to true when omitted, matching the CLI's own --dry-run=true default, so mutating the target is always an explicit opt-in; a mutating request with deleteMissing=true is rejected with 400 unless confirmDelete is exactly \"DELETE\", mirroring the CLI's --delete-missing/--confirm-delete guard verbatim"
   security.iam.policies:
     status: unsupported
     fidelity: none
