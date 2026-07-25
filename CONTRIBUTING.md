@@ -35,7 +35,7 @@ Issue templates are provided under `.github/ISSUE_TEMPLATE/` to prompt for this 
 
 ## Development Setup
 
-- WSL distribution `Ubuntu-24.04`, Go 1.24.9+ (see [Requirements](README.md#requirements) — `GOTOOLCHAIN=auto` downloads it automatically).
+- WSL distribution `Ubuntu-24.04`, Go 1.25.0+ (see [Requirements](README.md#requirements) — `GOTOOLCHAIN=auto` downloads it automatically).
 - Build and test everything through WSL, not native Windows, since race tests need `build-essential`/cgo:
 
 ```bash

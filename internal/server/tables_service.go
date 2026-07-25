@@ -8,10 +8,26 @@ import (
 	"time"
 )
 
+// tableField describes one schema column. Mode defaults to NULLABLE
+// (BigQuery's own default) when empty. Fields is populated only when Type is
+// RECORD/STRUCT, describing the nested column's own fields positionally:
+// BigQuery's REST tabledata.list/query result shape encodes a RECORD value
+// as {"v": {"f": [{"v": ...}, ...]}} in that same field order, and a
+// REPEATED value (any Mode == "REPEATED" field, scalar or RECORD) as
+// {"v": [...]} of "single" values for the field's base type.
 type tableField struct {
-	Name string
-	Type string
+	Name   string
+	Type   string
+	Mode   string
+	Fields []tableField
 }
+
+// tableRowValue is one cell of a table row, in schema-field order. It is one
+// of: a scalar string (BigQuery's REST convention — every scalar value,
+// including numbers and booleans, is a string), a RECORD value ([]any,
+// positionally matching field.Fields), a REPEATED value ([]any of "single"
+// values for the field's base type), or nil for SQL NULL.
+type tableRowValue = any
 
 type tableReference struct {
 	ProjectID string
@@ -29,10 +45,30 @@ type tableRecord struct {
 	Schema         []tableField
 	Rows           [][]string
 	External       *externalTableConfig
+	View           *viewConfig
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
 	Version        int
 	ExpirationTime time.Time // zero value means "never expires"
+}
+
+// viewConfig marks a table as a VIEW or MATERIALIZED_VIEW: its data is never
+// stored in tableRecord.Rows, only its GoogleSQL definition. Both kinds are
+// resolved by re-executing Query through the real query engine on every
+// access (see resolveTableRowsVisiting in bigquery.go) rather than caching a
+// snapshot — real BigQuery's periodic materialized-view refresh is not
+// modeled, a simplification declared explicitly rather than faked.
+type viewConfig struct {
+	Query        string
+	Materialized bool
+}
+
+func cloneViewConfig(v *viewConfig) *viewConfig {
+	if v == nil {
+		return nil
+	}
+	cp := *v
+	return &cp
 }
 
 // externalTableConfig marks a table as backed by local files (or fake-GCS via
@@ -66,6 +102,7 @@ type tableInsert struct {
 	Schema         []tableField
 	Rows           [][]string
 	External       *externalTableConfig
+	View           *viewConfig
 	ExpirationTime time.Time
 }
 
@@ -77,10 +114,12 @@ type tablePatch struct {
 	Description       string
 	Labels            map[string]string
 	ExpirationTime    time.Time
+	Schema            []tableField
 	HasFriendlyName   bool
 	HasDescription    bool
 	HasLabels         bool
 	HasExpirationTime bool
+	HasSchema         bool
 }
 
 // tableUpdate mirrors real BigQuery PUT semantics: every field is fully
@@ -220,6 +259,7 @@ func (s *tableService) insert(input tableInsert) (*tableRecord, bool) {
 		Schema:         cloneTableFields(input.Schema),
 		Rows:           cloneTableRows(input.Rows),
 		External:       cloneExternalConfig(input.External),
+		View:           cloneViewConfig(input.View),
 		CreatedAt:      now,
 		UpdatedAt:      now,
 		Version:        1,
@@ -278,6 +318,9 @@ func (s *tableService) patch(input tablePatch) (*tableRecord, bool) {
 	}
 	if input.HasExpirationTime {
 		t.ExpirationTime = input.ExpirationTime
+	}
+	if input.HasSchema {
+		t.Schema = cloneTableFields(input.Schema)
 	}
 
 	t.UpdatedAt = s.now().UTC()
@@ -471,12 +514,19 @@ func (s *tableService) datasetKey(projectID, datasetID string) string {
 	return projectID + ":" + datasetID
 }
 
+// cloneTableFields deep-clones a schema, recursively cloning a RECORD
+// field's nested Fields rather than sharing the same backing slice across
+// clones (a plain copy() would only copy the tableField struct itself,
+// leaving every clone's Fields slice aliased to the same array).
 func cloneTableFields(fields []tableField) []tableField {
 	if len(fields) == 0 {
 		return nil
 	}
 	out := make([]tableField, len(fields))
-	copy(out, fields)
+	for i, f := range fields {
+		out[i] = f
+		out[i].Fields = cloneTableFields(f.Fields)
+	}
 	return out
 }
 

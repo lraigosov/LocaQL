@@ -3,6 +3,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -178,12 +179,27 @@ func TestE2E_TableActionsQueryCopyDelete(t *testing.T) {
 	// --- Delete Table: confirm() dialog is auto-accepted. Switch back to the
 	// query workspace first: the table details panel (and its Delete
 	// button) is only visible under that tab. ---
+	// treeContainsExpr does a plain substring match, which collides here:
+	// the Copy Table step above created "<tableID>_copy", and tableID is a
+	// substring of that copy's name, so a substring check for tableID never
+	// goes away even after the original is really deleted. Poll for an
+	// exact .node-label match instead (app.js sets a table node's label
+	// textContent to exactly the tableId), which the copy's "_copy"-suffixed
+	// label can never satisfy.
 	if err := run(ctx,
 		switchMainTab("query-workspace"),
 		waitVisibleSel(`#deleteTableBtn`),
 		clickID("deleteTableBtn"),
-		pollTrue(`!`+treeContainsExpr(tableID)),
+		pollTrue(`!`+exactTableNodeExistsExpr(tableID)),
 	); err != nil {
 		t.Fatalf("delete table action: %v", err)
 	}
+}
+
+// exactTableNodeExistsExpr is a JS expression that is true only when a table
+// node's label is exactly tableID (not merely a substring match, unlike
+// treeContainsExpr) — needed wherever a test must distinguish a table from
+// another one whose name contains it as a substring (e.g. "<id>_copy").
+func exactTableNodeExistsExpr(tableID string) string {
+	return fmt.Sprintf(`Array.from(document.querySelectorAll("#explorerTree .node.table .node-label")).some(el => el.textContent === %s)`, jsString(tableID))
 }
