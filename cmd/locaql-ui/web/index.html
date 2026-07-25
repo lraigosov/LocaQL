@@ -229,6 +229,7 @@
           <span class="tab active" data-target="query-workspace">Query</span>
           <span class="tab" data-target="jobs-explorer">Jobs</span>
           <span class="tab" data-target="load-extract-workspace">Load / Extract</span>
+          <span class="tab" data-target="workspace-portability">Workspace</span>
           <span class="tab" data-target="capabilities-view">Capabilities</span>
         </div>
         <div class="status-strip">
@@ -481,6 +482,73 @@
           <pre id="extractJobResult" class="code-block"></pre>
         </article>
 
+        <article class="panel panel-wide" id="workspace-portability" style="display: none;">
+          <div class="panel-head">
+            <h3>Workspace Portability</h3>
+            <span class="meta-text">Validate, plan, diff, and apply a portable workspace directory (manifest.yaml + datasets/schemas/queries/profiles) between two local paths — the same operations available via the locaql CLI's workspace subcommands.</span>
+          </div>
+
+          <div class="panel-head">
+            <h3>Validate</h3>
+          </div>
+          <form id="workspaceValidateForm" class="stack-form">
+            <input id="workspaceValidatePath" placeholder="workspace path (local filesystem)" required />
+            <div class="row-actions">
+              <button type="submit">Validate</button>
+              <span id="workspaceValidateStatus" class="meta-text">ready</span>
+            </div>
+          </form>
+          <pre id="workspaceValidateResult" class="code-block"></pre>
+
+          <div class="panel-head">
+            <h3>Plan</h3>
+          </div>
+          <form id="workspacePlanForm" class="stack-form">
+            <input id="workspacePlanPath" placeholder="workspace path (local filesystem)" required />
+            <div class="row-actions">
+              <button type="submit">Build Plan</button>
+              <span id="workspacePlanStatus" class="meta-text">ready</span>
+            </div>
+          </form>
+          <pre id="workspacePlanResult" class="code-block"></pre>
+
+          <div class="panel-head">
+            <h3>Diff</h3>
+          </div>
+          <form id="workspaceDiffForm" class="stack-form">
+            <div class="compact-form">
+              <input id="workspaceDiffSource" placeholder="source path" required />
+              <input id="workspaceDiffTarget" placeholder="target path" required />
+            </div>
+            <div class="row-actions">
+              <button type="submit">Diff</button>
+              <span id="workspaceDiffStatus" class="meta-text">ready</span>
+            </div>
+          </form>
+          <pre id="workspaceDiffResult" class="code-block"></pre>
+
+          <div class="panel-head">
+            <h3>Apply</h3>
+            <span class="meta-text">dryRun defaults to on — nothing is written to target unless you uncheck it.</span>
+          </div>
+          <form id="workspaceApplyForm" class="stack-form">
+            <div class="compact-form">
+              <input id="workspaceApplySource" placeholder="source path" required />
+              <input id="workspaceApplyTarget" placeholder="target path" required />
+            </div>
+            <div class="compact-form">
+              <label class="meta-text"><input type="checkbox" id="workspaceApplyDryRun" checked /> dryRun</label>
+              <label class="meta-text"><input type="checkbox" id="workspaceApplyDeleteMissing" /> deleteMissing</label>
+              <input id="workspaceApplyConfirmDelete" placeholder="confirmDelete (type DELETE to confirm mutating deletes)" />
+            </div>
+            <div class="row-actions">
+              <button type="submit">Apply</button>
+              <span id="workspaceApplyStatus" class="meta-text">ready</span>
+            </div>
+          </form>
+          <pre id="workspaceApplyResult" class="code-block"></pre>
+        </article>
+
         <article class="panel panel-wide" id="capabilities-view">
           <div class="panel-head">
             <h3>Capabilities JSON</h3>
@@ -491,6 +559,6 @@
     </section>
   </main>
 
-  <script src="/web/app.js?v=23" type="module"></script>
+  <script src="/web/app.js?v=24" type="module"></script>
 </body>
 </html>
