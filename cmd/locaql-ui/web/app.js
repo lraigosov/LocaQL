@@ -75,6 +75,18 @@ const loadJobResult = document.getElementById("loadJobResult");
 const extractJobForm = document.getElementById("extractJobForm");
 const extractJobStatus = document.getElementById("extractJobStatus");
 const extractJobResult = document.getElementById("extractJobResult");
+const workspaceValidateForm = document.getElementById("workspaceValidateForm");
+const workspaceValidateStatus = document.getElementById("workspaceValidateStatus");
+const workspaceValidateResult = document.getElementById("workspaceValidateResult");
+const workspacePlanForm = document.getElementById("workspacePlanForm");
+const workspacePlanStatus = document.getElementById("workspacePlanStatus");
+const workspacePlanResult = document.getElementById("workspacePlanResult");
+const workspaceDiffForm = document.getElementById("workspaceDiffForm");
+const workspaceDiffStatus = document.getElementById("workspaceDiffStatus");
+const workspaceDiffResult = document.getElementById("workspaceDiffResult");
+const workspaceApplyForm = document.getElementById("workspaceApplyForm");
+const workspaceApplyStatus = document.getElementById("workspaceApplyStatus");
+const workspaceApplyResult = document.getElementById("workspaceApplyResult");
 const datasetSummaryStatus = document.getElementById("datasetSummaryStatus");
 const datasetSummaryCapabilityNote = document.getElementById("datasetSummaryCapabilityNote");
 const datasetSummaryId = document.getElementById("datasetSummaryId");
@@ -1723,7 +1735,7 @@ function setActiveMainTab(targetId) {
   mainTabs.querySelectorAll(".tab").forEach((t) => t.classList.remove("active"));
   tab.classList.add("active");
 
-  ["query-workspace", "query-results-panel", "table-details-panel", "jobs-explorer", "details-section", "load-extract-workspace", "capabilities-view"].forEach((id) => {
+  ["query-workspace", "query-results-panel", "table-details-panel", "jobs-explorer", "details-section", "load-extract-workspace", "workspace-portability", "capabilities-view"].forEach((id) => {
     const section = document.getElementById(id);
     if (!section) {
       return;
@@ -2361,6 +2373,98 @@ if (extractJobForm) {
     } catch (err) {
       if (extractJobStatus) extractJobStatus.textContent = "submit failed";
       alert(`Extract job failed: ${err.message}`);
+    }
+  });
+}
+
+if (workspaceValidateForm) {
+  workspaceValidateForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const path = document.getElementById("workspaceValidatePath").value.trim();
+    if (!path) return;
+    if (workspaceValidateStatus) workspaceValidateStatus.textContent = "validating...";
+    try {
+      const res = await fetchJson("/api/_emulator/workspace/validate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path }),
+      });
+      if (workspaceValidateResult) workspaceValidateResult.textContent = JSON.stringify(res, null, 2);
+      if (workspaceValidateStatus) workspaceValidateStatus.textContent = res.valid ? "valid" : "invalid — see missingRequired";
+    } catch (err) {
+      if (workspaceValidateStatus) workspaceValidateStatus.textContent = "validate failed";
+      alert(`Workspace validate failed: ${err.message}`);
+    }
+  });
+}
+
+if (workspacePlanForm) {
+  workspacePlanForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const path = document.getElementById("workspacePlanPath").value.trim();
+    if (!path) return;
+    if (workspacePlanStatus) workspacePlanStatus.textContent = "planning...";
+    try {
+      const res = await fetchJson("/api/_emulator/workspace/plan", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path }),
+      });
+      if (workspacePlanResult) workspacePlanResult.textContent = JSON.stringify(res, null, 2);
+      if (workspacePlanStatus) workspacePlanStatus.textContent = `${(res.files || []).length} file(s) tracked`;
+    } catch (err) {
+      if (workspacePlanStatus) workspacePlanStatus.textContent = "plan failed";
+      alert(`Workspace plan failed: ${err.message}`);
+    }
+  });
+}
+
+if (workspaceDiffForm) {
+  workspaceDiffForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const source = document.getElementById("workspaceDiffSource").value.trim();
+    const target = document.getElementById("workspaceDiffTarget").value.trim();
+    if (!source || !target) return;
+    if (workspaceDiffStatus) workspaceDiffStatus.textContent = "diffing...";
+    try {
+      const res = await fetchJson("/api/_emulator/workspace/diff", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ source, target }),
+      });
+      if (workspaceDiffResult) workspaceDiffResult.textContent = JSON.stringify(res, null, 2);
+      if (workspaceDiffStatus) {
+        workspaceDiffStatus.textContent = `${(res.onlyInSource || []).length} only-in-source, ${(res.onlyInTarget || []).length} only-in-target, ${(res.changed || []).length} changed`;
+      }
+    } catch (err) {
+      if (workspaceDiffStatus) workspaceDiffStatus.textContent = "diff failed";
+      alert(`Workspace diff failed: ${err.message}`);
+    }
+  });
+}
+
+if (workspaceApplyForm) {
+  workspaceApplyForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const source = document.getElementById("workspaceApplySource").value.trim();
+    const target = document.getElementById("workspaceApplyTarget").value.trim();
+    if (!source || !target) return;
+    const dryRun = document.getElementById("workspaceApplyDryRun").checked;
+    const deleteMissing = document.getElementById("workspaceApplyDeleteMissing").checked;
+    const confirmDelete = document.getElementById("workspaceApplyConfirmDelete").value.trim();
+
+    if (workspaceApplyStatus) workspaceApplyStatus.textContent = "applying...";
+    try {
+      const res = await fetchJson("/api/_emulator/workspace/apply", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ source, target, dryRun, deleteMissing, confirmDelete }),
+      });
+      if (workspaceApplyResult) workspaceApplyResult.textContent = JSON.stringify(res, null, 2);
+      if (workspaceApplyStatus) workspaceApplyStatus.textContent = res.applied ? "applied" : `dry run — ${(res.actions || []).length} action(s) planned`;
+    } catch (err) {
+      if (workspaceApplyStatus) workspaceApplyStatus.textContent = "apply failed";
+      alert(`Workspace apply failed: ${err.message}`);
     }
   });
 }

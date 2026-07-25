@@ -633,6 +633,46 @@ func (s *Server) insertTable(w http.ResponseWriter, r *http.Request, projectID, 
 		}
 	}
 
+	var view *viewConfig
+	rawView, hasView := raw["view"].(map[string]any)
+	rawMatView, hasMatView := raw["materializedView"].(map[string]any)
+	if hasView || hasMatView {
+		if hasView && hasMatView {
+			writeError(w, http.StatusBadRequest, "a table cannot have both view and materializedView", "invalid")
+			return
+		}
+		if external != nil {
+			writeError(w, http.StatusBadRequest, "a table cannot have both externalDataConfiguration and view/materializedView", "invalid")
+			return
+		}
+		target := rawView
+		materialized := false
+		if hasMatView {
+			target = rawMatView
+			materialized = true
+		}
+		query, _ := target["query"].(string)
+		query = strings.TrimSpace(query)
+		if query == "" {
+			writeError(w, http.StatusBadRequest, "view.query (or materializedView.query) is required", "required")
+			return
+		}
+		// Derive the schema by actually running the query once, the same way
+		// real BigQuery validates a view's SQL and infers its schema at
+		// creation time rather than accepting an unverifiable definition.
+		derivedSchema, _, err := s.executeRealSQLQuery(projectID, query)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid view query: %s", err.Error()), "invalid")
+			return
+		}
+		schema = derivedSchema
+		view = &viewConfig{Query: query, Materialized: materialized}
+	}
+
+	if external == nil && view == nil {
+		schema = parseTableSchemaFields(raw["schema"])
+	}
+
 	// An explicit expirationTime overrides the dataset's defaultTableExpirationMs
 	// (a duration relative to creation), matching real BigQuery precedence.
 	var expirationTime time.Time
@@ -656,6 +696,7 @@ func (s *Server) insertTable(w http.ResponseWriter, r *http.Request, projectID, 
 		Labels:         labels,
 		Schema:         schema,
 		External:       external,
+		View:           view,
 		ExpirationTime: expirationTime,
 	})
 	if !created {
@@ -742,8 +783,22 @@ func (s *Server) patchTable(w http.ResponseWriter, r *http.Request, projectID, d
 		patch.HasExpirationTime = true
 		patch.ExpirationTime = et
 	}
+	if _, ok := raw["schema"]; ok {
+		newSchema := parseTableSchemaFields(raw["schema"])
+		current, exists, _ := s.tables.get(projectID, datasetID, tableID)
+		if !exists {
+			writeError(w, http.StatusNotFound, fmt.Sprintf("Not found: Table %s:%s.%s", projectID, datasetID, tableID), "notFound")
+			return
+		}
+		if err := validateSchemaEvolution(current.Schema, newSchema); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error(), "invalid")
+			return
+		}
+		patch.HasSchema = true
+		patch.Schema = newSchema
+	}
 
-	if !patch.HasFriendlyName && !patch.HasDescription && !patch.HasLabels && !patch.HasExpirationTime {
+	if !patch.HasFriendlyName && !patch.HasDescription && !patch.HasLabels && !patch.HasExpirationTime && !patch.HasSchema {
 		writeError(w, http.StatusBadRequest, "at least one patchable field is required", "required")
 		return
 	}
@@ -898,11 +953,18 @@ func renderTableResource(t *tableRecord) map[string]any {
 			external["skipLeadingRows"] = t.External.SkipLeadingRows
 		}
 		resp["externalDataConfiguration"] = external
+	} else if t.View != nil && t.View.Materialized {
+		resp["type"] = "MATERIALIZED_VIEW"
+		resp["materializedView"] = map[string]any{"query": t.View.Query}
+	} else if t.View != nil {
+		resp["type"] = "VIEW"
+		resp["view"] = map[string]any{"query": t.View.Query}
 	} else {
 		resp["type"] = "TABLE"
 	}
 	return resp
 }
+
 
 type externalDataConfigParsed struct {
 	SourceURIs      []string
@@ -1273,15 +1335,7 @@ func (s *Server) writeQueryResults(w http.ResponseWriter, r *http.Request, proje
 		return
 	}
 	end := clampEnd(start, size, len(values))
-
-	rows := make([]map[string]any, 0, end-start)
-	for _, raw := range values[start:end] {
-		cells := make([]map[string]string, 0, len(raw))
-		for _, value := range raw {
-			cells = append(cells, map[string]string{"v": value})
-		}
-		rows = append(rows, map[string]any{"f": cells})
-	}
+	rows := renderRESTRows(schema, values[start:end])
 
 	resp := map[string]any{
 		"kind": kind,
@@ -1290,7 +1344,7 @@ func (s *Server) writeQueryResults(w http.ResponseWriter, r *http.Request, proje
 			"jobId":     jobID,
 		},
 		"schema": map[string]any{
-			"fields": schema,
+			"fields": renderTableSchemaFields(schema),
 		},
 		"rows":           rows,
 		"totalRows":      strconv.Itoa(len(values)),
@@ -1306,57 +1360,33 @@ func (s *Server) writeQueryResults(w http.ResponseWriter, r *http.Request, proje
 	writeJSON(w, http.StatusOK, resp)
 }
 
-func (s *Server) simulateQueryResultTable(projectID, queryText, callingUserEmail string) ([]map[string]string, [][]string, error) {
+func (s *Server) simulateQueryResultTable(projectID, queryText, callingUserEmail string) ([]tableField, [][]string, error) {
 	trimmed := strings.TrimSpace(queryText)
 	if trimmed == "" {
-		return []map[string]string{{"name": "result", "type": "STRING"}}, [][]string{{"query job executed"}}, nil
+		return []tableField{{Name: "result", Type: "STRING"}}, [][]string{{"query job executed"}}, nil
 	}
 
 	lower := strings.ToLower(trimmed)
 	if schema, rows, ok := s.simulateInformationSchemaQuery(projectID, trimmed, lower, callingUserEmail); ok {
-		return schema, rows, nil
+		return flatSchemaToTableFields(schema), rows, nil
 	}
-	if schema, rows, ok, err := s.simulateTableSelectQuery(projectID, trimmed); ok {
-		return schema, rows, err
-	}
-	if strings.HasPrefix(lower, "select") && !strings.Contains(lower, " from ") {
-		expr := strings.TrimSpace(trimmed[len("select"):])
-		if expr == "" {
-			return []map[string]string{{"name": "result", "type": "STRING"}}, [][]string{{"empty select"}}, nil
-		}
-		parts := strings.Split(expr, ",")
-		schema := make([]map[string]string, 0, len(parts))
-		row := make([]string, 0, len(parts))
-		for idx, p := range parts {
-			part := strings.TrimSpace(p)
-			name := fmt.Sprintf("col_%d", idx+1)
-			value := part
-			if asIdx := strings.LastIndex(strings.ToLower(part), " as "); asIdx >= 0 {
-				value = strings.TrimSpace(part[:asIdx])
-				alias := strings.TrimSpace(part[asIdx+4:])
-				if alias != "" {
-					name = strings.Trim(alias, "`")
-				}
-			}
-			value = strings.Trim(value, "'\"")
-			schema = append(schema, map[string]string{"name": name, "type": "STRING"})
-			row = append(row, value)
-		}
-		return schema, [][]string{row}, nil
-	}
+	return s.executeRealSQLQuery(projectID, trimmed)
+}
 
-	return []map[string]string{
-			{"name": "row_num", "type": "INT64"},
-			{"name": "preview", "type": "STRING"},
-		}, [][]string{
-			{"1", "Simulated query result row"},
-			{"2", "Add SQL engine integration for full fidelity"},
-			{"3", "Current mode returns deterministic preview"},
-		}, nil
+// flatSchemaToTableFields converts an INFORMATION_SCHEMA builder's flat
+// {name,type} schema (LocaQL's own synthetic metadata tables — never
+// nested) into tableField, the single schema type simulateQueryResultTable
+// now returns regardless of which path produced it.
+func flatSchemaToTableFields(schema []map[string]string) []tableField {
+	fields := make([]tableField, len(schema))
+	for i, f := range schema {
+		fields[i] = tableField{Name: f["name"], Type: f["type"]}
+	}
+	return fields
 }
 
 func (s *Server) listTableData(w http.ResponseWriter, r *http.Request, projectID, datasetID, tableID string) {
-	_, rawRows, ok, err := s.resolveTableRows(projectID, datasetID, tableID)
+	schema, rawRows, ok, err := s.resolveTableRows(projectID, datasetID, tableID)
 	if !ok {
 		writeError(w, http.StatusNotFound, fmt.Sprintf("Not found: Table %s:%s.%s", projectID, datasetID, tableID), "notFound")
 		return
@@ -1378,14 +1408,11 @@ func (s *Server) listTableData(w http.ResponseWriter, r *http.Request, projectID
 	}
 	end := clampEnd(start, size, len(rows))
 
-	out := make([]map[string]any, 0, end-start)
+	values := make([][]string, 0, end-start)
 	for _, row := range rows[start:end] {
-		cells := make([]map[string]string, 0, len(row.Values))
-		for _, v := range row.Values {
-			cells = append(cells, map[string]string{"v": v})
-		}
-		out = append(out, map[string]any{"f": cells})
+		values = append(values, row.Values)
 	}
+	out := renderRESTRows(schema, values)
 
 	resp := map[string]any{
 		"kind":           "bigquery#tableDataList",
@@ -1405,12 +1432,94 @@ func (s *Server) listTableData(w http.ResponseWriter, r *http.Request, projectID
 	writeJSON(w, http.StatusOK, resp)
 }
 
-func renderTableSchemaFields(fields []tableField) []map[string]string {
-	out := make([]map[string]string, 0, len(fields))
+// renderTableSchemaFields renders a schema for the REST API, recursively:
+// a RECORD/STRUCT field's own nested Fields become a "fields" array, and
+// mode defaults to "NULLABLE" (BigQuery's own default) when unset, matching
+// real BigQuery's schema JSON shape rather than the flat {name,type} pairs
+// this emulator used before nested schemas existed.
+func renderTableSchemaFields(fields []tableField) []map[string]any {
+	out := make([]map[string]any, 0, len(fields))
 	for _, field := range fields {
-		out = append(out, map[string]string{"name": field.Name, "type": field.Type})
+		mode := field.Mode
+		if mode == "" {
+			mode = "NULLABLE"
+		}
+		entry := map[string]any{"name": field.Name, "type": field.Type, "mode": mode}
+		if isRecordType(field.Type) && len(field.Fields) > 0 {
+			entry["fields"] = renderTableSchemaFields(field.Fields)
+		}
+		out = append(out, entry)
 	}
 	return out
+}
+
+// renderRESTRows converts stored rows into BigQuery's REST row shape
+// ({"f": [{"v": ...}, ...]}), one call site shared by tabledata.list and
+// query results.
+func renderRESTRows(schema []tableField, rows [][]string) []map[string]any {
+	out := make([]map[string]any, 0, len(rows))
+	for _, row := range rows {
+		cells := make([]map[string]any, len(schema))
+		for i, field := range schema {
+			var raw string
+			if i < len(row) {
+				raw = row[i]
+			}
+			cells[i] = map[string]any{"v": renderCellForREST(field, raw)}
+		}
+		out = append(out, map[string]any{"f": cells})
+	}
+	return out
+}
+
+// renderCellForREST converts one stored cell (BigQuery REST convention: a
+// plain string for scalars; a canonical JSON object/array for RECORD/
+// REPEATED, per the storage convention established in sql_engine.go) into
+// BigQuery's actual REST value shape: unchanged for scalars, a nested
+// {"f": [{"v": ...}, ...]} row for RECORD (ordered by field.Fields), or
+// [{"v": ...}, ...] of single rendered values for REPEATED. A stored value
+// that fails to parse as the expected JSON shape falls back to the raw
+// string rather than failing the whole response.
+func renderCellForREST(field tableField, raw string) any {
+	if raw == "" {
+		return raw
+	}
+	if field.Mode == "REPEATED" {
+		var decoded []any
+		if err := json.Unmarshal([]byte(raw), &decoded); err != nil {
+			return raw
+		}
+		base := field
+		base.Mode = ""
+		out := make([]map[string]any, len(decoded))
+		for i, elem := range decoded {
+			out[i] = map[string]any{"v": renderDecodedCellForREST(base, elem)}
+		}
+		return out
+	}
+	if isRecordType(field.Type) {
+		var decoded map[string]any
+		if err := json.Unmarshal([]byte(raw), &decoded); err != nil {
+			return raw
+		}
+		return renderDecodedCellForREST(field, decoded)
+	}
+	return raw
+}
+
+// renderDecodedCellForREST is renderCellForREST's counterpart for a value
+// that has already been json.Unmarshal-decoded (used for elements inside a
+// REPEATED array, which have no separate raw string of their own).
+func renderDecodedCellForREST(field tableField, decoded any) any {
+	if isRecordType(field.Type) {
+		obj, _ := decoded.(map[string]any)
+		cells := make([]map[string]any, len(field.Fields))
+		for i, sub := range field.Fields {
+			cells[i] = map[string]any{"v": renderDecodedCellForREST(sub, obj[sub.Name])}
+		}
+		return map[string]any{"f": cells}
+	}
+	return scalarValueToString(decoded)
 }
 
 func extractTableRef(v any, defaultProjectID string) tableReference {
@@ -1537,6 +1646,46 @@ func extractStringList(v any) []string {
 	return out
 }
 
+// validateSchemaEvolution allows exactly the schema changes real BigQuery
+// allows for an existing table via tables.patch: adding new columns
+// (which must be NULLABLE, since existing rows have no value for them) and
+// relaxing an existing column's mode from REQUIRED to NULLABLE. Removing a
+// column, renaming or reordering one, changing its type, or tightening its
+// mode are all rejected explicitly rather than silently applied or ignored.
+func validateSchemaEvolution(oldSchema, newSchema []tableField) error {
+	if len(newSchema) < len(oldSchema) {
+		return fmt.Errorf("schema evolution cannot remove existing columns")
+	}
+	for i, oldField := range oldSchema {
+		newField := newSchema[i]
+		if !strings.EqualFold(oldField.Name, newField.Name) {
+			return fmt.Errorf("column %d: existing columns cannot be renamed or reordered (expected %q, got %q)", i, oldField.Name, newField.Name)
+		}
+		if !strings.EqualFold(oldField.Type, newField.Type) {
+			return fmt.Errorf("column %q: changing type from %q to %q is not supported", oldField.Name, oldField.Type, newField.Type)
+		}
+		oldMode := normalizeMode(oldField.Mode)
+		newMode := normalizeMode(newField.Mode)
+		if oldMode != newMode && !(oldMode == "REQUIRED" && newMode == "NULLABLE") {
+			return fmt.Errorf("column %q: only relaxing REQUIRED to NULLABLE is supported (got %s -> %s)", oldField.Name, oldMode, newMode)
+		}
+	}
+	for i := len(oldSchema); i < len(newSchema); i++ {
+		newField := newSchema[i]
+		if normalizeMode(newField.Mode) != "NULLABLE" {
+			return fmt.Errorf("column %q: new columns must be NULLABLE", newField.Name)
+		}
+	}
+	return nil
+}
+
+func normalizeMode(mode string) string {
+	if mode == "" {
+		return "NULLABLE"
+	}
+	return mode
+}
+
 func parseTableSchemaFields(v any) []tableField {
 	obj, ok := v.(map[string]any)
 	if !ok {
@@ -1546,6 +1695,14 @@ func parseTableSchemaFields(v any) []tableField {
 	if !ok {
 		return nil
 	}
+	return parseTableSchemaFieldList(rawFields)
+}
+
+// parseTableSchemaFieldList parses a JSON fields array recursively: a
+// RECORD/STRUCT field's own nested "fields" array is parsed the same way,
+// and "mode" (NULLABLE/REQUIRED/REPEATED) is read alongside name/type,
+// defaulting to NULLABLE (BigQuery's own default) when absent.
+func parseTableSchemaFieldList(rawFields []any) []tableField {
 	out := make([]tableField, 0, len(rawFields))
 	for _, raw := range rawFields {
 		fieldObj, ok := raw.(map[string]any)
@@ -1562,7 +1719,15 @@ func parseTableSchemaFields(v any) []tableField {
 		if typ == "" {
 			typ = "STRING"
 		}
-		out = append(out, tableField{Name: name, Type: typ})
+		mode, _ := fieldObj["mode"].(string)
+		mode = strings.ToUpper(strings.TrimSpace(mode))
+		field := tableField{Name: name, Type: typ, Mode: mode}
+		if isRecordType(typ) {
+			if nestedRaw, ok := fieldObj["fields"].([]any); ok {
+				field.Fields = parseTableSchemaFieldList(nestedRaw)
+			}
+		}
+		out = append(out, field)
 	}
 	if len(out) == 0 {
 		return nil
@@ -1570,39 +1735,7 @@ func parseTableSchemaFields(v any) []tableField {
 	return out
 }
 
-var fromTablePattern = regexp.MustCompile("(?is)\\bfrom\\s+`?([a-zA-Z0-9_\\-\\.]+)`?")
-var informationSchemaPattern = regexp.MustCompile("(?is)(?:`?([a-zA-Z0-9_\\-]+)`?\\.)?(?:`?([a-zA-Z0-9_\\-]+)`?\\.)?information_schema\\.(schemata_options|schemata|table_options|tables|columns|jobs_by_project|jobs_by_user|jobs|partitions|routines|parameters|models|views)")
-
-// simulateTableSelectQuery's bool return means "this looked like a table
-// scan" (a FROM clause matched a real table), independent of whether the read
-// succeeded. Callers must check err whenever ok is true: ok=true/err!=nil
-// means the table exists (likely external) but its data could not be read,
-// and must propagate as a query failure rather than falling through to the
-// generic preview simulation below in simulateQueryResultTable.
-func (s *Server) simulateTableSelectQuery(projectID, queryText string) ([]map[string]string, [][]string, bool, error) {
-	matches := fromTablePattern.FindStringSubmatch(queryText)
-	if len(matches) < 2 {
-		return nil, nil, false, nil
-	}
-	parts := strings.Split(strings.TrimSpace(matches[1]), ".")
-	ref := tableReference{ProjectID: projectID}
-	switch len(parts) {
-	case 3:
-		ref.ProjectID, ref.DatasetID, ref.TableID = parts[0], parts[1], parts[2]
-	case 2:
-		ref.DatasetID, ref.TableID = parts[0], parts[1]
-	default:
-		return nil, nil, false, nil
-	}
-	fields, rows, ok, err := s.resolveTableRows(ref.ProjectID, ref.DatasetID, ref.TableID)
-	if !ok {
-		return nil, nil, false, nil
-	}
-	if err != nil {
-		return nil, nil, true, err
-	}
-	return renderTableSchemaFields(fields), rows, true, nil
-}
+var informationSchemaPattern = regexp.MustCompile("(?is)(?:`?([a-zA-Z0-9_\\-]+)`?\\.)?(?:`?([a-zA-Z0-9_\\-]+)`?\\.)?information_schema\\.(schemata_options|schemata|table_options|tables|columns|jobs_by_project|jobs_by_user|jobs|partitions|routines|parameters|models|materialized_views|views)")
 
 func (s *Server) simulateInformationSchemaQuery(projectID, queryText, lower, callingUserEmail string) ([]map[string]string, [][]string, bool) {
 	if !strings.Contains(lower, "information_schema.") {
@@ -1692,8 +1825,9 @@ var informationSchemaBuilders = map[string]informationSchemaBuilder{
 	"routines":         buildInformationSchemaRoutines,
 	"parameters":       buildInformationSchemaParameters,
 	"models":           buildInformationSchemaModels,
-	"table_options":    buildInformationSchemaTableOptions,
-	"views":            buildInformationSchemaViews,
+	"table_options":      buildInformationSchemaTableOptions,
+	"views":              buildInformationSchemaViews,
+	"materialized_views": buildInformationSchemaMaterializedViews,
 }
 
 func buildInformationSchemaSchemata(scope informationSchemaScope) ([]map[string]string, [][]string) {
@@ -1730,8 +1864,13 @@ func buildInformationSchemaTables(scope informationSchemaScope) ([]map[string]st
 	rows := [][]string{}
 	scope.forEachTable(func(datasetID string, table *tableRecord) {
 		tableType := "BASE TABLE"
-		if table.External != nil {
+		switch {
+		case table.External != nil:
 			tableType = "EXTERNAL"
+		case table.View != nil && table.View.Materialized:
+			tableType = "MATERIALIZED VIEW"
+		case table.View != nil:
+			tableType = "VIEW"
 		}
 		rows = append(rows, []string{scope.targetProjectID, datasetID, table.TableID, tableType})
 	})
@@ -1873,12 +2012,26 @@ func buildInformationSchemaTableOptions(scope informationSchemaScope) ([]map[str
 	return []map[string]string{{"name": "table_catalog", "type": "STRING"}, {"name": "table_schema", "type": "STRING"}, {"name": "table_name", "type": "STRING"}, {"name": "option_name", "type": "STRING"}, {"name": "option_type", "type": "STRING"}, {"name": "option_value", "type": "STRING"}}, rows
 }
 
-// buildInformationSchemaViews always returns zero rows: views are not a real
-// resource in the local catalog yet (only tables exist), so this exposes a
-// structurally correct empty result rather than fabricating view rows that
-// don't correspond to anything real.
-func buildInformationSchemaViews(informationSchemaScope) ([]map[string]string, [][]string) {
-	return []map[string]string{{"name": "table_catalog", "type": "STRING"}, {"name": "table_schema", "type": "STRING"}, {"name": "table_name", "type": "STRING"}, {"name": "view_definition", "type": "STRING"}, {"name": "use_standard_sql", "type": "STRING"}}, [][]string{}
+func buildInformationSchemaViews(scope informationSchemaScope) ([]map[string]string, [][]string) {
+	rows := [][]string{}
+	scope.forEachTable(func(datasetID string, table *tableRecord) {
+		if table.View == nil || table.View.Materialized {
+			return
+		}
+		rows = append(rows, []string{scope.targetProjectID, datasetID, table.TableID, table.View.Query, "true"})
+	})
+	return []map[string]string{{"name": "table_catalog", "type": "STRING"}, {"name": "table_schema", "type": "STRING"}, {"name": "table_name", "type": "STRING"}, {"name": "view_definition", "type": "STRING"}, {"name": "use_standard_sql", "type": "STRING"}}, rows
+}
+
+func buildInformationSchemaMaterializedViews(scope informationSchemaScope) ([]map[string]string, [][]string) {
+	rows := [][]string{}
+	scope.forEachTable(func(datasetID string, table *tableRecord) {
+		if table.View == nil || !table.View.Materialized {
+			return
+		}
+		rows = append(rows, []string{scope.targetProjectID, datasetID, table.TableID, table.View.Query})
+	})
+	return []map[string]string{{"name": "table_catalog", "type": "STRING"}, {"name": "table_schema", "type": "STRING"}, {"name": "table_name", "type": "STRING"}, {"name": "view_definition", "type": "STRING"}}, rows
 }
 
 // executeQueryJob resolves the query against the live in-memory catalog (the
@@ -2239,11 +2392,15 @@ func encodeNDJSON(schema []tableField, rows [][]string) ([]byte, error) {
 	for _, row := range rows {
 		record := make(map[string]any, len(schema))
 		for i, field := range schema {
-			if i >= len(row) {
+			if i >= len(row) || row[i] == "" {
 				record[field.Name] = nil
 				continue
 			}
-			record[field.Name] = stringToJSONValue(row[i], field.Type)
+			v, err := stringToJSONValue(row[i], field)
+			if err != nil {
+				return nil, fmt.Errorf("column %s: %w", field.Name, err)
+			}
+			record[field.Name] = v
 		}
 		encoded, err := json.Marshal(record)
 		if err != nil {
@@ -2255,7 +2412,24 @@ func encodeNDJSON(schema []tableField, rows [][]string) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// rejectNestedFields fails explicitly when schema declares a RECORD or
+// REPEATED field, for formats that don't support real nested/repeated
+// encode-decode yet (CSV never will, matching real BigQuery; Avro/Parquet
+// could in principle but that is deferred, declared here rather than
+// silently flattening or corrupting the data).
+func rejectNestedFields(format string, schema []tableField) error {
+	for _, field := range schema {
+		if field.Mode == "REPEATED" || isRecordType(field.Type) {
+			return fmt.Errorf("%s does not support RECORD/REPEATED schema fields yet (column %q); use NEWLINE_DELIMITED_JSON for nested data", format, field.Name)
+		}
+	}
+	return nil
+}
+
 func encodeCSV(schema []tableField, rows [][]string, fieldDelimiter string, printHeader bool) ([]byte, error) {
+	if err := rejectNestedFields("CSV", schema); err != nil {
+		return nil, err
+	}
 	var buf bytes.Buffer
 	writer := csv.NewWriter(&buf)
 	if delim := []rune(fieldDelimiter); len(delim) > 0 {
@@ -2283,24 +2457,34 @@ func encodeCSV(schema []tableField, rows [][]string, fieldDelimiter string, prin
 }
 
 // stringToJSONValue converts an internal string cell back to a typed JSON
-// value using the destination field type, so NDJSON extract round-trips
-// numbers and booleans instead of re-encoding everything as strings.
-func stringToJSONValue(v string, fieldType string) any {
-	switch strings.ToUpper(fieldType) {
+// value using the destination field, so NDJSON extract round-trips numbers
+// and booleans instead of re-encoding everything as strings. RECORD/
+// REPEATED cells are already stored as a canonical JSON object/array (see
+// sql_engine.go), so they are parsed and embedded as real nested JSON
+// rather than double-encoded as a JSON string.
+func stringToJSONValue(v string, field tableField) (any, error) {
+	if field.Mode == "REPEATED" || isRecordType(field.Type) {
+		var decoded any
+		if err := json.Unmarshal([]byte(v), &decoded); err != nil {
+			return nil, fmt.Errorf("invalid stored JSON for RECORD/REPEATED cell: %w", err)
+		}
+		return decoded, nil
+	}
+	switch strings.ToUpper(field.Type) {
 	case "INT64", "INTEGER":
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
-			return n
+			return n, nil
 		}
 	case "FLOAT64", "FLOAT":
 		if f, err := strconv.ParseFloat(v, 64); err == nil {
-			return f
+			return f, nil
 		}
 	case "BOOL", "BOOLEAN":
 		if b, err := strconv.ParseBool(v); err == nil {
-			return b
+			return b, nil
 		}
 	}
-	return v
+	return v, nil
 }
 
 // parseAvroRows reads an Avro Object Container File and projects each record
@@ -2308,6 +2492,9 @@ func stringToJSONValue(v string, fieldType string) any {
 // does not autodetect a BigQuery schema from the file's embedded Avro
 // schema; schema.fields is required just like NDJSON and CSV.
 func parseAvroRows(uri string, data []byte, schema []tableField) ([][]string, error) {
+	if err := rejectNestedFields("AVRO", schema); err != nil {
+		return nil, err
+	}
 	reader, err := goavro.NewOCFReader(bytes.NewReader(data))
 	if err != nil {
 		return nil, fmt.Errorf("invalid Avro OCF in sourceUri %q: %w", uri, err)
@@ -2337,12 +2524,17 @@ func parseAvroRows(uri string, data []byte, schema []tableField) ([][]string, er
 
 // encodeAvro writes rows as an Avro Object Container File using a record
 // schema derived from schema field names/types. Fields are encoded as
-// non-nullable scalars (no union/null branch): this codebase has no NULLABLE
-// vs REQUIRED mode tracking for any format yet, so Avro follows the same
-// bound as NDJSON/CSV rather than inventing null support only here. A row
-// value that fails to parse as its declared type falls back to that type's
-// zero value instead of failing the whole encode.
+// non-nullable scalars (no union/null branch): mode tracking (NULLABLE/
+// REQUIRED) exists in the schema now but Avro encode/decode doesn't observe
+// it yet, so Avro follows the same bound as CSV rather than inventing null
+// support only here. RECORD/REPEATED fields are rejected explicitly (see
+// rejectNestedFields) rather than attempted — real nested Avro schema/codec
+// support is deferred. A row value that fails to parse as its declared type
+// falls back to that type's zero value instead of failing the whole encode.
 func encodeAvro(schema []tableField, rows [][]string, codecName string) ([]byte, error) {
+	if err := rejectNestedFields("AVRO", schema); err != nil {
+		return nil, err
+	}
 	schemaJSON, err := buildAvroSchemaJSON(schema)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build Avro schema: %w", err)
@@ -2492,6 +2684,9 @@ func stringToParquetValue(v, fieldType string) any {
 // autodetect a BigQuery schema from the Parquet file's embedded schema;
 // schema.fields is required just like the other formats.
 func parseParquetRows(uri string, data []byte, schema []tableField) ([][]string, error) {
+	if err := rejectNestedFields("PARQUET", schema); err != nil {
+		return nil, err
+	}
 	parquetSchema := buildParquetSchema(schema)
 	reader := parquet.NewReader(bytes.NewReader(data), parquetSchema)
 	defer reader.Close()
@@ -2516,8 +2711,13 @@ func parseParquetRows(uri string, data []byte, schema []tableField) ([][]string,
 }
 
 // encodeParquet writes rows as a Parquet file using a schema derived from
-// schema field names/types.
+// schema field names/types. RECORD/REPEATED fields are rejected explicitly
+// (see rejectNestedFields) — real nested Parquet group/list support is
+// deferred rather than attempted.
 func encodeParquet(schema []tableField, rows [][]string, codec pqcompress.Codec) ([]byte, error) {
+	if err := rejectNestedFields("PARQUET", schema); err != nil {
+		return nil, err
+	}
 	parquetSchema := buildParquetSchema(schema)
 
 	var buf bytes.Buffer
@@ -2703,9 +2903,30 @@ func maybeGunzip(data []byte, compression string) ([]byte, error) {
 // ever set when ok is true and the table is external but its files could not
 // be read.
 func (s *Server) resolveTableRows(projectID, datasetID, tableID string) ([]tableField, [][]string, bool, error) {
+	return s.resolveTableRowsVisiting(projectID, datasetID, tableID, map[string]bool{})
+}
+
+// resolveTableRowsVisiting is resolveTableRows plus a visiting set threaded
+// through view resolution (a view's query is re-executed for real, which may
+// itself reference other views) so a view that directly or transitively
+// references itself fails with a clear error instead of recursing forever.
+func (s *Server) resolveTableRowsVisiting(projectID, datasetID, tableID string, visiting map[string]bool) ([]tableField, [][]string, bool, error) {
 	record, ok, _ := s.tables.get(projectID, datasetID, tableID)
 	if !ok {
 		return nil, nil, false, nil
+	}
+	if record.View != nil {
+		key := projectID + ":" + datasetID + "." + tableID
+		if visiting[key] {
+			return nil, nil, true, fmt.Errorf("circular view reference detected at %s.%s", datasetID, tableID)
+		}
+		visiting[key] = true
+		defer delete(visiting, key)
+		schema, rows, err := s.executeRealSQLQueryVisiting(projectID, record.View.Query, visiting)
+		if err != nil {
+			return nil, nil, true, fmt.Errorf("resolve view %s.%s: %w", datasetID, tableID, err)
+		}
+		return schema, rows, true, nil
 	}
 	if record.External == nil {
 		fields, rows, ok := s.tables.getData(projectID, datasetID, tableID)
@@ -2747,6 +2968,9 @@ func loadRowsAcrossURIs(uris []string, parse func(uri string, data []byte) ([][]
 // width must match len(schema) exactly; jagged rows fail closed rather than
 // being silently padded or truncated.
 func parseCSVRows(uri string, data []byte, schema []tableField, fieldDelimiter string, skipLeadingRows int) ([][]string, error) {
+	if err := rejectNestedFields("CSV", schema); err != nil {
+		return nil, err
+	}
 	reader := csv.NewReader(bytes.NewReader(data))
 	reader.FieldsPerRecord = -1
 	if delim := []rune(fieldDelimiter); len(delim) > 0 {

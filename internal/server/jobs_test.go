@@ -612,16 +612,35 @@ func runJobAndFetch(t *testing.T, s *Server, body string) map[string]any {
 	}
 	jobID := created["jobReference"].(map[string]any)["jobId"].(string)
 
-	time.Sleep(220 * time.Millisecond)
+	return pollJobUntilDone(t, s, jobID)
+}
 
-	jobReq := httptest.NewRequest(http.MethodGet, "/bigquery/v2/projects/p1/jobs/"+jobID, nil)
-	jobRes := httptest.NewRecorder()
-	s.Handler().ServeHTTP(jobRes, jobReq)
+// pollJobUntilDone polls jobs.get until status.state is DONE, rather than
+// sleeping a fixed duration: a fixed sleep is inherently racy against
+// anything that legitimately varies execution time between runs (load under
+// -race, a real SQL engine doing real work instead of a regex match, a slow
+// CI runner), and this project already hit that with the real SQL engine
+// (see sql_engine.go) taking measurably longer than the old simulation.
+func pollJobUntilDone(t *testing.T, s *Server, jobID string) map[string]any {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
 	var jobOut map[string]any
-	if err := json.NewDecoder(jobRes.Body).Decode(&jobOut); err != nil {
-		t.Fatalf("decode job: %v", err)
+	for {
+		jobReq := httptest.NewRequest(http.MethodGet, "/bigquery/v2/projects/p1/jobs/"+jobID, nil)
+		jobRes := httptest.NewRecorder()
+		s.Handler().ServeHTTP(jobRes, jobReq)
+		jobOut = map[string]any{}
+		if err := json.NewDecoder(jobRes.Body).Decode(&jobOut); err != nil {
+			t.Fatalf("decode job: %v", err)
+		}
+		if status, ok := jobOut["status"].(map[string]any); ok && status["state"] == "DONE" {
+			return jobOut
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("job %s did not reach DONE within timeout, last state: %v", jobID, jobOut["status"])
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	return jobOut
 }
 
 func TestLoadJobIngestsCSVSourceRows(t *testing.T) {
