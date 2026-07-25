@@ -15,16 +15,20 @@ This repository currently implements incremental scope from the master plan:
 - [Quick Start (WSL)](#quick-start-wsl)
 - [Capability Registry](#capability-registry)
 - [Current Scope Matrix](#current-scope-matrix)
+- [Known Divergences from Real BigQuery](#known-divergences-from-real-bigquery)
 - [Runtime Architecture](#runtime-architecture)
+- [Query Engine: Real GoogleSQL via an Embedded SQLite Backend](#query-engine-real-googlesql-via-an-embedded-sqlite-backend)
 - [Concurrency and Isolation Notes](#concurrency-and-isolation-notes)
 - [Job State Model](#job-state-model)
 - [Workspace Promotion Flow](#workspace-promotion-flow)
 - [Load Jobs: Real Row Ingestion (NDJSON / CSV / Avro / Parquet)](#load-jobs-real-row-ingestion-ndjson--csv--avro--parquet)
 - [Extract Jobs: Real Table Export (NDJSON / CSV / Avro / Parquet)](#extract-jobs-real-table-export-ndjson--csv--avro--parquet)
+- [Nested Schemas: STRUCT/RECORD and ARRAY/REPEATED](#nested-schemas-structrecord-and-arrayrepeated)
 - [Dataset Lifecycle: Delete Contents and Undelete](#dataset-lifecycle-delete-contents-and-undelete)
 - [Table Expiration: defaultTableExpirationMs Enforcement](#table-expiration-defaulttableexpirationms-enforcement)
 - [Routines and Models: Metadata CRUD](#routines-and-models-metadata-crud)
 - [External Tables: Query Local Files Without Loading](#external-tables-query-local-files-without-loading)
+- [Views and Materialized Views: Real Resources Backed by the Query Engine](#views-and-materialized-views-real-resources-backed-by-the-query-engine)
 - [Fake GCS: A Real Cloud Storage JSON API, Locally](#fake-gcs-a-real-cloud-storage-json-api-locally)
 - [Conformance Baseline](#conformance-baseline)
 - [Test](#test)
@@ -36,7 +40,7 @@ This repository currently implements incremental scope from the master plan:
 ## Requirements
 
 - WSL distribution: `Ubuntu-24.04`
-- Go 1.24.9+ (bumped from 1.22 to bring in `parquet-go/parquet-go` for real Parquet load/extract support; `GOTOOLCHAIN=auto`, the Go default, downloads it automatically)
+- Go 1.25.0+ (bumped from 1.22 for `parquet-go/parquet-go`, then to 1.25.0 for `goccy/googlesqlite`'s real GoogleSQL query engine; `GOTOOLCHAIN=auto`, the Go default, downloads it automatically)
 - For race tests: `build-essential` (provides `gcc` for cgo).
 
 ## Quick Start (WSL)
@@ -79,9 +83,11 @@ Registry file:
 | Opaque pagination tokens | Supported | `nextPageToken` is opaque; legacy numeric token input remains accepted |
 | Jobs lifecycle | Supported | `PENDING -> RUNNING -> DONE`, cancel before/during run |
 | requestId idempotency | Partial | Implemented for `jobs.insert` and `projects.queries` with TTL |
-| Job executors (query/load/extract/copy) | Partial | Query jobs report real `outputRows`/`processedBytes` from the resolved result (`totalSlotMs` stays synthetic by design); copy jobs create real destination table data; load jobs materialize destination schema and ingest real rows from `sourceUris` (`NEWLINE_DELIMITED_JSON`, `CSV`, `AVRO` or `PARQUET`, with optional `GZIP` decompression for CSV/NDJSON); extract jobs read a real source table and write `destinationUris` in the same four formats with optional `compression` (`GZIP` for CSV/NDJSON, `SNAPPY`/`DEFLATE` for Avro, `SNAPPY`/`GZIP` for Parquet), and split into multiple real shard files once `LOCAQL_EXTRACT_SHARD_MAX_BYTES` is set and exceeded (single shard by default). `sourceUris`/`destinationUris` are local paths by default; `gs://` resolves onto a local directory only when `LOCAQL_FAKE_GCS_ROOT` is set (multi-wildcard `destinationUris` and `ORC` are rejected explicitly) |
+| Job executors (query/load/extract/copy) | Partial | Query jobs execute real GoogleSQL — `WHERE`, projection, `JOIN`, aggregation, `ORDER BY`, `LIMIT` — via an embedded engine (see [Query Engine](#query-engine-real-googlesql-via-an-embedded-sqlite-backend)), reporting real `outputRows`/`processedBytes` (`totalSlotMs` stays synthetic by design); copy jobs create real destination table data; load jobs materialize destination schema and ingest real rows from `sourceUris` (`NEWLINE_DELIMITED_JSON`, `CSV`, `AVRO` or `PARQUET`, with optional `GZIP` decompression for CSV/NDJSON); extract jobs read a real source table and write `destinationUris` in the same four formats with optional `compression` (`GZIP` for CSV/NDJSON, `SNAPPY`/`DEFLATE` for Avro, `SNAPPY`/`GZIP` for Parquet), and split into multiple real shard files once `LOCAQL_EXTRACT_SHARD_MAX_BYTES` is set and exceeded (single shard by default). `sourceUris`/`destinationUris` are local paths by default; `gs://` resolves onto a local directory only when `LOCAQL_FAKE_GCS_ROOT` is set (multi-wildcard `destinationUris` and `ORC` are rejected explicitly) |
 | Routines and Models | Supported | `routines`/`models` `insert`/`get`/`list`/`patch`/`delete` are metadata-only (no SQL execution or ML training/inference backend exists; nothing is fabricated beyond stored fields) |
 | External tables | Partial | `tables.insert` accepts `externalDataConfiguration` (`NEWLINE_DELIMITED_JSON`/`CSV`/`AVRO`/`PARQUET`, explicit schema, no autodetect); `sourceUris` are read fresh from disk/fake-GCS on every query/`tabledata.list`/copy/extract access rather than materialized at creation. Patching `externalDataConfiguration`, autodetect, Hive partitioning and compression options are not supported |
+| Views and Materialized Views | Partial | `tables.insert` accepts `view.query`/`materializedView.query`, validated and schema-derived by executing the query through the real query engine at creation; every access re-executes the stored query live (see [Views and Materialized Views](#views-and-materialized-views-real-resources-backed-by-the-query-engine)). No patch-based redefinition; materialized views are not actually cached/refreshed |
+| Nested schemas and column evolution | Partial | `schema.fields` supports real `mode` (`NULLABLE`/`REQUIRED`/`REPEATED`) and nested `fields` (`RECORD`/`STRUCT`), rendered end-to-end with BigQuery's real nested REST shape; `tables.patch` can append `NULLABLE` columns and relax `REQUIRED`→`NULLABLE` (see [Nested Schemas](#nested-schemas-structrecord-and-arrayrepeated)). Real nested load/extract is `NEWLINE_DELIMITED_JSON`-only; `CSV`/`AVRO`/`PARQUET` reject nested fields explicitly |
 | Fake GCS JSON API | Partial | Buckets (insert/list/get) and objects (insert via media or multipart upload, get/download/list/delete) on the real endpoint paths, backed by `LOCAQL_FAKE_GCS_ROOT`; verified against `cloud.google.com/go/storage`. No resumable uploads, IAM, versioning, lifecycle rules, notifications, or signed URLs |
 | Job persistence across restart | Partial | Optional local file persistence |
 | Job concurrency limit | Partial | Controlled with `LOCAQL_JOB_WORKERS` |
@@ -89,14 +95,19 @@ Registry file:
 | Concurrent reads safety | Partial | `jobs.get` and `jobs.list` use read locks (`RWMutex`) |
 | Resource mutation serialization | Partial | Conflicting mutations serialized by `project:dataset.table` |
 | Catalog snapshot atomicity | Partial | Optional persisted state uses temp file replace to avoid partial commits |
-| INFORMATION_SCHEMA priority | Partial | `SCHEMATA`, `SCHEMATA_OPTIONS`, `TABLES`, `COLUMNS`, `TABLE_OPTIONS`, `JOBS`, `JOBS_BY_PROJECT`, `JOBS_BY_USER`, `PARTITIONS`, `ROUTINES`, `PARAMETERS` and `MODELS` are served from the in-memory catalog; `VIEWS` returns an empty but structurally correct result (views are not a real resource yet); `MATERIALIZED_VIEWS` and `SESSIONS` are not implemented |
+| INFORMATION_SCHEMA priority | Partial | `SCHEMATA`, `SCHEMATA_OPTIONS`, `TABLES`, `COLUMNS`, `TABLE_OPTIONS`, `JOBS`, `JOBS_BY_PROJECT`, `JOBS_BY_USER`, `PARTITIONS`, `ROUTINES`, `PARAMETERS`, `MODELS`, `VIEWS` and `MATERIALIZED_VIEWS` are served from the in-memory catalog; none support column projection yet (a `SELECT` with an explicit column list still returns every column). `SESSIONS` is not implemented |
 | Workspace validation | Supported | `locaql workspace validate` checks required portable workspace structure before promotion |
 | Workspace planning and diff | Supported | `locaql workspace plan` and `locaql workspace diff` provide portable inventory and deterministic source-target delta |
 | Workspace apply dry-run | Supported | `locaql workspace apply --dry-run=true` returns planned actions without mutating target |
 | Workspace apply mutate | Supported | `locaql workspace apply --dry-run=false` applies planned changes; deletes require explicit `--delete-missing=true --confirm-delete=DELETE` |
+| Workspace REST + console UI | Supported | The same validate/plan/diff/apply operations are reachable via `/_emulator/workspace/*` REST endpoints and a dedicated console **Workspace** tab (see [Workspace Promotion Flow](#workspace-promotion-flow)) — identical behavior to the CLI, verified end-to-end against a real headless-Chrome console |
 | IAM and policies | Unsupported | Deliberately out of scope for local emulator parity; treated as cloud control-plane concerns |
 | Standalone UI service | Supported | `cmd/locaql-ui` with dynamic capability-driven console and API proxy |
-| UI resource forms | Supported | Explorer can create/update/delete datasets (with `deleteContents` retry and Undelete), create tables (native and external) and edit basic table metadata, and create/select/delete real Routines and Models, all against emulator REST endpoints; a dedicated Load/Extract tab submits real load and extract jobs. All `console.ui.*` capabilities are verified by a headless-Chrome e2e suite (see [End-to-End Console Tests](#end-to-end-console-tests)), not just by reading the code |
+| UI resource forms | Supported | Explorer can create/update/delete datasets (with `deleteContents` retry and Undelete), create tables (native and external) and edit basic table metadata, and create/select/delete real Routines and Models, all against emulator REST endpoints; a dedicated Load/Extract tab submits real load and extract jobs, and a dedicated Workspace tab drives validate/plan/diff/apply. All `console.ui.*` capabilities are verified by a headless-Chrome e2e suite (see [End-to-End Console Tests](#end-to-end-console-tests)), not just by reading the code |
+
+## Known Divergences from Real BigQuery
+
+The matrix above says *whether* something is supported; it doesn't say how much a gap actually matters for a real workflow. [`KNOWN-DIVERGENCES.md`](KNOWN-DIVERGENCES.md) classifies every partial/unsupported capability (plus a couple of gaps found by reading the code directly, not yet reflected as their own registry entry) by severity — **Blocking** (silently wrong, no workaround), **Significant** (fails explicitly, workaround usually possible), **Minor** (narrow edge case), or **By design** (permanent non-goal). Read it before relying on this emulator for anything beyond the three query shapes and REST flows this README documents as real.
 
 ## Runtime Architecture
 
@@ -113,6 +124,37 @@ flowchart LR
 	JobService --> Persist[(Optional file persistence)]
 	JobService -->|"gs:// sourceUris / destinationUris"| FakeGCSRoot[(LOCAQL_FAKE_GCS_ROOT)]
 	GCSApi --> FakeGCSRoot
+```
+
+## Query Engine: Real GoogleSQL via an Embedded SQLite Backend
+
+`jobs.insert` (async query jobs), `jobs.query` (sync) and `projects.queries` execute query text against a real GoogleSQL engine: [`github.com/goccy/googlesqlite`](https://github.com/goccy/googlesqlite), a pure-Go `database/sql` driver (no cgo) that parses and analyzes GoogleSQL — the dialect BigQuery and Cloud Spanner use — and executes it against an in-memory SQLite backend. This replaced an earlier regex-based simulator that only matched a handful of query shapes and returned fabricated placeholder rows for anything else (see [`KNOWN-DIVERGENCES.md`](KNOWN-DIVERGENCES.md) for that history).
+
+For every query, LocaQL scans the query text for `FROM`/`JOIN` table references, materializes exactly those tables into a fresh in-memory engine instance (one SQL schema per dataset, real rows converted from LocaQL's stored string-per-cell representation into typed values), then runs the query for real. This means `WHERE`, column projection, `JOIN`, aggregate functions with `GROUP BY`, `ORDER BY` and `LIMIT` are genuine GoogleSQL semantics now, not simulated.
+
+Core scalar types execute with real GoogleSQL semantics too: `NUMERIC`/`BIGNUMERIC` are real decimal types in the engine (exact precision and arithmetic — `0.1 + 0.2` is exactly `0.3`, not `FLOAT64`'s binary rounding error), and `DATE`/`DATETIME`/`TIME`/`TIMESTAMP` round-trip unchanged through `tabledata.list` and compare correctly column-to-column through the engine. One exception, verified and **not fixable from LocaQL's side**: constructing a `DATE` from a string (`DATE 'YYYY-MM-DD'` literal syntax or `CAST(string AS DATE)`) is off by one day — a bug inside the query engine's own SQL analysis, not LocaQL's. See [`KNOWN-DIVERGENCES.md`](KNOWN-DIVERGENCES.md) (Blocking #2) for the full, precisely-reproduced detail and workarounds.
+
+```mermaid
+flowchart LR
+	Query["Query text (jobs.insert / jobs.query / projects.queries)"] --> Scan["Scan FROM/JOIN for dataset.table refs"]
+	Scan --> Materialize["Materialize each referenced table into a fresh in-memory engine"]
+	Materialize --> Engine["goccy/googlesqlite: real GoogleSQL parse + execute"]
+	Engine --> Convert["Convert results back to REST string-per-cell rows"]
+	Query -->|"INFORMATION_SCHEMA.X"| InfoSchema["Dedicated catalog builders (unaffected)"]
+```
+
+Known scope, declared explicitly:
+
+- A `project.dataset.table` reference only resolves when the leading component matches the request's own `projectID` (case-insensitive); the engine has no project-level concept, only one SQL schema per dataset. A genuine cross-project reference fails with "table not found" rather than silently resolving against the wrong project.
+- Nested `STRUCT`/`ARRAY` result columns execute correctly and get a real BigQuery-shaped `RECORD`/`REPEATED` schema entry and REST cell shape (see [Nested Schemas](#nested-schemas-structrecord-and-arrayrepeated)).
+- Only `SELECT` is routed through the real engine. `INSERT`/`UPDATE`/`DELETE`/`CREATE TABLE AS SELECT` issued as a query job's text are not wired to LocaQL's catalog — table mutation still goes exclusively through the existing REST job executors (load/copy/extract) and direct `tables`/`datasets` endpoints.
+- `INFORMATION_SCHEMA.X` queries are still handled by LocaQL's own dedicated builders (see the [Current Scope Matrix](#current-scope-matrix)), since those reflect LocaQL's catalog metadata rather than user table data.
+- `totalSlotMs` and dry-run byte estimates remain synthetic, as already declared — there is no query-plan/cost estimation.
+
+```bash
+curl -X POST http://localhost:9050/bigquery/v2/projects/p1/queries \
+  -H 'Content-Type: application/json' \
+  -d '{"query": "SELECT region, COUNT(*) AS n, SUM(amount) AS total FROM p1.analytics.orders WHERE amount > 10 GROUP BY region ORDER BY total DESC"}'
 ```
 
 ## Concurrency and Isolation Notes
@@ -137,7 +179,7 @@ stateDiagram-v2
 
 ## Workspace Promotion Flow
 
-The `locaql workspace` subcommands move a portable workspace from validation to a promoted target without mutating anything until `apply` runs explicitly.
+The `locaql workspace` subcommands move a portable workspace from validation to a promoted target without mutating anything until `apply` runs explicitly. The same four operations (`validate`, `plan`, `diff`, `apply`) are also reachable over REST and from the console's **Workspace** tab — both are thin wrappers around the identical `internal/workspace` package the CLI uses, so behavior (including the dry-run default and the delete-confirmation guard) is exactly the same regardless of which surface you use.
 
 ```mermaid
 flowchart LR
@@ -150,6 +192,25 @@ flowchart LR
 	Guard -->|no| Done[Target updated, deletes skipped]
 	Confirm --> Done
 ```
+
+### REST and Console UI
+
+Four LocaQL-only convenience endpoints, deliberately outside `/bigquery/v2/` since real BigQuery has no portable-workspace concept: paths resolve on the machine running the emulator process, the same convention already used for Load/Extract `sourceUris`/`destinationUris` — there is no file upload through the browser.
+
+| Endpoint | Body | Notes |
+|---|---|---|
+| `POST /_emulator/workspace/validate` | `{"path"}` | Returns `root`, `valid`, `found`, `missingRequired`, `missingRecommended`. |
+| `POST /_emulator/workspace/plan` | `{"path"}` | Returns the validation result plus the tracked-file inventory (`path`/`size`/`sha256`). |
+| `POST /_emulator/workspace/diff` | `{"source", "target"}` | `target` is required (400 otherwise). Returns `onlyInSource`, `onlyInTarget`, `changed`. |
+| `POST /_emulator/workspace/apply` | `{"source", "target", "dryRun", "deleteMissing", "confirmDelete"}` | `target` is required; `dryRun` defaults to `true` when omitted. A mutating (`dryRun: false`) request with `deleteMissing: true` is rejected with 400 unless `confirmDelete` is exactly `"DELETE"`. |
+
+```bash
+curl -X POST http://localhost:9050/_emulator/workspace/apply \
+  -H 'Content-Type: application/json' \
+  -d '{"source": "/path/to/workspace", "target": "/path/to/promoted", "dryRun": false}'
+```
+
+The console's **Workspace** tab exposes the same four operations as forms over these endpoints, rendering each response as JSON so the exact `actions`/`changed`/`missingRequired` shape is visible without leaving the browser.
 
 ## Load Jobs: Real Row Ingestion (NDJSON / CSV / Avro / Parquet)
 
@@ -228,6 +289,44 @@ curl -X POST http://localhost:9050/bigquery/v2/projects/p1/jobs \
     }
   }'
 ```
+
+## Nested Schemas: STRUCT/RECORD and ARRAY/REPEATED
+
+`schema.fields` supports real nested structure: `mode` (`NULLABLE`, the default; `REQUIRED`; or `REPEATED`) and, for a `RECORD`/`STRUCT` field, its own nested `fields` array, recursively. This is rendered end-to-end the way real BigQuery does it — `tables.get`/`tables.insert` responses, `INFORMATION_SCHEMA.COLUMNS`, `tabledata.list` and query results all reflect the real nested shape, not a flattened stand-in:
+
+- A `RECORD` cell renders as BigQuery's actual nested row shape: `{"v": {"f": [{"v": ...}, ...]}}`.
+- A `REPEATED` cell (scalar or `RECORD` base type) renders as `{"v": [{"v": ...}, ...]}`.
+
+```bash
+curl -X POST http://localhost:9050/bigquery/v2/projects/p1/jobs \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "configuration": {
+      "load": {
+        "destinationTable": {"projectId": "p1", "datasetId": "analytics", "tableId": "orders"},
+        "schema": {"fields": [
+          {"name": "order_id", "type": "INT64"},
+          {"name": "items", "type": "RECORD", "mode": "REPEATED", "fields": [
+            {"name": "sku", "type": "STRING"},
+            {"name": "qty", "type": "INT64"}
+          ]}
+        ]},
+        "sourceUris": ["/absolute/path/to/orders.ndjson"],
+        "sourceFormat": "NEWLINE_DELIMITED_JSON"
+      }
+    }
+  }'
+```
+
+The real [Query Engine](#query-engine-real-googlesql-via-an-embedded-sqlite-backend) materializes and returns nested columns for real (`CREATE TABLE` emits `STRUCT<...>`/`ARRAY<...>` column types), so `WHERE`/projection/`JOIN` work over a table with nested columns exactly as they do over a flat one.
+
+`tables.patch` can evolve a schema after creation: appending new columns (which must be `NULLABLE`, since existing rows have no value for them) and relaxing an existing column from `REQUIRED` to `NULLABLE` are supported; removing a column, renaming/reordering one, changing its type, or tightening `NULLABLE` to `REQUIRED` all fail explicitly with a `400` instead of being silently applied or ignored.
+
+Known limitations, declared explicitly:
+
+- `NEWLINE_DELIMITED_JSON` is the only format with real nested load/extract support — JSON is naturally recursive. `CSV`, `AVRO` and `PARQUET` reject a schema containing a `RECORD`/`REPEATED` field explicitly rather than silently flattening or corrupting it. `CSV` never will support this, matching real BigQuery; `AVRO`/`PARQUET` could in principle, but that is deferred.
+- A nested `RECORD` field's own sub-`fields` cannot be evolved via `tables.patch` once the table exists.
+- `timePartitioning`, `rangePartitioning` and `clustering` are unrelated top-level table settings — still not implemented (see [`KNOWN-DIVERGENCES.md`](KNOWN-DIVERGENCES.md)).
 
 ## Dataset Lifecycle: Delete Contents and Undelete
 
@@ -313,6 +412,36 @@ curl -X POST http://localhost:9050/bigquery/v2/projects/p1/datasets/analytics/ta
 ```
 
 Supported `sourceFormat` values are the same four covered by load/extract: `NEWLINE_DELIMITED_JSON`, `CSV`, `AVRO`, `PARQUET` (`ORC` and other formats are rejected). Deleting an external table (or its dataset) only removes the LocaQL catalog entry — the underlying file is never touched. Patching `externalDataConfiguration` after creation, autodetect, Hive partitioning, and compression options are not supported yet.
+
+## Views and Materialized Views: Real Resources Backed by the Query Engine
+
+`tables.insert` accepts `view.query` or `materializedView.query` instead of `schema`/`externalDataConfiguration` — mutually exclusive with each other and with `externalDataConfiguration`. The query is executed once at creation time through the real [Query Engine](#query-engine-real-googlesql-via-an-embedded-sqlite-backend), both to validate it (an invalid query, or one referencing a table that doesn't exist, fails the insert explicitly with a `400`) and to derive `schema.fields`, since a view's schema is inferred rather than user-supplied — the same way real BigQuery validates a view's SQL and infers its schema at creation.
+
+Nothing is materialized into the view's own storage: every access — a query's `FROM`/`JOIN`, `tabledata.list`, `INFORMATION_SCHEMA.PARTITIONS` row counts — re-executes the stored query fresh, so a view always reflects the current state of whatever it selects from. This includes a view selecting from another view, resolved recursively, with a cycle guard that fails a self-referencing or circular view chain explicitly rather than recursing forever.
+
+```mermaid
+flowchart LR
+	Insert["tables.insert (view.query or materializedView.query)"] --> Validate["Execute query once via the real engine"]
+	Validate -->|fails| Reject["400: invalid query / missing table"]
+	Validate -->|succeeds| Store["Store query text + derived schema.fields"]
+	Access["Any access: query FROM/JOIN, tabledata.list, PARTITIONS"] --> Reexecute["Re-execute the stored query live"]
+	Reexecute -->|references another view| Reexecute
+```
+
+```bash
+curl -X POST http://localhost:9050/bigquery/v2/projects/p1/datasets/analytics/tables \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "tableReference": {"tableId": "high_value_orders"},
+    "view": {"query": "SELECT region, amount FROM p1.analytics.orders WHERE amount > 100"}
+  }'
+```
+
+`materializedView.query` is accepted the same way and rendered with `type: MATERIALIZED_VIEW`, appearing in `INFORMATION_SCHEMA.MATERIALIZED_VIEWS` rather than `VIEWS`. Known limitations, declared explicitly:
+
+- `tables.patch`/`tables.update` cannot redefine an existing view's query yet.
+- A materialized view is **not actually cached**: it is recomputed live on every access exactly like a plain view. Real BigQuery's periodic background refresh, `enableRefresh`/`refreshIntervalMs`/`lastRefreshTime` are not modeled.
+- A 3-part `project.dataset.table` reference inside a view's query only resolves against the project that created the view (see [Query Engine](#query-engine-real-googlesql-via-an-embedded-sqlite-backend)).
 
 ## Fake GCS: A Real Cloud Storage JSON API, Locally
 
