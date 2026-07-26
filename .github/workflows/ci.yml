@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Build, vet, test, race (linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test ./...
+      - run: CGO_ENABLED=1 go test -race ./internal/server
+
+  e2e:
+    name: End-to-end console tests (Chrome, linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Confirm a Chrome/Chromium binary is available
+        run: |
+          command -v google-chrome-stable || command -v google-chrome || command -v chromium-browser || command -v chromium
+      - run: go test -tags e2e -timeout 15m ./cmd/locaql-ui/...
+
+  native:
+    name: Native build/vet/test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test ./...
+
+  cross-build:
+    name: Cross-compile (${{ matrix.goos }}/${{ matrix.goarch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+    env:
+      CGO_ENABLED: 0
+      GOOS: ${{ matrix.goos }}
+      GOARCH: ${{ matrix.goarch }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go build -o /dev/null ./cmd/locaql
+      - run: go build -o /dev/null ./cmd/locaql-ui
+
+  license-scan:
+    name: Dependency license scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      # Pinned to v1.0.0: @latest fails on every package that imports stdlib
+      # (e.g. mime/multipart, io/ioutil, flag) with "does not have module
+      # info" and exits nonzero before producing any report — a confirmed,
+      # still-open upstream regression (google/go-licenses#128), not
+      # something specific to this project. v1.0.0 predates it.
+      - run: go install github.com/google/go-licenses@v1.0.0
+      - name: Generate per-dependency license report (artifact, informational)
+        run: go-licenses csv ./... > licenses.csv
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dependency-licenses
+          path: licenses.csv
+      - name: Fail on forbidden (copyleft-incompatible) licenses
+        run: go-licenses check ./...
