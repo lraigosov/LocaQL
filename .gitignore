@@ -30,3 +30,7 @@ dist/
 vendor/
 coverage.txt
 profile.cov
+
+# Built binaries
+locaql
+locaql-ui
