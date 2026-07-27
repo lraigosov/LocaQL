@@ -965,7 +965,6 @@ func renderTableResource(t *tableRecord) map[string]any {
 	return resp
 }
 
-
 type externalDataConfigParsed struct {
 	SourceURIs      []string
 	SourceFormat    string
@@ -1069,6 +1068,9 @@ func (s *Server) insertJob(w http.ResponseWriter, r *http.Request, projectID str
 	priority := "INTERACTIVE"
 	createSession := false
 	var connectionProperties []connectionProperty
+	var queryParameters []storedQueryParameter
+	parameterMode := ""
+	var queryParametersErr error
 	if r.Body != nil {
 		body, _ := io.ReadAll(r.Body)
 		if len(body) > 0 {
@@ -1093,6 +1095,9 @@ func (s *Server) insertJob(w http.ResponseWriter, r *http.Request, projectID str
 								connectionProperties = append(connectionProperties, connectionProperty{Key: key, Value: value})
 							}
 						}
+						rawParameterMode, _ := qCfg["parameterMode"].(string)
+						rawQueryParameters, _ := qCfg["queryParameters"].([]any)
+						queryParameters, parameterMode, queryParametersErr = parseQueryParametersFromRaw(rawParameterMode, rawQueryParameters)
 					}
 					if loadRaw, ok := conf["load"]; ok {
 						jobType = "load"
@@ -1157,6 +1162,10 @@ func (s *Server) insertJob(w http.ResponseWriter, r *http.Request, projectID str
 		}
 		_ = r.Body.Close()
 	}
+	if queryParametersErr != nil {
+		writeError(w, http.StatusBadRequest, queryParametersErr.Error(), "invalid")
+		return
+	}
 	if len(splitScriptStatements(queryText)) > 1 {
 		isScript = true
 	}
@@ -1168,31 +1177,33 @@ func (s *Server) insertJob(w http.ResponseWriter, r *http.Request, projectID str
 	}
 
 	insertOpts := jobInsertOptions{
-		ProjectID:     projectID,
-		RequestID:     requestID,
-		UserEmail:     userEmail,
-		QueryText:     queryText,
-		JobType:       jobType,
-		Priority:      priority,
-		SessionID:     sessionID,
-		SourceTables:  sourceTables,
-		LoadSchema:    loadSchema,
-		LoadSourceURIs: loadSourceURIs,
-		LoadSourceFormat: loadSourceFormat,
-		LoadFieldDelimiter: loadFieldDelimiter,
-		LoadSkipLeadingRows: loadSkipLeadingRows,
-		LoadCompression: loadCompression,
-		ExtractSourceTable: extractSourceTable,
-		ExtractDestinationURIs: extractDestinationURIs,
+		ProjectID:                projectID,
+		RequestID:                requestID,
+		UserEmail:                userEmail,
+		QueryText:                queryText,
+		JobType:                  jobType,
+		Priority:                 priority,
+		SessionID:                sessionID,
+		SourceTables:             sourceTables,
+		LoadSchema:               loadSchema,
+		LoadSourceURIs:           loadSourceURIs,
+		LoadSourceFormat:         loadSourceFormat,
+		LoadFieldDelimiter:       loadFieldDelimiter,
+		LoadSkipLeadingRows:      loadSkipLeadingRows,
+		LoadCompression:          loadCompression,
+		ExtractSourceTable:       extractSourceTable,
+		ExtractDestinationURIs:   extractDestinationURIs,
 		ExtractDestinationFormat: extractDestinationFormat,
-		ExtractFieldDelimiter: extractFieldDelimiter,
-		ExtractPrintHeader: extractPrintHeader,
-		ExtractCompression: extractCompression,
-		CreateDisposition: createDisposition,
-		WriteDisposition:  writeDisposition,
-		TargetDataset: targetDataset,
-		TargetTable:   targetTable,
-		IsScript:      isScript,
+		ExtractFieldDelimiter:    extractFieldDelimiter,
+		ExtractPrintHeader:       extractPrintHeader,
+		ExtractCompression:       extractCompression,
+		CreateDisposition:        createDisposition,
+		WriteDisposition:         writeDisposition,
+		TargetDataset:            targetDataset,
+		TargetTable:              targetTable,
+		IsScript:                 isScript,
+		ParameterMode:            parameterMode,
+		QueryParameters:          queryParameters,
 	}
 
 	if isScript {
@@ -1249,17 +1260,25 @@ func (s *Server) handleJobsQuery(w http.ResponseWriter, r *http.Request, project
 	}()
 
 	var payload struct {
-		Query                string                `json:"query"`
-		MaxResults           int                   `json:"maxResults"`
-		TimeoutMs            int                   `json:"timeoutMs"`
-		DryRun               bool                  `json:"dryRun"`
-		RequestId            string                `json:"requestId"`
-		Priority             string                `json:"priority"`
-		CreateSession        bool                  `json:"createSession"`
-		ConnectionProperties []connectionProperty  `json:"connectionProperties"`
+		Query                string               `json:"query"`
+		MaxResults           int                  `json:"maxResults"`
+		TimeoutMs            int                  `json:"timeoutMs"`
+		DryRun               bool                 `json:"dryRun"`
+		RequestId            string               `json:"requestId"`
+		Priority             string               `json:"priority"`
+		CreateSession        bool                 `json:"createSession"`
+		ConnectionProperties []connectionProperty `json:"connectionProperties"`
+		ParameterMode        string               `json:"parameterMode"`
+		QueryParameters      []any                `json:"queryParameters"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 		writeError(w, http.StatusBadRequest, "Invalid request body", "invalid")
+		return
+	}
+
+	queryParams, parameterMode, err := parseQueryParametersFromRaw(payload.ParameterMode, payload.QueryParameters)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error(), "invalid")
 		return
 	}
 
@@ -1296,13 +1315,15 @@ func (s *Server) handleJobsQuery(w http.ResponseWriter, r *http.Request, project
 	}
 
 	insertOpts := jobInsertOptions{
-		ProjectID: projectID,
-		RequestID: requestID,
-		UserEmail: userEmail,
-		QueryText: payload.Query,
-		JobType:   "query",
-		Priority:  payload.Priority,
-		SessionID: sessionID,
+		ProjectID:       projectID,
+		RequestID:       requestID,
+		UserEmail:       userEmail,
+		QueryText:       payload.Query,
+		JobType:         "query",
+		Priority:        payload.Priority,
+		SessionID:       sessionID,
+		ParameterMode:   parameterMode,
+		QueryParameters: queryParams,
 	}
 
 	jr, created := s.jobs.insert(insertOpts)
@@ -1375,7 +1396,7 @@ func (s *Server) writeQueryResults(w http.ResponseWriter, r *http.Request, proje
 		schema, values = j.Statistics.ResultSchema, j.Statistics.ResultRows
 	} else {
 		var err error
-		schema, values, err = s.simulateQueryResultTable(projectID, j.SessionID, j.QueryText, j.UserEmail)
+		schema, values, err = s.simulateQueryResultTable(projectID, j.SessionID, j.QueryText, j.UserEmail, j.ParameterMode, j.QueryParameters)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err.Error(), "invalid")
 			return
@@ -1410,7 +1431,7 @@ func (s *Server) writeQueryResults(w http.ResponseWriter, r *http.Request, proje
 	writeJSON(w, http.StatusOK, resp)
 }
 
-func (s *Server) simulateQueryResultTable(projectID, sessionID, queryText, callingUserEmail string) ([]tableField, [][]string, error) {
+func (s *Server) simulateQueryResultTable(projectID, sessionID, queryText, callingUserEmail string, paramMode string, params []storedQueryParameter) ([]tableField, [][]string, error) {
 	trimmed := strings.TrimSpace(queryText)
 	if trimmed == "" {
 		return []tableField{{Name: "result", Type: "STRING"}}, [][]string{{"query job executed"}}, nil
@@ -1433,7 +1454,7 @@ func (s *Server) simulateQueryResultTable(projectID, sessionID, queryText, calli
 	if schema, rows, ok := s.simulateInformationSchemaQuery(projectID, trimmed, lower, callingUserEmail); ok {
 		return flatSchemaToTableFields(schema), rows, nil
 	}
-	return s.executeRealSQLQuery(projectID, trimmed, sess)
+	return s.executeRealSQLQueryWithParams(projectID, trimmed, sess, paramMode, params)
 }
 
 // flatSchemaToTableFields converts an INFORMATION_SCHEMA builder's flat
@@ -1877,17 +1898,17 @@ func (sc informationSchemaScope) forEachTable(fn func(datasetID string, table *t
 type informationSchemaBuilder func(scope informationSchemaScope) ([]map[string]string, [][]string)
 
 var informationSchemaBuilders = map[string]informationSchemaBuilder{
-	"schemata":         buildInformationSchemaSchemata,
-	"schemata_options": buildInformationSchemaSchemataOptions,
-	"tables":           buildInformationSchemaTables,
-	"columns":          buildInformationSchemaColumns,
-	"jobs":             buildInformationSchemaJobs,
-	"jobs_by_project":  buildInformationSchemaJobs,
-	"jobs_by_user":     buildInformationSchemaJobsByUser,
-	"partitions":       buildInformationSchemaPartitions,
-	"routines":         buildInformationSchemaRoutines,
-	"parameters":       buildInformationSchemaParameters,
-	"models":           buildInformationSchemaModels,
+	"schemata":           buildInformationSchemaSchemata,
+	"schemata_options":   buildInformationSchemaSchemataOptions,
+	"tables":             buildInformationSchemaTables,
+	"columns":            buildInformationSchemaColumns,
+	"jobs":               buildInformationSchemaJobs,
+	"jobs_by_project":    buildInformationSchemaJobs,
+	"jobs_by_user":       buildInformationSchemaJobsByUser,
+	"partitions":         buildInformationSchemaPartitions,
+	"routines":           buildInformationSchemaRoutines,
+	"parameters":         buildInformationSchemaParameters,
+	"models":             buildInformationSchemaModels,
 	"table_options":      buildInformationSchemaTableOptions,
 	"views":              buildInformationSchemaViews,
 	"materialized_views": buildInformationSchemaMaterializedViews,
@@ -2141,7 +2162,7 @@ func (s *Server) executeQueryJob(job *jobRecord) (jobStatistics, error) {
 	if strings.Contains(strings.ToUpper(job.QueryText), "FORCE_ERROR") {
 		return jobStatistics{Executor: "query", Simulated: false}, fmt.Errorf("simulated forced error from query text")
 	}
-	schema, rows, err := s.simulateQueryResultTable(job.ProjectID, job.SessionID, job.QueryText, job.UserEmail)
+	schema, rows, err := s.simulateQueryResultTable(job.ProjectID, job.SessionID, job.QueryText, job.UserEmail, job.ParameterMode, job.QueryParameters)
 	if err != nil {
 		return jobStatistics{Executor: "query", Simulated: false}, err
 	}
