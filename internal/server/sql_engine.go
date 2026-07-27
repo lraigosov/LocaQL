@@ -325,16 +325,20 @@ func sqlTypeDescriptorToField(name string, desc sqlTypeDescriptor) tableField {
 // GoogleSQL engine (github.com/goccy/googlesqlite): every table the query
 // references is materialized into it first, so WHERE, column projection,
 // JOIN, aggregation, ORDER BY and LIMIT are real GoogleSQL semantics rather
-// than the previous regex-matched full-table-dump/fabricated fallback.
-func (s *Server) executeRealSQLQuery(projectID, queryText string) ([]tableField, [][]string, error) {
-	return s.executeRealSQLQueryVisiting(projectID, queryText, map[string]bool{})
+// than the previous regex-matched full-table-dump/fabricated fallback. sess
+// is nil unless the query is running within a BigQuery-style session, in
+// which case a `_SESSION.<table>` reference resolves against that session's
+// own temp-table catalog instead of the real dataset catalog (see
+// session_service.go).
+func (s *Server) executeRealSQLQuery(projectID, queryText string, sess *sessionRecord) ([]tableField, [][]string, error) {
+	return s.executeRealSQLQueryVisiting(projectID, queryText, map[string]bool{}, sess)
 }
 
 // executeRealSQLQueryVisiting is executeRealSQLQuery plus the view-cycle
 // guard threaded through resolveTableRowsVisiting: a referenced table may
 // itself be a view, which is resolved by recursively executing its own
 // query here.
-func (s *Server) executeRealSQLQueryVisiting(projectID, queryText string, visiting map[string]bool) ([]tableField, [][]string, error) {
+func (s *Server) executeRealSQLQueryVisiting(projectID, queryText string, visiting map[string]bool, sess *sessionRecord) ([]tableField, [][]string, error) {
 	db, err := sql.Open("googlesqlite", ":memory:")
 	if err != nil {
 		return nil, nil, fmt.Errorf("open real SQL engine: %w", err)
@@ -343,12 +347,23 @@ func (s *Server) executeRealSQLQueryVisiting(projectID, queryText string, visiti
 
 	createdSchemas := map[string]bool{}
 	for _, ref := range referencedTables(queryText, projectID) {
-		fields, rows, ok, err := s.resolveTableRowsVisiting(projectID, ref.datasetID, ref.tableID, visiting)
-		if !ok {
-			continue
-		}
-		if err != nil {
-			return nil, nil, err
+		var fields []tableField
+		var rows [][]string
+		if sess != nil && strings.EqualFold(ref.datasetID, sessionDatasetName) {
+			t, ok := sess.getTempTable(ref.tableID)
+			if !ok {
+				continue
+			}
+			fields, rows = t.Fields, t.Rows
+		} else {
+			var ok bool
+			fields, rows, ok, err = s.resolveTableRowsVisiting(projectID, ref.datasetID, ref.tableID, visiting)
+			if !ok {
+				continue
+			}
+			if err != nil {
+				return nil, nil, err
+			}
 		}
 		if !createdSchemas[ref.datasetID] {
 			if _, err := db.Exec("CREATE SCHEMA " + quoteIdent(ref.datasetID)); err != nil {

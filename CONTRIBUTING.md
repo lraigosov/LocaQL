@@ -85,7 +85,7 @@ Keep the subject line concise and in English; avoid referencing internal tooling
 ## Pull Request Process
 
 1. Open the PR against `dev` (or `main` for a `hotfix/*` branch only).
-2. Make sure CI-equivalent checks pass locally before requesting review:
+2. [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs automatically on every push/PR to `main`/`dev` (see [Continuous Integration](README.md#continuous-integration)) and covers all of the below, but run them locally first so you're not waiting on CI to find out:
    - `go build ./...`
    - `go vet ./...`
    - `go test ./...`
