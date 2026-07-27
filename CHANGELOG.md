@@ -4,6 +4,8 @@ All notable user-facing changes to LocaQL are documented here, in the style of [
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-07-27
+
 ### Added
 - BigQuery Storage API (gRPC): `CreateReadSession`/`ReadRows` (Avro framing) and `CreateWriteStream`/`AppendRows`/`GetWriteStream`/`FinalizeWriteStream`/`BatchCommitWriteStreams` (protobuf rows via real runtime reflection), on a separate listener (`--storage-grpc-addr`, default `:9060`). See [README: BigQuery Storage API](README.md#bigquery-storage-api-real-grpc-read-sessions-avro-and-write-streams-protobuf).
 - Sessions and multi-statement transactions: `createSession`/`connectionProperties`, session-scoped `_SESSION.<table>` temp tables, real `BEGIN`/`COMMIT`/`ROLLBACK TRANSACTION` atomicity, `INFORMATION_SCHEMA.SESSIONS_BY_USER`.
@@ -12,12 +14,16 @@ All notable user-facing changes to LocaQL are documented here, in the style of [
 - Guided troubleshooting: `GET /_emulator/diagnostics` (persistence write health, recent job failures, contended resource lock keys, active sessions, effective `LOCAQL_*` environment variables).
 - Real GoogleSQL query engine (`goccy/googlesqlite`) behind `jobs.query`/`jobs.insert`/`projects.queries`: genuine `WHERE`, projection, `JOIN`, aggregation, `ORDER BY`, `LIMIT`.
 - Views and Materialized Views as real, live-resolved resources; nested `STRUCT`/`RECORD` and `ARRAY`/`REPEATED` schemas with BigQuery's real REST wire shape; `NUMERIC`/`BIGNUMERIC` exact-precision decimal types.
-- Reproducible build pipeline: `Makefile` (`make build`, `make build-all` for a 5-platform cross-compile matrix), a multi-stage `Dockerfile` producing a minimal, non-root container image, version/commit/build-date injected via `-ldflags` and surfaced at `GET /_emulator/version`.
+- Reproducible build pipeline: `Makefile` (`make build`, `make build-all` for a 5-platform cross-compile matrix), a multi-stage, multi-arch `Dockerfile` producing a minimal, non-root container image, version/commit/build-date injected via `-ldflags` and surfaced at `GET /_emulator/version`.
 - Continuous integration (`.github/workflows/ci.yml`): build/vet/test/race on Linux, end-to-end console tests, native build/vet/test on Windows/macOS, a 5-platform cross-compile matrix, a dependency license scan, and a CycloneDX SBOM (`make sbom` locally; generated fresh per CI run rather than committed, since a static copy would go stale).
 - Architecture Decision Records (`docs/adr/`) for the project's independent identity/licensing, the real GoogleSQL engine choice, and the sessions/transactions design.
 - Real BigQuery `queryParameters`: `NAMED` (`@name`) and `POSITIONAL` (`?`) parameter binding for `jobs.query`/`jobs.insert`, including a genuinely `NULL`-valued typed parameter, for `STRING`/`INT64`/`FLOAT64`/`BOOL`/`BYTES`/`DATE`/`DATETIME`/`TIME`/`TIMESTAMP`. See [README: Query Parameters](README.md#query-parameters-named-and-positional).
 - Console: a non-affiliation legal disclaimer, a real emulator version indicator, and a "Diagnostics" tab rendering `GET /_emulator/diagnostics`.
-- Automated releases (`.github/workflows/release.yml`, triggered by pushing a `vX.Y.Z` tag): a multi-arch (`linux/amd64`+`linux/arm64`) image published to `ghcr.io/lraigosov/locaql`, plus a GitHub Release with cross-compiled binaries for every `make build-all` platform and the SBOM attached. See "How releases are cut" below.
+- Automated releases (`.github/workflows/release.yml`, triggered by pushing a `vX.Y.Z` tag): a real multi-arch (`linux/amd64`+`linux/arm64`) image published to `ghcr.io/lraigosov/locaql`, plus a GitHub Release with cross-compiled binaries for every `make build-all` platform and the SBOM attached. See "How releases are cut" below. This is the first release this pipeline has ever produced.
+
+### Fixed
+- `NOTICE` didn't attribute `google/googlesql` (formerly ZetaSQL), the real Apache-2.0-licensed Google engine the query layer actually transpiles and runs — only the MIT-licensed inspiration project was mentioned. Not a license conflict (Apache-2.0 and MIT are freely combinable, and this project is already Apache-2.0), but a real attribution gap, now corrected with the full dependency chain documented in `NOTICE`.
+- The `Dockerfile` hardcoded `GOOS=linux` with no `GOARCH` at all, so it always built for the host's native architecture regardless of what was requested — "multi-arch" support didn't actually work. Fixed to consume Docker's `TARGETOS`/`TARGETARCH` build args properly.
 
 ### Known limitations
 See [KNOWN-DIVERGENCES.md](KNOWN-DIVERGENCES.md) for the full, severity-classified list. Highlights: Storage Write API has no BUFFERED streams/`FlushRows`; Storage Read API is Avro-only with one stream per session, no `SplitReadStream`; a session transaction's atomicity never extends to real base tables; `GET /_emulator/metrics` is plain JSON, not Prometheus text exposition; the query engine only runs correctly on Linux (including WSL) — it traps at analyzer initialization on native Windows/macOS, root-caused but not yet fixable from LocaQL's side (see Blocking #3).
@@ -37,7 +43,11 @@ pinning to an older version is always a real option for a consumer who isn't rea
 
 ## How releases are cut
 
-1. Update this file's `[Unreleased]` section into a new dated version section (`## [x.y.z] - YYYY-MM-DD`), summarizing what changed for someone *using* LocaQL — not the session-by-session build process (that stays in `devlog.md`, which isn't published).
-2. Push a tag matching `vX.Y.Z` (e.g. `git tag v0.9.0 && git push origin v0.9.0`). That alone triggers everything below — `.github/workflows/release.yml` — no local build step is required.
-3. CI validates (`build`/`vet`/`test`/`-race`), then in parallel: builds and pushes a real multi-arch (`linux/amd64`+`linux/arm64`) image to `ghcr.io/lraigosov/locaql` tagged `X.Y.Z`, `X.Y`, and `latest`; and cross-compiles binaries for linux/darwin/windows × amd64/arm64 (`make build-all`), generates a CycloneDX SBOM (`make sbom`), and publishes a GitHub Release for the tag with every platform archive and the SBOM attached.
-4. The same `make build`/`make build-all`/`make docker-build` targets still work locally for a manual/offline build (they read the version from `git describe` when `VERSION` isn't set explicitly) — CI just does it for you on every tag now.
+Fully automated except for the one approval branch protection requires:
+
+1. Every push to `main` runs `.github/workflows/prepare-release.yml`. It checks whether `CHANGELOG.md`'s `[Unreleased]` section has anything in it; if not, it stops there (nothing to release yet). If it does, it works out the SemVer bump from which `### ` subsections are present (`### Removed` or a `BREAKING` marker → major, `### Added` → minor, anything else → patch) against the latest `vX.Y.Z` tag, dates the section into `## [X.Y.Z] - YYYY-MM-DD`, opens a fresh empty `[Unreleased]` above it, and opens (or replaces, if the bump level changed since an earlier run) a PR (`release/vX.Y.Z` → `main`) with that single commit. No manual version number, no manual trigger.
+2. Review and merge the PR. That's the only manual step in the entire process — `main`'s branch protection requires it regardless of who or what is proposing the change.
+3. Merging triggers `.github/workflows/auto-tag-release.yml`, which tags that exact merge commit `vX.Y.Z` and calls `.github/workflows/release.yml` directly (not by relying on the tag push itself: a tag pushed with the default `GITHUB_TOKEN` doesn't start other workflow runs, a documented GitHub anti-recursion rule, so triggering it explicitly is what actually makes this work end to end).
+4. `release.yml` validates (`build`/`vet`/`test`/`-race`), then in parallel: builds and pushes a real multi-arch (`linux/amd64`+`linux/arm64`) image to `ghcr.io/lraigosov/locaql` tagged `X.Y.Z`, `X.Y`, and `latest`; and cross-compiles binaries for linux/darwin/windows × amd64/arm64 (`make build-all`), generates a CycloneDX SBOM (`make sbom`), and publishes a GitHub Release for the tag with every platform archive and the SBOM attached.
+
+Pushing a `vX.Y.Z` tag by hand (`git tag v0.9.0 && git push origin v0.9.0`) still works too — `release.yml` keeps its original `push: tags` trigger for anyone who wants to skip the PR entirely, e.g. for a one-off rebuild. The same `make build`/`make build-all`/`make docker-build` targets also still work locally for a manual/offline build (they read the version from `git describe` when `VERSION` isn't set explicitly).
