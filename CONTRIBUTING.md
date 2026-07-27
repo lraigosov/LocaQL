@@ -43,6 +43,7 @@ wsl -d Ubuntu-24.04 -- bash -lc 'cd /mnt/f/GitHub/LocaQL && go build ./... && go
 ```
 
 - See [Quick Start (WSL)](README.md#quick-start-wsl) and [Test](README.md#test) in the README for running the emulator, the conformance suite, and the race-detector build.
+- Optionally register `goccy/bigquery-emulator` (an early inspiration for scope, not a fork ancestor — see `docs/adr/0001-*.md`) as a read-only reference remote: `git remote add upstream https://github.com/goccy/bigquery-emulator.git && git remote set-url --push upstream no_push`. Never merged automatically; any idea or fix referenced from it goes through its own license/compatibility review before import (see §41.6 of the local master plan).
 
 ## Branching Model and DevOps Cycle
 

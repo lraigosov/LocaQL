@@ -684,6 +684,8 @@ wsl -d Ubuntu-24.04 -- bash -lc 'cd /mnt/f/GitHub/LocaQL && go run ./cmd/locaql 
 wsl -d Ubuntu-24.04 -- bash -lc 'cd /mnt/f/GitHub/LocaQL && go test ./...'
 ```
 
+**Baseline (Sesión 86, `go test -list '.*'` counts, not hand-counted):** 214 unit tests across `internal/server` (193), `cmd/locaql` (9), `cmd/locaql-ui` (2), `internal/capabilities` (1) and `internal/workspace` (9), plus 15 more under the `e2e` build tag (see [End-to-End Console Tests](#end-to-end-console-tests)) and 7 declarative conformance cases (`test/conformance/cases/foundation.yaml` + `pagination.yaml`, see [Conformance Baseline](#conformance-baseline)). This is a point-in-time snapshot for onboarding context, not a target to keep updated by hand — `.github/workflows/ci.yml`'s `test`/`e2e` jobs are the actual source of truth for whether the suite is green today.
+
 Validate consumer workspace layout (Delivery E baseline):
 
 ```bash
@@ -849,7 +851,7 @@ The `license-scan` job pins `go-licenses` to `v1.0.0` rather than `@latest`: at 
 
 ## Contributing
 
-Issues and pull requests are welcome. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the branching model (`feature`/`fix`/`docs`/`chore`/`hotfix` → `dev` → `main`), commit conventions, the pull request checklist, and exactly who can approve and merge into `main`/`dev` (branch protection is enforced via a GitHub ruleset + [`CODEOWNERS`](.github/CODEOWNERS): any PR needs the code owner's approval, and only the repository owner can bypass that requirement).
+Issues and pull requests are welcome. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the branching model (`feature`/`fix`/`docs`/`chore`/`hotfix` → `dev` → `main`), commit conventions, the pull request checklist, and exactly who can approve and merge into `main`/`dev` (branch protection is enforced via a GitHub ruleset + [`CODEOWNERS`](.github/CODEOWNERS): any PR needs the code owner's approval, and only the repository owner can bypass that requirement). Significant, hard-to-reverse design decisions are recorded in [`docs/adr/`](docs/adr/README.md).
 
 ## License
 
