@@ -4,17 +4,39 @@ on:
   push:
     tags:
       - 'v*'
+  # Lets auto-tag-release.yml invoke this deterministically after merging a
+  # release PR: a tag pushed with the default GITHUB_TOKEN does NOT trigger
+  # other workflow runs (a documented GitHub Actions anti-recursion rule), so
+  # relying on `push: tags` alone would silently never fire in that path.
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. v0.10.0)'
+        required: true
+        type: string
 
 permissions:
   contents: write
   packages: write
 
 jobs:
+  resolve:
+    name: Resolve release tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - id: resolve
+        run: echo "tag=${{ inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+
   validate:
     name: Validate before releasing
+    needs: resolve
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.tag }}
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -25,13 +47,16 @@ jobs:
 
   docker:
     name: Build and push multi-arch image to GHCR
-    needs: validate
+    needs: [resolve, validate]
     runs-on: ubuntu-latest
     env:
       REGISTRY: ghcr.io
       IMAGE_NAME: ${{ github.repository }}
+      TAG: ${{ needs.resolve.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.tag }}
       - name: Compute build metadata
         id: build_meta
         run: |
@@ -44,14 +69,14 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      # Tags produced for a push of tag v1.2.3: 1.2.3, 1.2, latest.
+      # Tags produced for a release tag v1.2.3: 1.2.3, 1.2, latest.
       - id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{version}},value=${{ env.TAG }}
+            type=semver,pattern={{major}}.minor}},value=${{ env.TAG }}
             type=raw,value=latest
       - uses: docker/build-push-action@v6
         with:
@@ -61,36 +86,52 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            VERSION=${{ github.ref_name }}
+            VERSION=${{ env.TAG }}
             COMMIT=${{ steps.build_meta.outputs.commit }}
             BUILD_DATE=${{ steps.build_meta.outputs.date }}
 
   binaries:
     name: Cross-compile release binaries, SBOM, and GitHub Release
-    needs: validate
+    needs: [resolve, validate]
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      TAG: ${{ needs.resolve.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.tag }}
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - run: make build-all VERSION=${{ github.ref_name }}
-      - run: make sbom VERSION=${{ github.ref_name }}
+      - run: make build-all VERSION=${{ env.TAG }}
+      - run: make sbom VERSION=${{ env.TAG }}
+>>>>>>> origin/dev
       - name: Archive each platform's binaries
         run: |
           cd dist
           for platform_dir in */; do
             name="${platform_dir%/}"
+<<<<<<< HEAD
+            tar czf "../locaql-${TAG}-${name}.tar.gz" -C "$name" .
+=======
             tar czf "../locaql-${{ github.ref_name }}-${name}.tar.gz" -C "$name" .
+>>>>>>> origin/dev
           done
       - name: Create GitHub Release with binaries and SBOM attached
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+<<<<<<< HEAD
+          gh release create "${TAG}" \
+            --title "${TAG}" \
+            --generate-notes \
+            locaql-${TAG}-*.tar.gz \
+=======
           gh release create "${{ github.ref_name }}" \
             --title "${{ github.ref_name }}" \
             --generate-notes \
             locaql-${{ github.ref_name }}-*.tar.gz \
+>>>>>>> origin/dev
             dist/sbom.json

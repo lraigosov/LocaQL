@@ -1,0 +1,49 @@
+name: Auto-tag Release PR
+
+# Fires when a `release/vX.Y.Z` PR (opened by prepare-release.yml) merges
+# into main, tags that exact merge commit, and invokes release.yml directly
+# via workflow_call — not by relying on the tag push itself to trigger it,
+# since a tag pushed with the default GITHUB_TOKEN does not start other
+# workflow runs (GitHub's built-in anti-recursion rule for GITHUB_TOKEN
+# events). A tag pushed manually by a real user still triggers release.yml
+# the original way, via its `push: tags: v*` trigger — both paths coexist.
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  tag:
+    name: Create and push the release tag
+    if: github.event.pull_request.merged == true && startsWith(github.event.pull_request.head.ref, 'release/')
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - id: version
+        run: |
+          branch="${{ github.event.pull_request.head.ref }}"
+          echo "tag=${branch#release/}" >> "$GITHUB_OUTPUT"
+      - run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "${{ steps.version.outputs.tag }}"
+          git push origin "${{ steps.version.outputs.tag }}"
+
+  release:
+    needs: tag
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.tag.outputs.tag }}
+    permissions:
+      contents: write
+      packages: write
+    secrets: inherit
