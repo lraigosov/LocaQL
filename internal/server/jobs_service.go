@@ -21,42 +21,43 @@ const (
 )
 
 type jobRecord struct {
-	ProjectID       string
-	JobID           string
-	ParentJobID     string
-	JobType         string
-	Priority        string // INTERACTIVE or BATCH
-	ResourceKey     string
-	SourceTables    []tableReference
-	LoadSchema      []tableField
-	LoadSourceURIs  []string
-	LoadSourceFormat string
-	LoadFieldDelimiter string
-	LoadSkipLeadingRows int
-	LoadCompression string
-	ExtractSourceTable      tableReference
-	ExtractDestinationURIs  []string
+	ProjectID                string
+	JobID                    string
+	ParentJobID              string
+	JobType                  string
+	Priority                 string // INTERACTIVE or BATCH
+	ResourceKey              string
+	SourceTables             []tableReference
+	LoadSchema               []tableField
+	LoadSourceURIs           []string
+	LoadSourceFormat         string
+	LoadFieldDelimiter       string
+	LoadSkipLeadingRows      int
+	LoadCompression          string
+	ExtractSourceTable       tableReference
+	ExtractDestinationURIs   []string
 	ExtractDestinationFormat string
-	ExtractFieldDelimiter   string
-	ExtractPrintHeader      bool
-	ExtractCompression      string
-	TargetDataset   string
-	TargetTable     string
-	CreateDisposition string
-	WriteDisposition  string
-	State           jobState
-	RequestID       string
-	UserEmail       string
-	QueryText       string
-	IsScript        bool
-	Statistics      jobStatistics
-	CreatedAt       time.Time
-	StartedAt       time.Time
-	EndedAt         time.Time
-	CancelRequested bool
-	ErrorReason     string
-	ErrorMessage    string
-	Errors          []jobError // Secondary errors
+	ExtractFieldDelimiter    string
+	ExtractPrintHeader       bool
+	ExtractCompression       string
+	TargetDataset            string
+	TargetTable              string
+	CreateDisposition        string
+	WriteDisposition         string
+	State                    jobState
+	RequestID                string
+	UserEmail                string
+	QueryText                string
+	IsScript                 bool
+	SessionID                string
+	Statistics               jobStatistics
+	CreatedAt                time.Time
+	StartedAt                time.Time
+	EndedAt                  time.Time
+	CancelRequested          bool
+	ErrorReason              string
+	ErrorMessage             string
+	Errors                   []jobError // Secondary errors
 }
 
 type jobError struct {
@@ -71,6 +72,19 @@ type jobStatistics struct {
 	TotalSlotMs    int64
 	ProcessedBytes int64
 	OutputRows     int64
+	// ResultSchema/ResultRows cache a query job's actual result set, computed
+	// once when the job runs (see executeQueryJob) rather than recomputed on
+	// every subsequent getQueryResults/jobs.query fetch. This matters beyond
+	// performance: some query text now has real, non-idempotent side effects
+	// (BEGIN/COMMIT/ROLLBACK TRANSACTION, CREATE TEMP TABLE — see
+	// session_service.go), so re-running it a second time to serve a second
+	// fetch would re-apply those side effects (a second BEGIN would fail
+	// with "already active", a second COMMIT would fail with "no active
+	// transaction", etc.) instead of just returning the already-computed
+	// result, unlike a plain SELECT which happened to be safe to re-run
+	// only because it has no side effects at all.
+	ResultSchema []tableField
+	ResultRows   [][]string
 }
 
 type requestIDRecord struct {
@@ -79,31 +93,32 @@ type requestIDRecord struct {
 }
 
 type jobInsertOptions struct {
-	ProjectID     string
-	RequestID     string
-	ParentJobID   string
-	UserEmail     string
-	QueryText     string
-	JobType       string
-	Priority      string
-	SourceTables   []tableReference
-	LoadSchema      []tableField
-	LoadSourceURIs  []string
-	LoadSourceFormat string
-	LoadFieldDelimiter string
-	LoadSkipLeadingRows int
-	LoadCompression string
-	ExtractSourceTable      tableReference
-	ExtractDestinationURIs  []string
+	ProjectID                string
+	RequestID                string
+	ParentJobID              string
+	UserEmail                string
+	QueryText                string
+	JobType                  string
+	Priority                 string
+	SourceTables             []tableReference
+	LoadSchema               []tableField
+	LoadSourceURIs           []string
+	LoadSourceFormat         string
+	LoadFieldDelimiter       string
+	LoadSkipLeadingRows      int
+	LoadCompression          string
+	ExtractSourceTable       tableReference
+	ExtractDestinationURIs   []string
 	ExtractDestinationFormat string
-	ExtractFieldDelimiter   string
-	ExtractPrintHeader      bool
-	ExtractCompression      string
-	CreateDisposition string
-	WriteDisposition  string
-	TargetDataset string
-	TargetTable   string
-	IsScript      bool
+	ExtractFieldDelimiter    string
+	ExtractPrintHeader       bool
+	ExtractCompression       string
+	CreateDisposition        string
+	WriteDisposition         string
+	TargetDataset            string
+	TargetTable              string
+	IsScript                 bool
+	SessionID                string
 }
 
 type jobListFilters struct {
@@ -116,22 +131,27 @@ type jobListFilters struct {
 }
 
 type jobService struct {
-	mu                sync.RWMutex
-	jobsByProject     map[string]map[string]*jobRecord
-	requestIDIndex    map[string]map[string]requestIDRecord
-	projectVersions   map[string]int
-	requestIDTTL      time.Duration
-	maxConcurrent     int
-	runSlots          chan struct{}
-	maxStorageWrite   int
-	storageWriteSlots chan struct{}
-	resourceSlots     map[string]chan struct{}
-	persistencePath   string
-	copyExecutor      func(*jobRecord) (jobStatistics, error)
-	loadExecutor      func(*jobRecord) (jobStatistics, error)
-	extractExecutor   func(*jobRecord) (jobStatistics, error)
-	queryExecutor     func(*jobRecord) (jobStatistics, error)
-	counter           int64
+	mu                 sync.RWMutex
+	jobsByProject      map[string]map[string]*jobRecord
+	requestIDIndex     map[string]map[string]requestIDRecord
+	projectVersions    map[string]int
+	requestIDTTL       time.Duration
+	maxConcurrent      int
+	runSlots           chan struct{}
+	maxStorageWrite    int
+	storageWriteSlots  chan struct{}
+	resourceSlots      map[string]chan struct{}
+	persistencePath    string
+	copyExecutor       func(*jobRecord) (jobStatistics, error)
+	loadExecutor       func(*jobRecord) (jobStatistics, error)
+	extractExecutor    func(*jobRecord) (jobStatistics, error)
+	queryExecutor      func(*jobRecord) (jobStatistics, error)
+	counter            int64
+	submittedTotal     int64
+	completedTotal     int64
+	failedTotal        int64
+	lastPersistError   string
+	lastPersistErrorAt time.Time
 }
 
 type jobServiceSnapshot struct {
@@ -225,42 +245,44 @@ func (s *jobService) insert(opts jobInsertOptions) (*jobRecord, bool) {
 	s.counter++
 	jobID := "job_" + strconv.FormatInt(s.counter, 10)
 	jr := &jobRecord{
-		ProjectID:   projectID,
-		JobID:       jobID,
-		ParentJobID: opts.ParentJobID,
-		JobType:     normalizeJobType(opts),
-		Priority:    normalizePriority(opts.Priority),
-		ResourceKey: buildResourceKey(opts),
-		SourceTables: cloneTableReferences(opts.SourceTables),
-		LoadSchema:   cloneTableFields(opts.LoadSchema),
-		LoadSourceURIs: cloneStringSlice(opts.LoadSourceURIs),
-		LoadSourceFormat: strings.TrimSpace(opts.LoadSourceFormat),
-		LoadFieldDelimiter: opts.LoadFieldDelimiter,
-		LoadSkipLeadingRows: opts.LoadSkipLeadingRows,
-		LoadCompression: strings.TrimSpace(opts.LoadCompression),
-		ExtractSourceTable: opts.ExtractSourceTable,
-		ExtractDestinationURIs: cloneStringSlice(opts.ExtractDestinationURIs),
+		ProjectID:                projectID,
+		JobID:                    jobID,
+		ParentJobID:              opts.ParentJobID,
+		JobType:                  normalizeJobType(opts),
+		Priority:                 normalizePriority(opts.Priority),
+		ResourceKey:              buildResourceKey(opts),
+		SourceTables:             cloneTableReferences(opts.SourceTables),
+		LoadSchema:               cloneTableFields(opts.LoadSchema),
+		LoadSourceURIs:           cloneStringSlice(opts.LoadSourceURIs),
+		LoadSourceFormat:         strings.TrimSpace(opts.LoadSourceFormat),
+		LoadFieldDelimiter:       opts.LoadFieldDelimiter,
+		LoadSkipLeadingRows:      opts.LoadSkipLeadingRows,
+		LoadCompression:          strings.TrimSpace(opts.LoadCompression),
+		ExtractSourceTable:       opts.ExtractSourceTable,
+		ExtractDestinationURIs:   cloneStringSlice(opts.ExtractDestinationURIs),
 		ExtractDestinationFormat: strings.TrimSpace(opts.ExtractDestinationFormat),
-		ExtractFieldDelimiter: opts.ExtractFieldDelimiter,
-		ExtractPrintHeader: opts.ExtractPrintHeader,
-		ExtractCompression: strings.TrimSpace(opts.ExtractCompression),
-		TargetDataset: strings.TrimSpace(opts.TargetDataset),
-		TargetTable: strings.TrimSpace(opts.TargetTable),
-		CreateDisposition: normalizeCreateDisposition(opts.CreateDisposition),
-		WriteDisposition: normalizeWriteDisposition(opts.WriteDisposition),
-		State:       jobStatePending,
-		RequestID:   requestID,
-		UserEmail:   opts.UserEmail,
-		QueryText:   opts.QueryText,
-		IsScript:    opts.IsScript,
-		Statistics:  newSimulatedStatistics(normalizeJobType(opts)),
-		CreatedAt:   now,
+		ExtractFieldDelimiter:    opts.ExtractFieldDelimiter,
+		ExtractPrintHeader:       opts.ExtractPrintHeader,
+		ExtractCompression:       strings.TrimSpace(opts.ExtractCompression),
+		TargetDataset:            strings.TrimSpace(opts.TargetDataset),
+		TargetTable:              strings.TrimSpace(opts.TargetTable),
+		CreateDisposition:        normalizeCreateDisposition(opts.CreateDisposition),
+		WriteDisposition:         normalizeWriteDisposition(opts.WriteDisposition),
+		State:                    jobStatePending,
+		RequestID:                requestID,
+		UserEmail:                opts.UserEmail,
+		QueryText:                opts.QueryText,
+		IsScript:                 opts.IsScript,
+		SessionID:                opts.SessionID,
+		Statistics:               newSimulatedStatistics(normalizeJobType(opts)),
+		CreatedAt:                now,
 	}
 
 	if _, ok := s.jobsByProject[projectID]; !ok {
 		s.jobsByProject[projectID] = make(map[string]*jobRecord)
 	}
 	s.jobsByProject[projectID][jobID] = jr
+	s.submittedTotal++
 
 	if requestID != "" {
 		if _, ok := s.requestIDIndex[projectID]; !ok {
@@ -299,6 +321,17 @@ func (s *jobService) insertScriptWithChildren(opts jobInsertOptions) (*jobRecord
 	return parent, childJobs, true
 }
 
+// recordJobOutcomeLocked increments the completed/failed counters exposed by
+// metricsSnapshot; callers must already hold s.mu (all four jobStateDone
+// transition points in run() do).
+func (s *jobService) recordJobOutcomeLocked(jr *jobRecord) {
+	if jr.ErrorReason == "" {
+		s.completedTotal++
+	} else {
+		s.failedTotal++
+	}
+}
+
 func (s *jobService) run(jobID, projectID string) {
 	s.mu.RLock()
 	jrForPriority := s.jobsByProject[projectID][jobID]
@@ -335,6 +368,7 @@ func (s *jobService) run(jobID, projectID string) {
 		jr.ErrorReason = "stopped"
 		jr.ErrorMessage = "job cancelled before execution"
 		jr.EndedAt = time.Now().UTC()
+		s.recordJobOutcomeLocked(jr)
 		_ = s.persistLocked()
 		s.mu.Unlock()
 		return
@@ -358,6 +392,7 @@ func (s *jobService) run(jobID, projectID string) {
 		jr.ErrorReason = "stopped"
 		jr.ErrorMessage = "job cancelled before execution"
 		jr.EndedAt = time.Now().UTC()
+		s.recordJobOutcomeLocked(jr)
 		_ = s.persistLocked()
 		s.mu.Unlock()
 		return
@@ -387,6 +422,7 @@ func (s *jobService) run(jobID, projectID string) {
 		jr.ErrorReason = "stopped"
 		jr.ErrorMessage = "job cancelled"
 		jr.EndedAt = time.Now().UTC()
+		s.recordJobOutcomeLocked(jr)
 		s.projectVersions[projectID]++
 		_ = s.persistLocked()
 		return
@@ -403,6 +439,7 @@ func (s *jobService) run(jobID, projectID string) {
 	}
 	jr.State = jobStateDone
 	jr.EndedAt = time.Now().UTC()
+	s.recordJobOutcomeLocked(jr)
 	s.projectVersions[projectID]++
 	_ = s.persistLocked()
 }
@@ -652,6 +689,44 @@ func requiresStorageWriteBackpressure(jobType string) bool {
 	}
 }
 
+// metricsSnapshot backs GET /_emulator/metrics: submitted/completed/failed
+// job counters, plus a live occupancy/capacity gauge for each concurrency
+// limiter already in the run() path (runSlots, storageWriteSlots,
+// resourceSlots) — no new bookkeeping needed, since a buffered channel's
+// len/cap already is that gauge. There is no retry mechanism anywhere in
+// this codebase (a failed job is never automatically re-run), so no retry
+// counter is reported here rather than fabricating one that would always
+// read zero.
+func (s *jobService) metricsSnapshot() map[string]any {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	resourceLocksHeld := 0
+	for _, slot := range s.resourceSlots {
+		resourceLocksHeld += len(slot)
+	}
+
+	return map[string]any{
+		"submittedTotal":     s.submittedTotal,
+		"completedTotal":     s.completedTotal,
+		"failedTotal":        s.failedTotal,
+		"runQueue":           channelGauge(s.runSlots),
+		"storageWriteQueue":  channelGauge(s.storageWriteSlots),
+		"resourceLocksHeld":  resourceLocksHeld,
+		"resourceLocksTotal": len(s.resourceSlots),
+	}
+}
+
+// channelGauge reports a buffered-channel semaphore's live occupancy: nil
+// (the limiter is disabled, e.g. LOCAQL_JOB_WORKERS unset) reports
+// unbounded rather than a misleading capacity of 0.
+func channelGauge(ch chan struct{}) map[string]any {
+	if ch == nil {
+		return map[string]any{"depth": 0, "capacity": 0, "unbounded": true}
+	}
+	return map[string]any{"depth": len(ch), "capacity": cap(ch), "unbounded": false}
+}
+
 func renderJobResource(j *jobRecord) map[string]any {
 	status := map[string]any{"state": string(j.State)}
 	if j.ErrorReason != "" {
@@ -672,6 +747,9 @@ func renderJobResource(j *jobRecord) map[string]any {
 			"enabled":  j.Statistics.Simulated,
 			"executor": j.Statistics.Executor,
 		},
+	}
+	if j.SessionID != "" {
+		stats["sessionInfo"] = map[string]string{"sessionId": j.SessionID}
 	}
 
 	res := map[string]any{
@@ -813,10 +891,29 @@ func (s *jobService) loadPersistence() {
 	s.counter = snap.Counter
 }
 
+// persistLocked snapshots job state to disk when persistence is configured,
+// tracking the outcome in lastPersistError/lastPersistErrorAt for
+// GET /_emulator/diagnostics — every existing call site already discards
+// this function's returned error (persistence failures were, until Sesión
+// 83, completely invisible: a full disk or a permissions problem would fail
+// silently forever). This does not change that call-site behavior; it just
+// makes the last failure observable rather than swallowed entirely.
 func (s *jobService) persistLocked() error {
 	if strings.TrimSpace(s.persistencePath) == "" {
 		return nil
 	}
+	err := s.persistLockedInner()
+	if err != nil {
+		s.lastPersistError = err.Error()
+		s.lastPersistErrorAt = time.Now().UTC()
+	} else {
+		s.lastPersistError = ""
+		s.lastPersistErrorAt = time.Time{}
+	}
+	return err
+}
+
+func (s *jobService) persistLockedInner() error {
 	snap := jobServiceSnapshot{
 		Counter:        s.counter,
 		JobsByProject:  s.jobsByProject,
@@ -848,4 +945,77 @@ func (s *jobService) persistLocked() error {
 		return err
 	}
 	return nil
+}
+
+// jobFailureSummary is one entry in GET /_emulator/diagnostics'
+// recentJobFailures — real failed jobs from the live catalog, not synthetic.
+type jobFailureSummary struct {
+	ProjectID    string    `json:"projectId"`
+	JobID        string    `json:"jobId"`
+	JobType      string    `json:"jobType"`
+	ErrorReason  string    `json:"errorReason"`
+	ErrorMessage string    `json:"errorMessage"`
+	EndedAt      time.Time `json:"endedAt"`
+}
+
+// recentFailures returns up to limit failed jobs across every project,
+// newest first — the "why did my load/query/copy job fail" troubleshooting
+// view, without needing to already know the job ID to look it up.
+func (s *jobService) recentFailures(limit int) []jobFailureSummary {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var out []jobFailureSummary
+	for projectID, jobs := range s.jobsByProject {
+		for _, jr := range jobs {
+			if jr.ErrorReason == "" {
+				continue
+			}
+			out = append(out, jobFailureSummary{
+				ProjectID:    projectID,
+				JobID:        jr.JobID,
+				JobType:      jr.JobType,
+				ErrorReason:  jr.ErrorReason,
+				ErrorMessage: jr.ErrorMessage,
+				EndedAt:      jr.EndedAt,
+			})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].EndedAt.After(out[j].EndedAt) })
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out
+}
+
+// resourceLockKeysHeld reports exactly which resource keys (project:dataset.table)
+// are currently locked, not just a count — the "guided" part of
+// troubleshooting a mutation that appears to hang: it tells you which
+// specific table is contended, not just that something is.
+func (s *jobService) resourceLockKeysHeld() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var held []string
+	for key, slot := range s.resourceSlots {
+		if len(slot) > 0 {
+			held = append(held, key)
+		}
+	}
+	sort.Strings(held)
+	return held
+}
+
+// persistenceStatus backs the "persistence" field of GET /_emulator/diagnostics.
+func (s *jobService) persistenceStatus() map[string]any {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	status := map[string]any{
+		"enabled": s.persistencePath != "",
+		"path":    s.persistencePath,
+	}
+	if s.lastPersistError != "" {
+		status["lastError"] = s.lastPersistError
+		status["lastErrorAt"] = s.lastPersistErrorAt
+	}
+	return status
 }

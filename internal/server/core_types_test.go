@@ -119,29 +119,26 @@ func TestDateColumnToColumnComparisonWorksCorrectly(t *testing.T) {
 	}
 }
 
-// TestKnownUpstreamBugDateStringLiteralParsingIsOffByOneDay documents a real,
-// verified bug in goccy/googlesqlite (not a LocaQL defect, and not
-// workaroundable from LocaQL's side: it happens inside the query engine's
-// own SQL text analysis, which LocaQL cannot intercept without parsing SQL
-// itself — exactly what adopting a real engine was meant to avoid).
-// Constructing a DATE value from a string — either `DATE 'YYYY-MM-DD'`
-// literal syntax or `CAST('YYYY-MM-DD' AS DATE)` — silently produces a date
-// exactly one calendar day earlier than the string says. Verified NOT to
-// affect: DATETIME/TIMESTAMP/TIME literals, CURRENT_DATE(), DATE(<timestamp>)
-// extraction, or comparing two real DATE columns to each other (see
-// TestDateColumnToColumnComparisonWorksCorrectly above) — only constructing
-// a DATE from a string is affected. This test pins the CURRENT (buggy)
-// behavior explicitly: if a future googlesqlite upgrade fixes this, the
-// assertion below fails, which is the intended signal to update
-// KNOWN-DIVERGENCES.md and this comment rather than silently going stale.
-func TestKnownUpstreamBugDateStringLiteralParsingIsOffByOneDay(t *testing.T) {
+// TestDateStringLiteralParsesCorrectlyRegardlessOfHostTimezone guards
+// against a real bug found via Sesión 85's CI work: constructing a DATE
+// value from a string — either `DATE 'YYYY-MM-DD'` literal syntax or
+// `CAST('YYYY-MM-DD' AS DATE)` — used to silently produce a date one
+// calendar day earlier than the string says, but only on a host machine
+// configured with a negative UTC offset (e.g. America/Bogota, UTC-5) —
+// confirmed absent on a UTC-configured GitHub Actions runner while still
+// reproducing locally, and confirmed fixed by forcing time.Local = time.UTC
+// (see internal/server/server.go's init()), not a version-dependent
+// property of the embedded query engine itself. This test pins the
+// CORRECT, timezone-independent behavior: if it ever regresses, something
+// reintroduced ambient-timezone sensitivity into DATE literal handling.
+func TestDateStringLiteralParsesCorrectlyRegardlessOfHostTimezone(t *testing.T) {
 	s := newTestServer()
 	code, qout := syncQuery(t, s, "SELECT DATE '2026-01-01' AS d")
 	if code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %v", code, qout)
 	}
 	got := cellsOf(t, qout, 0)[0]
-	if got != "2025-12-31" {
-		t.Fatalf("known upstream bug behavior changed: expected the buggy off-by-one value 2025-12-31, got %v — if googlesqlite fixed this, update KNOWN-DIVERGENCES.md", got)
+	if got != "2026-01-01" {
+		t.Fatalf("expected DATE '2026-01-01' to parse as 2026-01-01 regardless of host timezone, got %v", got)
 	}
 }

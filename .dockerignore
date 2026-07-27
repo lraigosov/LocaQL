@@ -1,0 +1,9 @@
+.git
+.github
+dist
+bin
+local-support
+devlog.md
+*.exe
+locaql
+locaql-ui

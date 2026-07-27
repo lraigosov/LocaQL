@@ -3,11 +3,13 @@ module github.com/lraigosov/LocaQL
 go 1.25.0
 
 require (
+	cloud.google.com/go/bigquery v1.79.0
 	github.com/chromedp/cdproto v0.0.0-20250403032234-65de8f5d025b
 	github.com/chromedp/chromedp v0.13.7
 	github.com/goccy/googlesqlite v0.3.1
 	github.com/linkedin/goavro/v2 v2.15.0
 	github.com/parquet-go/parquet-go v0.30.1
+	google.golang.org/grpc v1.82.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -46,12 +48,14 @@ require (
 	github.com/rogpeppe/go-internal v1.15.0 // indirect
 	github.com/spaolacci/murmur3 v1.1.0 // indirect
 	github.com/twpayne/go-geom v1.6.1 // indirect
-	golang.org/x/net v0.53.0 // indirect
+	golang.org/x/net v0.56.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
-	golang.org/x/sys v0.43.0 // indirect
-	golang.org/x/text v0.37.0 // indirect
+	golang.org/x/sys v0.46.0 // indirect
+	golang.org/x/text v0.38.0 // indirect
 	gonum.org/v1/gonum v0.17.0 // indirect
 	google.golang.org/genproto v0.0.0-20260319201613-d00831a3d3e7 // indirect
+	google.golang.org/genproto/googleapis/api v0.0.0-20260630182238-925bb5da69e7 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20260630182238-925bb5da69e7 // indirect
 	google.golang.org/protobuf v1.36.12-0.20260120151049-f2248ac996af // indirect
 	gopkg.in/check.v1 v1.0.0-20201130134442-10cb98267c6c // indirect
 	modernc.org/libc v1.72.3 // indirect
