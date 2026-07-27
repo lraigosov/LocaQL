@@ -76,7 +76,7 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=semver,pattern={{version}},value=${{ env.TAG }}
-            type=semver,pattern={{major}}.minor}},value=${{ env.TAG }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ env.TAG }}
             type=raw,value=latest
       - uses: docker/build-push-action@v6
         with:
@@ -107,31 +107,19 @@ jobs:
           go-version-file: go.mod
       - run: make build-all VERSION=${{ env.TAG }}
       - run: make sbom VERSION=${{ env.TAG }}
->>>>>>> origin/dev
       - name: Archive each platform's binaries
         run: |
           cd dist
           for platform_dir in */; do
             name="${platform_dir%/}"
-<<<<<<< HEAD
             tar czf "../locaql-${TAG}-${name}.tar.gz" -C "$name" .
-=======
-            tar czf "../locaql-${{ github.ref_name }}-${name}.tar.gz" -C "$name" .
->>>>>>> origin/dev
           done
       - name: Create GitHub Release with binaries and SBOM attached
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-<<<<<<< HEAD
           gh release create "${TAG}" \
             --title "${TAG}" \
             --generate-notes \
             locaql-${TAG}-*.tar.gz \
-=======
-          gh release create "${{ github.ref_name }}" \
-            --title "${{ github.ref_name }}" \
-            --generate-notes \
-            locaql-${{ github.ref_name }}-*.tar.gz \
->>>>>>> origin/dev
             dist/sbom.json
