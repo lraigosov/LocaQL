@@ -49,6 +49,7 @@ This repository currently implements incremental scope from the master plan:
 - WSL distribution: `Ubuntu-24.04`
 - Go 1.25.0+ (bumped from 1.22 for `parquet-go/parquet-go`, then to 1.25.0 for `goccy/googlesqlite`'s real GoogleSQL query engine; `GOTOOLCHAIN=auto`, the Go default, downloads it automatically)
 - For race tests: `build-essential` (provides `gcc` for cgo).
+- **Run LocaQL itself on Linux (including WSL on Windows) — not verified to work natively on Windows or macOS.** The query engine's WASM-based analyzer traps at runtime outside Linux (discovered in Sesión 85; see [Known Divergences](KNOWN-DIVERGENCES.md) Blocking #3): the binary builds fine for every platform, but every query fails. Building/cross-compiling from any OS is unaffected — only running it natively on Windows/macOS is currently broken.
 
 ## Quick Start (WSL)
 
@@ -838,11 +839,13 @@ Every push and pull request to `main`/`dev` runs [`.github/workflows/ci.yml`](.g
 | --- | --- | --- |
 | `test` | ubuntu-latest | `go build ./...`, `go vet ./...`, `go test ./...`, `CGO_ENABLED=1 go test -race ./internal/server` |
 | `e2e` | ubuntu-latest | `go test -tags e2e ./cmd/locaql-ui/...` against the Chrome preinstalled on GitHub's Linux runner image (see [End-to-End Console Tests](#end-to-end-console-tests)) |
-| `native` | windows-latest, macos-latest | `go build`/`go vet`/`go test ./...` natively on each OS, catching platform-specific issues a Linux-only run or a cross-compile check alone would miss |
+| `native` | windows-latest, macos-latest | `go build`/`go vet`/`go test ./...` natively on each OS; `go test` is `continue-on-error` (see below) |
 | `cross-build` | ubuntu-latest (5-way matrix) | `CGO_ENABLED=0 go build` for `locaql`/`locaql-ui` across every `make build-all` target: `linux/amd64`, `linux/arm64`, `windows/amd64`, `darwin/amd64`, `darwin/arm64` |
 | `license-scan` | ubuntu-latest | [`go-licenses`](https://github.com/google/go-licenses) `check`/`csv` over the full dependency tree; fails on a forbidden (copyleft) license, uploads the per-dependency CSV as a build artifact |
 
 The `license-scan` job pins `go-licenses` to `v1.0.0` rather than `@latest`: at the time this was written, `@latest` fails on every package that imports anything from the standard library (`mime/multipart`, `io/ioutil`, `flag`, ...) with `"does not have module info"` and exits nonzero before producing any report — a confirmed, still-open upstream regression ([google/go-licenses#128](https://github.com/google/go-licenses/issues/128)), not something specific to this project. Two indirect dependencies (`github.com/ncruces/go-sqlite3-wasm/v2`, `modernc.org/mathutil`) have no `LICENSE`/`COPYING`/`README`/`NOTICE` file discoverable in their module cache copy, so the scan reports them as `Unknown` rather than guessing — worth a manual look if you're auditing licenses closely, not a build failure.
+
+**`native`'s `go test ./...` step is `continue-on-error`, not a passing check**: this CI job is the first time this project's test suite has ever actually run on native Windows or macOS (development has always happened through WSL/Linux, per [Requirements](#requirements)), and it surfaced a real, previously-unknown limitation — see [Known Divergences](KNOWN-DIVERGENCES.md) for the full detail. `go build`/`go vet` are unaffected and still block on failure.
 
 ## Contributing
 
