@@ -32,4 +32,36 @@ LocaQL is not affiliated with, endorsed by, sponsored by, or otherwise
 officially connected to Google LLC, Google Cloud, or BigQuery. "BigQuery"
 and any related Google trademarks are the property of their respective
 owner. LocaQL's user interface is an original design and does not copy
-the Google Cloud Console's branding, logos, or visual identity.
+the Google Cloud Console's branding, logos, or visual identity. This
+disclaimer is about corporate affiliation and branding — it does not
+describe the actual open-source code LocaQL runs, documented below.
+
+Third-party notice: GoogleSQL / ZetaSQL (Apache License 2.0)
+--------------------------------------------------------------
+LocaQL's query engine is not a hand-written GoogleSQL implementation.
+It runs the real parser/analyzer from Google's `google/googlesql`
+project (https://github.com/google/googlesql, formerly ZetaSQL) —
+Copyright Google LLC, licensed under the Apache License, Version 2.0
+(http://www.apache.org/licenses/LICENSE-2.0) — by way of a dependency
+chain that compiles that engine to WebAssembly and transpiles the
+result to pure Go: google/googlesql -> goccy/googlesql-wasm ->
+goccy/wasm2go -> goccy/go-googlesql -> goccy/googlesqlite (imported
+directly by LocaQL). Each of those goccy/* repositories publishes its
+own wrapper/tooling code under the MIT License, but the GoogleSQL
+engine logic transpiled inside them remains Apache-2.0-licensed,
+Google-authored work — an MIT license on the surrounding tooling does
+not relicense it.
+
+This notice exists because, at the time it was written, none of those
+intermediate `goccy/*` repositories shipped a NOTICE file carrying that
+attribution forward themselves (verified by checking each repository
+directly) — so LocaQL states it explicitly here instead of silently
+passing the gap through. Apache License 2.0 is used under license, not
+under any Google trademark or endorsement grant: LocaQL's own Apache-2.0
+license is compatible with consuming Apache-2.0-licensed dependencies
+(no license-conflict issue), and using Google's real, permissively
+licensed open-source code here is exactly what "compatible with
+selected Google BigQuery APIs" means in practice — the SQL dialect
+itself comes from Google's own real implementation, not a guess at its
+behavior. It does not create, and should not be read as implying,
+sponsorship, endorsement, or any other affiliation with Google LLC.

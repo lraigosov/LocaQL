@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted (Sesión 73; known limitation added Sesión 85).
+Accepted (Sesión 73; known limitation added Sesión 85; licensing consideration corrected in a later session — see Consequences).
 
 ## Context
 
@@ -37,3 +37,16 @@ falling back to a fabricated `200`.
 - The local master plan's §40 explores a hypothetical future migration to DuckDB as an alternative engine; that
   remains unstarted exploratory planning, not a decision — this ADR only covers the engine actually in production
   use today.
+- **Licensing: this ADR originally omitted a real consideration, corrected here rather than left standing.**
+  `goccy/googlesqlite` isn't a hand-rolled MIT-licensed GoogleSQL implementation — `go-googlesql` compiles the real
+  parser/analyzer from Google's own [`google/googlesql`](https://github.com/google/googlesql) (formerly ZetaSQL,
+  Apache License 2.0, Copyright Google LLC) to WebAssembly and transpiles that to Go source
+  (`google/googlesql` -> `goccy/googlesql-wasm` -> `goccy/wasm2go` -> `goccy/go-googlesql` -> `goccy/googlesqlite`).
+  Each intermediate `goccy/*` repository publishes its own wrapper code under MIT, but the transpiled engine logic
+  inside remains Apache-2.0, Google-authored work — an MIT license on the surrounding tooling doesn't relicense it,
+  and none of those repositories shipped a NOTICE file carrying that attribution forward at the time this was
+  checked. This is not a license **conflict** — Apache-2.0 and MIT are both permissive and freely combinable, and
+  LocaQL's own license is already Apache-2.0 — but it is a real attribution gap this project's own `NOTICE` file
+  didn't originally cover. Fixed by adding an explicit third-party notice to `NOTICE` for `google/googlesql`
+  (Apache-2.0) rather than silently depending on upstream `goccy/*` repositories to have already handled it. See
+  ADR 0001 for the broader licensing/non-affiliation posture this extends.
