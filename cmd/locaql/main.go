@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -252,6 +253,7 @@ func runWorkspaceValidate(args []string) error {
 func runStart(args []string) error {
 	fs := flag.NewFlagSet("start", flag.ContinueOnError)
 	addr := fs.String("addr", ":9050", "http address")
+	storageGRPCAddr := fs.String("storage-grpc-addr", ":9060", "BigQuery Storage Read API gRPC address")
 	capPath := fs.String("capabilities", "capabilities/registry.yaml", "capabilities registry path")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -263,6 +265,19 @@ func runStart(args []string) error {
 	}
 
 	srv := server.New(reg)
+
+	grpcListener, err := net.Listen("tcp", *storageGRPCAddr)
+	if err != nil {
+		return fmt.Errorf("listen for storage gRPC on %s: %w", *storageGRPCAddr, err)
+	}
+	grpcServer := srv.NewStorageGRPCServer()
+	go func() {
+		log.Printf("LocaQL Storage Read API (gRPC) listening on %s", *storageGRPCAddr)
+		if err := grpcServer.Serve(grpcListener); err != nil {
+			log.Printf("storage gRPC server stopped: %v", err)
+		}
+	}()
+
 	log.Printf("LocaQL listening on %s", *addr)
 	return http.ListenAndServe(*addr, srv.Handler())
 }
