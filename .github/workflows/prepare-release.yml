@@ -1,0 +1,113 @@
+name: Prepare Release
+
+# Runs on every push to main. Fully automatic: detects whether CHANGELOG.md's
+# [Unreleased] section has anything in it, works out the right SemVer bump
+# from which subsections are present (### Removed or a BREAKING marker ->
+# major, ### Added -> minor, anything else -> patch), dates the section, and
+# opens (or refreshes) a release/vX.Y.Z -> main PR. No manual version input,
+# no manual trigger. The only human step left is reviewing and merging that
+# PR — main's branch protection requires that regardless of who proposes the
+# change. Merging it is what auto-tag-release.yml reacts to.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: prepare-release
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    name: Detect version, date CHANGELOG, open release PR
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      # A push that IS a release-PR merge lands with an already-emptied
+      # [Unreleased] (this same job dated it in the commit that just merged),
+      # so this step correctly finds nothing and every later step is skipped
+      # via `if: steps.check.outputs.bump != 'none'`. That's what prevents
+      # this workflow from looping on its own merges.
+      - name: Detect release bump from [Unreleased] content
+        id: check
+        run: |
+          section=$(awk '/^## \[Unreleased\]/{flag=1; next} /^## \[/{flag=0} flag {print}' CHANGELOG.md)
+          if echo "$section" | grep -qE '^### Removed|BREAKING'; then
+            bump=major
+          elif echo "$section" | grep -qE '^### Added'; then
+            bump=minor
+          elif [ -n "$(echo "$section" | tr -d '[:space:]')" ]; then
+            bump=patch
+          else
+            bump=none
+          fi
+          echo "Detected bump: $bump"
+          echo "bump=$bump" >> "$GITHUB_OUTPUT"
+
+      - name: Compute next version
+        if: steps.check.outputs.bump != 'none'
+        id: version
+        run: |
+          latest=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -1)
+          latest="${latest#v}"
+          latest="${latest:-0.0.0}"
+          IFS='.' read -r major minor patch <<< "$latest"
+          case "${{ steps.check.outputs.bump }}" in
+            major) next="$((major + 1)).0.0" ;;
+            minor) next="${major}.$((minor + 1)).0" ;;
+            patch) next="${major}.${minor}.$((patch + 1))" ;;
+          esac
+          echo "Latest tag: v${latest} -> next: v${next}"
+          echo "version=$next" >> "$GITHUB_OUTPUT"
+
+      - name: Date the Unreleased section
+        if: steps.check.outputs.bump != 'none'
+        id: date
+        run: |
+          today=$(date -u +%Y-%m-%d)
+          echo "date=$today" >> "$GITHUB_OUTPUT"
+          sed -i "s/^## \[Unreleased\]/## [Unreleased]\n\n## [${{ steps.version.outputs.version }}] - ${today}/" CHANGELOG.md
+
+      # Auto-generated bookkeeping PR: if an older one is still open (e.g.
+      # the bump level changed after more commits landed since it was
+      # opened), replace it outright rather than reconciling branch state.
+      - name: Close any stale open release PR
+        if: steps.check.outputs.bump != 'none'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          stale=$(gh pr list --state open --json number,headRefName \
+            --jq '.[] | select(.headRefName | startswith("release/")) | .number')
+          for n in $stale; do
+            gh pr close "$n" --delete-branch
+          done
+
+      - name: Create release branch and commit
+        if: steps.check.outputs.bump != 'none'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -B "release/v${{ steps.version.outputs.version }}"
+          git add CHANGELOG.md
+          git commit -m "chore: release v${{ steps.version.outputs.version }}"
+          git push --force origin "release/v${{ steps.version.outputs.version }}"
+
+      - name: Open pull request to main
+        if: steps.check.outputs.bump != 'none'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr create \
+            --base main \
+            --head "release/v${{ steps.version.outputs.version }}" \
+            --title "chore: release v${{ steps.version.outputs.version }}" \
+            --body "Auto-detected bump: **${{ steps.check.outputs.bump }}** (from which \`### \` subsections are under \`[Unreleased]\`). Dates \`CHANGELOG.md\`'s \`[Unreleased]\` section into \`[${{ steps.version.outputs.version }}] - ${{ steps.date.outputs.date }}\` and opens a fresh empty \`[Unreleased]\` section above it for future work.
+
+          Merging this PR automatically creates and pushes the \`v${{ steps.version.outputs.version }}\` tag and runs the release pipeline (build/vet/test/race, multi-arch GHCR image, cross-compiled binaries + SBOM attached to a GitHub Release) — see \`.github/workflows/auto-tag-release.yml\`. Reviewing and merging this PR is the only manual step in the whole release process."
