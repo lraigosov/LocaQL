@@ -2156,15 +2156,33 @@ func TestJobsPersistenceAtomicReplaceDoesNotLeakTempFile(t *testing.T) {
 	storePath := filepath.Join(t.TempDir(), "jobs", "state.json")
 	js := newJobServiceWithPersistence(storePath)
 
-	if _, created := js.insert(jobInsertOptions{ProjectID: "p1", RequestID: "persist-tmp", JobType: "query"}); !created {
+	jr, created := js.insert(jobInsertOptions{ProjectID: "p1", RequestID: "persist-tmp", JobType: "query"})
+	if !created {
 		t.Fatalf("expected job creation")
 	}
 
-	// The background job goroutine calls persistLocked() again on its own
-	// RUNNING/DONE transitions, so the .tmp file can legitimately still be
-	// mid-write briefly after insert() returns. Poll instead of a single
-	// fixed-delay check: under -race, scheduling overhead can stretch that
-	// window past a short fixed sleep and make the test flaky without this.
+	// Wait for the job to reach its terminal state before returning: the
+	// background job goroutine calls persistLocked() again on its own
+	// RUNNING/DONE transitions, and t.TempDir()'s automatic cleanup can run
+	// concurrently with one of those writes otherwise, intermittently
+	// failing with "RemoveAll cleanup: ... directory not empty" — a real
+	// flake found via CI (Sesión 85), not reproducible on every run.
+	doneDeadline := time.Now().Add(2 * time.Second)
+	for {
+		if current, ok := js.get("p1", jr.JobID); ok && current.State == jobStateDone {
+			break
+		}
+		if time.Now().After(doneDeadline) {
+			t.Fatalf("expected job to reach DONE within deadline")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// The DONE transition above still triggers persistLocked() itself, so
+	// the .tmp file can legitimately be mid-write briefly after it. Poll
+	// instead of a single fixed-delay check: under -race, scheduling
+	// overhead can stretch that window past a short fixed sleep and make
+	// the test flaky without this.
 	deadline := time.Now().Add(1 * time.Second)
 	for {
 		_, err := os.Stat(storePath + ".tmp")

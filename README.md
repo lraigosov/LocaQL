@@ -1,5 +1,7 @@
 # LocaQL
 
+[![CI](https://github.com/lraigosov/LocaQL/actions/workflows/ci.yml/badge.svg)](https://github.com/lraigosov/LocaQL/actions/workflows/ci.yml)
+
 LocaQL is a local BigQuery-compatible development platform.
 
 This repository currently implements incremental scope from the master plan:
@@ -20,6 +22,7 @@ This repository currently implements incremental scope from the master plan:
 - [Query Engine: Real GoogleSQL via an Embedded SQLite Backend](#query-engine-real-googlesql-via-an-embedded-sqlite-backend)
 - [Concurrency and Isolation Notes](#concurrency-and-isolation-notes)
 - [Job State Model](#job-state-model)
+- [Operational Observability: Structured Logging, Request Metrics, and Extended Health](#operational-observability-structured-logging-request-metrics-and-extended-health)
 - [Workspace Promotion Flow](#workspace-promotion-flow)
 - [Load Jobs: Real Row Ingestion (NDJSON / CSV / Avro / Parquet)](#load-jobs-real-row-ingestion-ndjson--csv--avro--parquet)
 - [Extract Jobs: Real Table Export (NDJSON / CSV / Avro / Parquet)](#extract-jobs-real-table-export-ndjson--csv--avro--parquet)
@@ -29,11 +32,15 @@ This repository currently implements incremental scope from the master plan:
 - [Routines and Models: Metadata CRUD](#routines-and-models-metadata-crud)
 - [External Tables: Query Local Files Without Loading](#external-tables-query-local-files-without-loading)
 - [Views and Materialized Views: Real Resources Backed by the Query Engine](#views-and-materialized-views-real-resources-backed-by-the-query-engine)
+- [Sessions and Multi-Statement Transactions](#sessions-and-multi-statement-transactions)
+- [BigQuery Storage API: Real gRPC Read Sessions (Avro) and Write Streams (Protobuf)](#bigquery-storage-api-real-grpc-read-sessions-avro-and-write-streams-protobuf)
 - [Fake GCS: A Real Cloud Storage JSON API, Locally](#fake-gcs-a-real-cloud-storage-json-api-locally)
 - [Conformance Baseline](#conformance-baseline)
 - [Test](#test)
 - [End-to-End Console Tests](#end-to-end-console-tests)
 - [LocaQL Console (Standalone UI)](#locaql-console-standalone-ui)
+- [Building and Releasing](#building-and-releasing)
+- [Continuous Integration](#continuous-integration)
 - [Contributing](#contributing)
 - [License](#license)
 
@@ -42,6 +49,7 @@ This repository currently implements incremental scope from the master plan:
 - WSL distribution: `Ubuntu-24.04`
 - Go 1.25.0+ (bumped from 1.22 for `parquet-go/parquet-go`, then to 1.25.0 for `goccy/googlesqlite`'s real GoogleSQL query engine; `GOTOOLCHAIN=auto`, the Go default, downloads it automatically)
 - For race tests: `build-essential` (provides `gcc` for cgo).
+- **Run LocaQL itself on Linux (including WSL on Windows) — not verified to work natively on Windows or macOS.** The query engine's WASM-based analyzer traps at runtime outside Linux (discovered in Sesión 85; see [Known Divergences](KNOWN-DIVERGENCES.md) Blocking #3): the binary builds fine for every platform, but every query fails. Building/cross-compiling from any OS is unaffected — only running it natively on Windows/macOS is currently broken.
 
 ## Quick Start (WSL)
 
@@ -77,7 +85,8 @@ Registry file:
 
 | Area | Status | Notes |
 | --- | --- | --- |
-| Emulator internal endpoints | Supported | `/_emulator/health`, `/_emulator/readiness`, `/_emulator/version`, `/_emulator/capabilities` |
+| Emulator internal endpoints | Supported | `/_emulator/health`, `/_emulator/readiness` (both now include per-subsystem diagnostics), `/_emulator/version`, `/_emulator/capabilities`, `/_emulator/metrics` |
+| Operational observability | Partial | Structured (`log/slog` JSON) request logging, a `/_emulator/metrics` JSON snapshot (request counts/latency histogram, job submitted/completed/failed counters, live queue/backpressure gauges), and a `/_emulator/diagnostics` guided-troubleshooting endpoint (real persistence failure tracking, recent job failures, contended resource lock keys, active sessions, effective `LOCAQL_*` env vars) — see [Operational Observability](#operational-observability-structured-logging-request-metrics-and-extended-health). No Prometheus text exposition, distributed tracing, slow-query log, or catalog audit yet; release pipeline (binary/container/notes) not started |
 | Dataset management | Supported | `datasets.list`, `datasets.get`, `datasets.insert`, `datasets.delete` (requires `deleteContents=true` to remove a non-empty dataset's tables), `datasets.patch` (`friendlyName`, `location`, `labels`, `defaultTableExpirationMs` — now enforced: tables lazily expire and are purged based on it, or on an explicit per-table `expirationTime` override) |
 | REST pagination baseline | Supported | `datasets.list`, `tables.list`, `jobs.list`, `tabledata.list` |
 | Opaque pagination tokens | Supported | `nextPageToken` is opaque; legacy numeric token input remains accepted |
@@ -95,7 +104,9 @@ Registry file:
 | Concurrent reads safety | Partial | `jobs.get` and `jobs.list` use read locks (`RWMutex`) |
 | Resource mutation serialization | Partial | Conflicting mutations serialized by `project:dataset.table` |
 | Catalog snapshot atomicity | Partial | Optional persisted state uses temp file replace to avoid partial commits |
-| INFORMATION_SCHEMA priority | Partial | `SCHEMATA`, `SCHEMATA_OPTIONS`, `TABLES`, `COLUMNS`, `TABLE_OPTIONS`, `JOBS`, `JOBS_BY_PROJECT`, `JOBS_BY_USER`, `PARTITIONS`, `ROUTINES`, `PARAMETERS`, `MODELS`, `VIEWS` and `MATERIALIZED_VIEWS` are served from the in-memory catalog; none support column projection yet (a `SELECT` with an explicit column list still returns every column). `SESSIONS` is not implemented |
+| INFORMATION_SCHEMA priority | Partial | `SCHEMATA`, `SCHEMATA_OPTIONS`, `TABLES`, `COLUMNS`, `TABLE_OPTIONS`, `JOBS`, `JOBS_BY_PROJECT`, `JOBS_BY_USER`, `PARTITIONS`, `ROUTINES`, `PARAMETERS`, `MODELS`, `VIEWS`, `MATERIALIZED_VIEWS` and `SESSIONS_BY_USER` are served from the in-memory catalog; none support column projection yet (a `SELECT` with an explicit column list still returns every column). `SESSIONS_BY_PROJECT` is not implemented, matching real BigQuery |
+| Sessions and transactions | Partial | `createSession`/`connectionProperties` (`session_id`) on `jobs.query`/`jobs.insert`, idle-expiring; session-scoped `` _SESSION.<table> `` temp tables (`CREATE TEMP TABLE ... AS SELECT` only) and `BEGIN`/`COMMIT`/`ROLLBACK TRANSACTION` implemented in LocaQL's own catalog rather than passed through to the query engine (see [Sessions and Multi-Statement Transactions](#sessions-and-multi-statement-transactions)); a transaction's atomicity never extends to real base tables |
+| BigQuery Storage API (gRPC) | Partial | Real `CreateReadSession`/`ReadRows` and `CreateWriteStream`/`AppendRows`/`FinalizeWriteStream`/`BatchCommitWriteStreams` on a separate plaintext gRPC listener (`--storage-grpc-addr`, default `:9060`); Read: column projection/`row_restriction` run through the real SQL engine, Avro framing only, one stream per session, no `SplitReadStream`/Arrow. Write: real protobuf row decoding via `dynamicpb`, `_default`/COMMITTED/PENDING streams with atomic `BatchCommitWriteStreams` and real offset/exactly-once semantics, no BUFFERED streams/`FlushRows` (see [BigQuery Storage API](#bigquery-storage-api-real-grpc-read-sessions-avro-and-write-streams-protobuf)) |
 | Workspace validation | Supported | `locaql workspace validate` checks required portable workspace structure before promotion |
 | Workspace planning and diff | Supported | `locaql workspace plan` and `locaql workspace diff` provide portable inventory and deterministic source-target delta |
 | Workspace apply dry-run | Supported | `locaql workspace apply --dry-run=true` returns planned actions without mutating target |
@@ -132,7 +143,7 @@ flowchart LR
 
 For every query, LocaQL scans the query text for `FROM`/`JOIN` table references, materializes exactly those tables into a fresh in-memory engine instance (one SQL schema per dataset, real rows converted from LocaQL's stored string-per-cell representation into typed values), then runs the query for real. This means `WHERE`, column projection, `JOIN`, aggregate functions with `GROUP BY`, `ORDER BY` and `LIMIT` are genuine GoogleSQL semantics now, not simulated.
 
-Core scalar types execute with real GoogleSQL semantics too: `NUMERIC`/`BIGNUMERIC` are real decimal types in the engine (exact precision and arithmetic — `0.1 + 0.2` is exactly `0.3`, not `FLOAT64`'s binary rounding error), and `DATE`/`DATETIME`/`TIME`/`TIMESTAMP` round-trip unchanged through `tabledata.list` and compare correctly column-to-column through the engine. One exception, verified and **not fixable from LocaQL's side**: constructing a `DATE` from a string (`DATE 'YYYY-MM-DD'` literal syntax or `CAST(string AS DATE)`) is off by one day — a bug inside the query engine's own SQL analysis, not LocaQL's. See [`KNOWN-DIVERGENCES.md`](KNOWN-DIVERGENCES.md) (Blocking #2) for the full, precisely-reproduced detail and workarounds.
+Core scalar types execute with real GoogleSQL semantics too: `NUMERIC`/`BIGNUMERIC` are real decimal types in the engine (exact precision and arithmetic — `0.1 + 0.2` is exactly `0.3`, not `FLOAT64`'s binary rounding error), and `DATE`/`DATETIME`/`TIME`/`TIMESTAMP` round-trip unchanged through `tabledata.list` and compare correctly column-to-column through the engine. Constructing a `DATE` from a string (`DATE 'YYYY-MM-DD'` literal syntax or `CAST(string AS DATE)`) used to be off by one day on a host machine configured with a negative UTC offset — root-caused in Sesión 85 to the process's ambient local timezone, not a fixed engine defect, and fixed by forcing `time.Local = time.UTC` at startup (see [`KNOWN-DIVERGENCES.md`](KNOWN-DIVERGENCES.md) for the full story).
 
 ```mermaid
 flowchart LR
@@ -176,6 +187,78 @@ stateDiagram-v2
 	RUNNING --> DONE: cancel during run
 	DONE --> [*]
 ```
+
+## Operational Observability: Structured Logging, Request Metrics, and Extended Health
+
+Every request passes through a real HTTP middleware (`internal/server/observability.go`) that records metrics and emits a structured (`log/slog`, JSON) log line: successful requests log at `Debug` (silent at the default level, keeping normal test/CLI output quiet), `4xx` at `Warn`, `5xx` at `Error` — problems surface by default, without needing a verbose flag first.
+
+```mermaid
+flowchart LR
+	Request[Incoming request] --> Middleware[withObservability]
+	Middleware --> Handler[Route handler]
+	Handler --> Middleware
+	Middleware --> Log["log/slog JSON line\n(Debug/Warn/Error by status)"]
+	Middleware --> Metrics["metricsService\n(counters + latency histogram)"]
+	Metrics --> Endpoint["GET /_emulator/metrics"]
+```
+
+`GET /_emulator/metrics` returns a JSON snapshot:
+
+```bash
+curl http://localhost:9050/_emulator/metrics
+```
+
+```json
+{
+  "uptimeSeconds": 42.1,
+  "requests": {
+    "total": 128,
+    "byStatusClass": {"1xx": 0, "2xx": 120, "3xx": 0, "4xx": 6, "5xx": 2},
+    "byRouteGroup": {"emulator": 20, "bigquery": 100, "storage": 8},
+    "latencyMsBuckets": [{"leMs": "5", "count": 80}, {"leMs": "10", "count": 30}, "..."]
+  },
+  "jobs": {
+    "submittedTotal": 40, "completedTotal": 37, "failedTotal": 3,
+    "runQueue": {"depth": 0, "capacity": 4, "unbounded": false},
+    "storageWriteQueue": {"depth": 0, "capacity": 0, "unbounded": true},
+    "resourceLocksHeld": 0, "resourceLocksTotal": 3
+  },
+  "sessions": {"active": 1}
+}
+```
+
+`GET /_emulator/health` and `GET /_emulator/readiness` both include the same live `jobs`/`sessions` diagnostic detail under a `subsystems` key, so a health check surfaces real queue/backpressure/session state rather than a flat `{"status":"ok"}`.
+
+Known limitations, declared explicitly:
+
+- The metrics format is plain JSON, not Prometheus text exposition — consistent with the rest of this REST API and no new dependency, but not directly scrapeable by a real Prometheus/Grafana instance without an intermediate exporter.
+- No distributed tracing (REST handler → service → SQL engine → SQLite is not span-instrumented), no OpenTelemetry export, no slow-query log, and no sensitive-data log redaction policy — this is the "minimal metrics" increment of the master plan's broader observability vision, not the full wishlist.
+- There is no automatic retry mechanism anywhere in this codebase (a failed job is never re-run), so no retry counter is reported — one would always read zero.
+
+### Guided Troubleshooting
+
+`GET /_emulator/diagnostics` answers "why is this broken" rather than `/_emulator/metrics`' raw counters:
+
+```bash
+curl http://localhost:9050/_emulator/diagnostics
+```
+
+```json
+{
+  "persistence": {"enabled": true, "path": "/data/locaql-state.json"},
+  "recentJobFailures": [{"projectId": "p1", "jobId": "job_7", "jobType": "load", "errorReason": "invalid", "errorMessage": "...", "endedAt": "..."}],
+  "resourceLocks": {"held": ["p1:analytics.events"], "total": 3},
+  "sessions": {"active": 1},
+  "environment": {"LOCAQL_JOB_WORKERS": "4"}
+}
+```
+
+- **`persistence`** surfaces a real failure that was previously invisible: every `persistLocked()` call site already discarded its returned error, so a full disk or a permissions problem failed silently forever. `lastError`/`lastErrorAt` only appear after a real failure.
+- **`recentJobFailures`** lists the actual failed jobs behind a `failedTotal` count (project/job ID/type/reason/message/end time, newest first, capped at 20) — which job failed and why, not just how many.
+- **`resourceLocks.held`** names the specific `project:dataset.table` keys currently locked, not just a count — which table is contended, the guided part of diagnosing a mutation that appears to hang.
+- **`environment`** lists every `LOCAQL_*` variable that changes behavior, read live (not cached at startup) and included only when actually set — an unset one silently uses its documented default, and showing it as empty would misleadingly suggest it was explicitly configured to nothing.
+
+Known limitations: no dataset/table/routine/model catalog audit (a separate, larger feature); no report of whether the Storage API gRPC listener is reachable (it lives in a separate process concern, `cmd/locaql/main.go`, with no shared state back into the HTTP server today); no fault-injection capability.
 
 ## Workspace Promotion Flow
 
@@ -443,6 +526,111 @@ curl -X POST http://localhost:9050/bigquery/v2/projects/p1/datasets/analytics/ta
 - A materialized view is **not actually cached**: it is recomputed live on every access exactly like a plain view. Real BigQuery's periodic background refresh, `enableRefresh`/`refreshIntervalMs`/`lastRefreshTime` are not modeled.
 - A 3-part `project.dataset.table` reference inside a view's query only resolves against the project that created the view (see [Query Engine](#query-engine-real-googlesql-via-an-embedded-sqlite-backend)).
 
+## Sessions and Multi-Statement Transactions
+
+`jobs.query` and `jobs.insert` (`configuration.query`) accept `createSession: true` (mints a new session, returned as `sessionInfo.sessionId`) or `connectionProperties: [{"key": "session_id", "value": "..."}]` (continues an existing one — an unknown or idle-expired session fails the request explicitly with `400`, never silently). Sessions idle-expire lazily on next use (24h default, `LOCAQL_SESSION_IDLE_TIMEOUT_SECONDS` to override for local testing).
+
+Within a session, `` CREATE TEMP TABLE <name> AS <select> `` creates a session-scoped temporary table, referenced in later queries (in the same or a separate request, as long as they share `session_id`) as `` _SESSION.<name> ``. `BEGIN TRANSACTION` / `COMMIT TRANSACTION` / `ROLLBACK TRANSACTION` give that session's own temp tables real, atomic commit/rollback semantics.
+
+This is deliberately **not** a thin wrapper around the query engine's native session/transaction support: a disposable investigation spike (deleted after use) found that `goccy/googlesqlite`'s own `CREATE TEMP TABLE` registration does not survive past the single call that created it — not even pinned to one connection, not even inside an already-open transaction — and its `ROLLBACK` statement fails unconditionally (`Statement not supported: RollbackStatement`). Both are real, verified upstream limitations, not a LocaQL binding issue (see [Known Divergences](KNOWN-DIVERGENCES.md) Blocking #2). Session temp tables and transactions are therefore implemented entirely in LocaQL's own code: a session's temp tables live in its own catalog, materialized into a fresh engine instance per query exactly like any other table, with `BEGIN`/`COMMIT`/`ROLLBACK` snapshotting and restoring that catalog directly.
+
+```mermaid
+flowchart LR
+	Create["jobs.query createSession:true"] --> SessionID["sessionInfo.sessionId"]
+	SessionID --> Reuse["Later jobs.query/jobs.insert with\nconnectionProperties session_id"]
+	Reuse --> CreateTemp["CREATE TEMP TABLE t AS SELECT ..."]
+	CreateTemp --> Store["Stored in session's own temp-table catalog"]
+	Reuse --> Begin["BEGIN TRANSACTION"]
+	Begin --> Snapshot["Snapshot session temp tables"]
+	Snapshot --> Mutate["More CREATE TEMP TABLE / re-creates"]
+	Mutate --> Commit["COMMIT TRANSACTION: discard snapshot"]
+	Mutate --> Rollback["ROLLBACK TRANSACTION: restore snapshot"]
+	Store --> SelectTemp["SELECT ... FROM `_SESSION`.t"]
+```
+
+```bash
+curl -X POST http://localhost:9050/bigquery/v2/projects/p1/queries \
+  -H 'Content-Type: application/json' \
+  -d '{"query": "SELECT 1", "createSession": true}'
+# -> {"sessionInfo": {"sessionId": "session_..."}, ...}
+
+curl -X POST http://localhost:9050/bigquery/v2/projects/p1/queries \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "query": "CREATE TEMP TABLE mytemp AS SELECT 42 AS answer",
+    "connectionProperties": [{"key": "session_id", "value": "session_..."}]
+  }'
+
+curl -X POST http://localhost:9050/bigquery/v2/projects/p1/queries \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "query": "SELECT answer FROM _SESSION.mytemp",
+    "connectionProperties": [{"key": "session_id", "value": "session_..."}]
+  }'
+```
+
+`INFORMATION_SCHEMA.SESSIONS_BY_USER` lists the calling user's own non-expired sessions (`SESSIONS_BY_PROJECT` is not implemented — matching real BigQuery, which has no such view either, since sessions are inherently scoped to the connection/user that created them).
+
+Known limitations, declared explicitly:
+
+- Only the `` _SESSION.<table> `` qualified reference form resolves against a session; a bare unqualified temp table name does not.
+- Only the single-statement `CREATE TEMP TABLE <name> AS <select>` form is recognized; a separate `CREATE TEMP TABLE (schema...)` followed by standalone `INSERT` statements is not.
+- A session transaction's atomicity covers only that session's own temp tables — `INSERT`/`UPDATE`/`DELETE` against a real base table inside `BEGIN`/`COMMIT`/`ROLLBACK TRANSACTION` still does not mutate LocaQL's catalog at all, matching the existing, independent [Query Engine](#query-engine-real-googlesql-via-an-embedded-sqlite-backend) limitation that only `SELECT` is routed through the real engine.
+
+## BigQuery Storage API: Real gRPC Read Sessions (Avro) and Write Streams (Protobuf)
+
+Unlike everything else in this document, the BigQuery Storage API is a real **gRPC** service in BigQuery, not part of the JSON REST surface — so LocaQL exposes it on its own plaintext listener, separate from the REST/HTTP port, using Google's own generated protobuf/gRPC stubs (`cloud.google.com/go/bigquery/storage/apiv1/storagepb`) rather than hand-rolled message types:
+
+```bash
+locaql start --addr :9050 --storage-grpc-addr :9060
+```
+
+Like the rest of this emulator, the gRPC listener is plaintext with no TLS and no auth interceptor — the same convention Google's own local emulators (Firestore, Pub/Sub, Bigtable) already use, consistent with LocaQL's permanent anonymous-only design.
+
+### Storage Read
+
+`CreateReadSession` and `ReadRows` (`google.cloud.bigquery.storage.v1.BigQueryRead`) are real: column projection (`TableReadOptions.selected_fields`) and the push-down filter (`TableReadOptions.row_restriction`) are rendered as a genuine `SELECT ... WHERE ...` and executed through the same real GoogleSQL engine every other query in this project uses (see [Query Engine](#query-engine-real-googlesql-via-an-embedded-sqlite-backend)) — not a hand-rolled column/filter interpreter, so `row_restriction` gets exactly the same WHERE-clause correctness as any other query. Rows are returned Avro-framed (`AvroRows.SerializedBinaryRows`, real raw binary encoding, reusing the same Avro codec already used by [Load](#load-jobs-real-row-ingestion-ndjson--csv--avro--parquet)/[Extract](#extract-jobs-real-table-export-ndjson--csv--avro--parquet) jobs), matching the real API's message shape exactly.
+
+```mermaid
+flowchart LR
+	Client["gRPC client\n(google-cloud-go, etc.)"] -->|CreateReadSession| Session["Resolve table via real SQL engine\n(selected_fields + row_restriction -> SELECT ... WHERE ...)"]
+	Session --> Stream["1 ReadStream\n(Avro schema + rows snapshotted)"]
+	Client -->|ReadRows stream_name| Stream
+	Stream -->|AvroRows.SerializedBinaryRows| Client
+```
+
+Deliberately bounded, confirmed with the user before building it:
+
+- **Avro only.** Requesting Arrow framing (`arrow_serialization_options`) returns an explicit `Unimplemented` gRPC status rather than silently ignoring it or producing wrong bytes.
+- **Exactly one stream per session**, regardless of `max_stream_count`/`preferred_min_stream_count`. `SplitReadStream` returns `Unimplemented` explicitly — there's nothing to split.
+- **A table with a `RECORD`/`REPEATED` schema field is rejected explicitly** at `CreateReadSession` (same `rejectNestedFields` convention already used by CSV/AVRO/PARQUET load/extract), not silently flattened or corrupted.
+- **Sessions never expire** — real BigQuery auto-expires a session after 6 hours; not modeled, since there's no cleanup pressure in a local, single-process emulator.
+
+### Storage Write
+
+`CreateWriteStream`, `AppendRows` (bidi-streaming), `GetWriteStream`, `FinalizeWriteStream` and `BatchCommitWriteStreams` (`google.cloud.bigquery.storage.v1.BigQueryWrite`) are real. Unlike Read, the Write API's rows are always **protobuf**-encoded, never Avro/Arrow: a client sends a raw `DescriptorProto` (`ProtoSchema.proto_descriptor`) once per destination, and LocaQL wraps it in a synthetic, self-contained `FileDescriptorProto`, resolves it into a real `protoreflect.MessageDescriptor`, and decodes every row through real runtime protobuf reflection (`google.golang.org/protobuf/types/dynamicpb`) — no generated Go struct or compiled `.proto` file involved on either side. Decoded fields are matched to the destination table's columns by name and appended for real.
+
+```mermaid
+flowchart LR
+	Client["gRPC client"] -->|"CreateWriteStream\n(COMMITTED or PENDING)"| Stream["Write stream state"]
+	Client -->|"AppendRows\n(ProtoSchema + ProtoRows)"| Decode["dynamicpb decode\nby field name"]
+	Decode -->|COMMITTED / _default| Catalog["Real table catalog\n(visible immediately)"]
+	Decode -->|PENDING| Buffer["Buffered in memory"]
+	Client -->|FinalizeWriteStream| Stream
+	Client -->|"BatchCommitWriteStreams\n(all named streams)"| Commit["Atomic: all buffers -> Catalog"]
+	Buffer --> Commit
+```
+
+The `_default` stream (implicit, no `CreateWriteStream` needed — every table already has one) and explicit **COMMITTED** streams append straight into the real catalog, visible immediately, reusing the same `upsertCopyDestination` helper `jobs.copy` already uses (`WRITE_APPEND` + `CREATE_NEVER` — Storage Write never creates a table, matching real BigQuery). Explicit **PENDING** streams buffer rows in server memory until `BatchCommitWriteStreams` applies every named, finalized stream's buffer to the catalog in one call — genuinely atomic (all rows from all streams land together, or none do). Explicit streams also get real offset-based exactly-once semantics: an `AppendRowsRequest.offset` behind the stream's current end returns `ALREADY_EXISTS`, ahead of it returns `OUT_OF_RANGE` — both embedded in the per-request `AppendRowsResponse`, matching the real API's own retry contract, not a top-level RPC error.
+
+Deliberately bounded, confirmed with the user before building it:
+
+- **BUFFERED streams are not supported.** `CreateWriteStream` with `type: BUFFERED` returns an explicit `Unimplemented` status; `FlushRows` (which only ever applies to BUFFERED streams) is likewise `Unimplemented`.
+- **A repeated or nested-message proto field is rejected per row** (via `RowErrors` on that specific row, not the whole request) rather than silently flattened or corrupted; a destination table with a `RECORD`/`REPEATED` schema field is rejected even earlier, at stream creation.
+- **`missing_value_interpretations` and mid-stream schema updates are not implemented** — a field absent from a given row is always `NULL`/empty, and the destination schema is read once, not re-checked mid-stream.
+
+Verified beyond the in-memory test suite: a disposable throwaway Go client (deleted after use) drove `CreateWriteStream`/`AppendRows` over a **real TCP network connection** against a running `locaql` binary, confirming genuine wire-protocol interoperability, not just the bufconn-based unit tests.
+
 ## Fake GCS: A Real Cloud Storage JSON API, Locally
 
 Beyond the local-disk `gs://` path mapping described above, the emulator also exposes a minimal, real-contract-compatible subset of the **Google Cloud Storage JSON API** on the same host:port as the rest of this REST surface (`:9050` by default). This lets a user's own code that already uses the official Cloud Storage client library point `STORAGE_EMULATOR_HOST` at this emulator instead of real GCS — the same "same code, different endpoint" idea this whole project is built around, just for GCS instead of BigQuery.
@@ -609,6 +797,55 @@ Current UI scope:
 - Jobs Explorer with personal/project history tabs, selection, detail refresh, and cancellation.
 - Saved Queries stored in the browser (`localStorage`) with local version history, JSON import/export, and shareable URL links.
 - Persistent Dark/Light theme toggle.
+
+## Building and Releasing
+
+`locaql` and `locaql-ui` are both fully static, dependency-free binaries — every dependency this emulator actually needs at runtime (`goccy/googlesqlite`, `google.golang.org/grpc`, etc.) is pure Go, and `locaql-ui`'s web assets are embedded via `go:embed`, so a built binary is self-contained with no separate asset directory to ship alongside it.
+
+```bash
+make build          # host platform, into ./dist
+make build-all       # linux/darwin/windows × amd64/arm64, into ./dist/<os>_<arch>/
+make test            # go test ./...
+make vet             # go vet ./...
+```
+
+Version, commit, and build date are injected at build time via `-ldflags` (from `git describe`/`git rev-parse` when `VERSION`/`COMMIT` aren't set explicitly) and surfaced at `GET /_emulator/version`:
+
+```bash
+curl http://localhost:9050/_emulator/version
+# {"name":"LocaQL","version":"v0.2.0","commit":"a1b2c3d","buildDate":"2026-07-26T18:00:00Z"}
+```
+
+A plain `go run`/`go build` with no `-ldflags` (ordinary local development, unaffected by any of this) still reports the same defaults as before this became overridable (`0.1.0-dev`/`none`/`unknown`).
+
+### Container image
+
+```bash
+make docker-build    # builds locaql:<version> and locaql:latest
+make docker-run       # runs it, publishing :9050 (REST) and :9060 (Storage API gRPC)
+```
+
+The `Dockerfile` is a multi-stage build: a `golang:1.25` builder stage (`CGO_ENABLED=0`, matching `make build`) producing a static binary, copied into a minimal, non-root `gcr.io/distroless/static-debian12:nonroot` final image alongside `capabilities/registry.yaml` (the registry path the container's entrypoint passes explicitly, since the image has no other copy of the repo to resolve a relative path against). Only `locaql` (the emulator) is containerized — `locaql-ui` is a local dev-console tool normally run directly on the developer's machine, not typically deployed as its own container.
+
+### Release notes
+
+[`CHANGELOG.md`](CHANGELOG.md) is the curated, user-facing summary of what changed release to release, in [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format — distinct from `devlog.md` (gitignored, not published), which is this project's full internal session-by-session build log. See `CHANGELOG.md`'s own "How releases are cut" section for the exact process.
+
+## Continuous Integration
+
+Every push and pull request to `main`/`dev` runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml), which wires up exactly the checks already described above (and in [`CONTRIBUTING.md`](CONTRIBUTING.md#pull-request-process)) instead of relying on them being run by hand:
+
+| Job | Runs on | What it does |
+| --- | --- | --- |
+| `test` | ubuntu-latest | `go build ./...`, `go vet ./...`, `go test ./...`, `CGO_ENABLED=1 go test -race ./internal/server` |
+| `e2e` | ubuntu-latest | `go test -tags e2e ./cmd/locaql-ui/...` against the Chrome preinstalled on GitHub's Linux runner image (see [End-to-End Console Tests](#end-to-end-console-tests)) |
+| `native` | windows-latest, macos-latest | `go build`/`go vet`/`go test ./...` natively on each OS; `go test` is `continue-on-error` (see below) |
+| `cross-build` | ubuntu-latest (5-way matrix) | `CGO_ENABLED=0 go build` for `locaql`/`locaql-ui` across every `make build-all` target: `linux/amd64`, `linux/arm64`, `windows/amd64`, `darwin/amd64`, `darwin/arm64` |
+| `license-scan` | ubuntu-latest | [`go-licenses`](https://github.com/google/go-licenses) `check`/`csv` over the full dependency tree; fails on a forbidden (copyleft) license, uploads the per-dependency CSV as a build artifact |
+
+The `license-scan` job pins `go-licenses` to `v1.0.0` rather than `@latest`: at the time this was written, `@latest` fails on every package that imports anything from the standard library (`mime/multipart`, `io/ioutil`, `flag`, ...) with `"does not have module info"` and exits nonzero before producing any report — a confirmed, still-open upstream regression ([google/go-licenses#128](https://github.com/google/go-licenses/issues/128)), not something specific to this project. Two indirect dependencies (`github.com/ncruces/go-sqlite3-wasm/v2`, `modernc.org/mathutil`) have no `LICENSE`/`COPYING`/`README`/`NOTICE` file discoverable in their module cache copy, so the scan reports them as `Unknown` rather than guessing — worth a manual look if you're auditing licenses closely, not a build failure.
+
+**`native`'s `go test ./...` step is `continue-on-error`, not a passing check**: this CI job is the first time this project's test suite has ever actually run on native Windows or macOS (development has always happened through WSL/Linux, per [Requirements](#requirements)), and it surfaced a real, previously-unknown limitation — see [Known Divergences](KNOWN-DIVERGENCES.md) for the full detail. `go build`/`go vet` are unaffected and still block on failure.
 
 ## Contributing
 

@@ -660,7 +660,7 @@ func (s *Server) insertTable(w http.ResponseWriter, r *http.Request, projectID, 
 		// Derive the schema by actually running the query once, the same way
 		// real BigQuery validates a view's SQL and infers its schema at
 		// creation time rather than accepting an unverifiable definition.
-		derivedSchema, _, err := s.executeRealSQLQuery(projectID, query)
+		derivedSchema, _, err := s.executeRealSQLQuery(projectID, query, nil)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid view query: %s", err.Error()), "invalid")
 			return
@@ -1067,6 +1067,8 @@ func (s *Server) insertJob(w http.ResponseWriter, r *http.Request, projectID str
 	createDisposition := ""
 	writeDisposition := ""
 	priority := "INTERACTIVE"
+	createSession := false
+	var connectionProperties []connectionProperty
 	if r.Body != nil {
 		body, _ := io.ReadAll(r.Body)
 		if len(body) > 0 {
@@ -1076,6 +1078,20 @@ func (s *Server) insertJob(w http.ResponseWriter, r *http.Request, projectID str
 					if qCfg, ok := conf["query"].(map[string]any); ok {
 						if p, ok := qCfg["priority"].(string); ok {
 							priority = p
+						}
+						if cs, ok := qCfg["createSession"].(bool); ok {
+							createSession = cs
+						}
+						if propsRaw, ok := qCfg["connectionProperties"].([]any); ok {
+							for _, pRaw := range propsRaw {
+								pMap, ok := pRaw.(map[string]any)
+								if !ok {
+									continue
+								}
+								key, _ := pMap["key"].(string)
+								value, _ := pMap["value"].(string)
+								connectionProperties = append(connectionProperties, connectionProperty{Key: key, Value: value})
+							}
 						}
 					}
 					if loadRaw, ok := conf["load"]; ok {
@@ -1141,8 +1157,14 @@ func (s *Server) insertJob(w http.ResponseWriter, r *http.Request, projectID str
 		}
 		_ = r.Body.Close()
 	}
-	if strings.Count(queryText, ";") > 0 {
+	if len(splitScriptStatements(queryText)) > 1 {
 		isScript = true
+	}
+
+	sessionID, err := s.resolveSessionID(projectID, userEmail, createSession, connectionProperties)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error(), "invalid")
+		return
 	}
 
 	insertOpts := jobInsertOptions{
@@ -1152,6 +1174,7 @@ func (s *Server) insertJob(w http.ResponseWriter, r *http.Request, projectID str
 		QueryText:     queryText,
 		JobType:       jobType,
 		Priority:      priority,
+		SessionID:     sessionID,
 		SourceTables:  sourceTables,
 		LoadSchema:    loadSchema,
 		LoadSourceURIs: loadSourceURIs,
@@ -1226,12 +1249,14 @@ func (s *Server) handleJobsQuery(w http.ResponseWriter, r *http.Request, project
 	}()
 
 	var payload struct {
-		Query      string `json:"query"`
-		MaxResults int    `json:"maxResults"`
-		TimeoutMs  int    `json:"timeoutMs"`
-		DryRun     bool   `json:"dryRun"`
-		RequestId  string `json:"requestId"`
-		Priority   string `json:"priority"`
+		Query                string                `json:"query"`
+		MaxResults           int                   `json:"maxResults"`
+		TimeoutMs            int                   `json:"timeoutMs"`
+		DryRun               bool                  `json:"dryRun"`
+		RequestId            string                `json:"requestId"`
+		Priority             string                `json:"priority"`
+		CreateSession        bool                  `json:"createSession"`
+		ConnectionProperties []connectionProperty  `json:"connectionProperties"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 		writeError(w, http.StatusBadRequest, "Invalid request body", "invalid")
@@ -1264,6 +1289,12 @@ func (s *Server) handleJobsQuery(w http.ResponseWriter, r *http.Request, project
 		userEmail = strings.TrimSpace(r.Header.Get("X-User-Email"))
 	}
 
+	sessionID, err := s.resolveSessionID(projectID, userEmail, payload.CreateSession, payload.ConnectionProperties)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error(), "invalid")
+		return
+	}
+
 	insertOpts := jobInsertOptions{
 		ProjectID: projectID,
 		RequestID: requestID,
@@ -1271,6 +1302,7 @@ func (s *Server) handleJobsQuery(w http.ResponseWriter, r *http.Request, project
 		QueryText: payload.Query,
 		JobType:   "query",
 		Priority:  payload.Priority,
+		SessionID: sessionID,
 	}
 
 	jr, created := s.jobs.insert(insertOpts)
@@ -1329,10 +1361,25 @@ func (s *Server) writeQueryResults(w http.ResponseWriter, r *http.Request, proje
 	}
 
 	start, size := parsePagination(r, 20, 1000)
-	schema, values, err := s.simulateQueryResultTable(projectID, j.QueryText, j.UserEmail)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error(), "invalid")
-		return
+	// A DONE query job's result set was already computed once by
+	// executeQueryJob and cached on Statistics.ResultSchema/ResultRows —
+	// reuse it instead of re-running queryText a second time. This isn't
+	// just an optimization: some query text has real, non-idempotent side
+	// effects (session control statements, see jobStatistics.ResultSchema),
+	// so re-running it here to serve a second/paginated fetch would
+	// re-apply those side effects instead of returning the already-computed
+	// result.
+	var schema []tableField
+	var values [][]string
+	if j.State == jobStateDone && j.Statistics.ResultSchema != nil {
+		schema, values = j.Statistics.ResultSchema, j.Statistics.ResultRows
+	} else {
+		var err error
+		schema, values, err = s.simulateQueryResultTable(projectID, j.SessionID, j.QueryText, j.UserEmail)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error(), "invalid")
+			return
+		}
 	}
 	end := clampEnd(start, size, len(values))
 	rows := renderRESTRows(schema, values[start:end])
@@ -1356,21 +1403,37 @@ func (s *Server) writeQueryResults(w http.ResponseWriter, r *http.Request, proje
 	if end < len(values) {
 		resp["pageToken"] = encodePageToken(end)
 	}
+	if j.SessionID != "" {
+		resp["sessionInfo"] = map[string]string{"sessionId": j.SessionID}
+	}
 
 	writeJSON(w, http.StatusOK, resp)
 }
 
-func (s *Server) simulateQueryResultTable(projectID, queryText, callingUserEmail string) ([]tableField, [][]string, error) {
+func (s *Server) simulateQueryResultTable(projectID, sessionID, queryText, callingUserEmail string) ([]tableField, [][]string, error) {
 	trimmed := strings.TrimSpace(queryText)
 	if trimmed == "" {
 		return []tableField{{Name: "result", Type: "STRING"}}, [][]string{{"query job executed"}}, nil
+	}
+	trimmed = strings.TrimSpace(strings.TrimSuffix(trimmed, ";"))
+
+	var sess *sessionRecord
+	if sessionID != "" {
+		var handled bool
+		var schema []tableField
+		var rows [][]string
+		var err error
+		sess, handled, schema, rows, err = s.executeSessionControlStatement(projectID, sessionID, trimmed)
+		if handled {
+			return schema, rows, err
+		}
 	}
 
 	lower := strings.ToLower(trimmed)
 	if schema, rows, ok := s.simulateInformationSchemaQuery(projectID, trimmed, lower, callingUserEmail); ok {
 		return flatSchemaToTableFields(schema), rows, nil
 	}
-	return s.executeRealSQLQuery(projectID, trimmed)
+	return s.executeRealSQLQuery(projectID, trimmed, sess)
 }
 
 // flatSchemaToTableFields converts an INFORMATION_SCHEMA builder's flat
@@ -1735,7 +1798,7 @@ func parseTableSchemaFieldList(rawFields []any) []tableField {
 	return out
 }
 
-var informationSchemaPattern = regexp.MustCompile("(?is)(?:`?([a-zA-Z0-9_\\-]+)`?\\.)?(?:`?([a-zA-Z0-9_\\-]+)`?\\.)?information_schema\\.(schemata_options|schemata|table_options|tables|columns|jobs_by_project|jobs_by_user|jobs|partitions|routines|parameters|models|materialized_views|views)")
+var informationSchemaPattern = regexp.MustCompile("(?is)(?:`?([a-zA-Z0-9_\\-]+)`?\\.)?(?:`?([a-zA-Z0-9_\\-]+)`?\\.)?information_schema\\.(schemata_options|schemata|table_options|tables|columns|jobs_by_project|jobs_by_user|jobs|partitions|routines|parameters|models|materialized_views|views|sessions_by_user)")
 
 func (s *Server) simulateInformationSchemaQuery(projectID, queryText, lower, callingUserEmail string) ([]map[string]string, [][]string, bool) {
 	if !strings.Contains(lower, "information_schema.") {
@@ -1828,6 +1891,41 @@ var informationSchemaBuilders = map[string]informationSchemaBuilder{
 	"table_options":      buildInformationSchemaTableOptions,
 	"views":              buildInformationSchemaViews,
 	"materialized_views": buildInformationSchemaMaterializedViews,
+	"sessions_by_user":   buildInformationSchemaSessionsByUser,
+}
+
+// buildInformationSchemaSessionsByUser mirrors real BigQuery's
+// INFORMATION_SCHEMA.SESSIONS_BY_USER: scoped strictly to the calling user's
+// own sessions (zero rows if callingUserEmail is empty, same convention as
+// JOBS_BY_USER), listing only sessions that are not idle-expired (sessions
+// service purges expired ones lazily on list/get, so anything returned here
+// is real and current). is_active is always "true" for a listed row since
+// there is no concept of a currently-executing query to distinguish it from
+// an idle-but-not-yet-expired session.
+func buildInformationSchemaSessionsByUser(scope informationSchemaScope) ([]map[string]string, [][]string) {
+	columns := []map[string]string{
+		{"name": "creation_time", "type": "INT64"},
+		{"name": "session_id", "type": "STRING"},
+		{"name": "last_modified_time", "type": "INT64"},
+		{"name": "is_active", "type": "BOOL"},
+	}
+	if strings.TrimSpace(scope.callingUserEmail) == "" {
+		return columns, [][]string{}
+	}
+	sessions := scope.server.sessions.list(scope.targetProjectID)
+	rows := make([][]string, 0, len(sessions))
+	for _, rec := range sessions {
+		if rec.UserEmail != scope.callingUserEmail {
+			continue
+		}
+		rows = append(rows, []string{
+			strconv.FormatInt(rec.CreatedAt.UnixMilli(), 10),
+			rec.SessionID,
+			strconv.FormatInt(rec.LastUsedAt.UnixMilli(), 10),
+			"true",
+		})
+	}
+	return columns, rows
 }
 
 func buildInformationSchemaSchemata(scope informationSchemaScope) ([]map[string]string, [][]string) {
@@ -2043,11 +2141,11 @@ func (s *Server) executeQueryJob(job *jobRecord) (jobStatistics, error) {
 	if strings.Contains(strings.ToUpper(job.QueryText), "FORCE_ERROR") {
 		return jobStatistics{Executor: "query", Simulated: false}, fmt.Errorf("simulated forced error from query text")
 	}
-	_, rows, err := s.simulateQueryResultTable(job.ProjectID, job.QueryText, job.UserEmail)
+	schema, rows, err := s.simulateQueryResultTable(job.ProjectID, job.SessionID, job.QueryText, job.UserEmail)
 	if err != nil {
 		return jobStatistics{Executor: "query", Simulated: false}, err
 	}
-	return jobStatistics{Executor: "query", Simulated: false, TotalSlotMs: 60, ProcessedBytes: estimateRowsByteSize(rows), OutputRows: int64(len(rows))}, nil
+	return jobStatistics{Executor: "query", Simulated: false, TotalSlotMs: 60, ProcessedBytes: estimateRowsByteSize(rows), OutputRows: int64(len(rows)), ResultSchema: schema, ResultRows: rows}, nil
 }
 
 func estimateRowsByteSize(rows [][]string) int64 {
@@ -2922,7 +3020,7 @@ func (s *Server) resolveTableRowsVisiting(projectID, datasetID, tableID string, 
 		}
 		visiting[key] = true
 		defer delete(visiting, key)
-		schema, rows, err := s.executeRealSQLQueryVisiting(projectID, record.View.Query, visiting)
+		schema, rows, err := s.executeRealSQLQueryVisiting(projectID, record.View.Query, visiting, nil)
 		if err != nil {
 			return nil, nil, true, fmt.Errorf("resolve view %s.%s: %w", datasetID, tableID, err)
 		}
