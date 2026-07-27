@@ -44,6 +44,7 @@ const jobsNextBtn = document.getElementById("jobsNextBtn");
 const jobsPageHint = document.getElementById("jobsPageHint");
 
 const healthStatus = document.getElementById("healthStatus");
+const versionStatus = document.getElementById("versionStatus");
 const capabilitiesStatus = document.getElementById("capabilitiesStatus");
 const jobsStatus = document.getElementById("jobsStatus");
 const emulatorTarget = document.getElementById("emulatorTarget");
@@ -124,6 +125,7 @@ const deleteTableBtn = document.getElementById("deleteTableBtn");
 const tableActionStatus = document.getElementById("tableActionStatus");
 const jobsList = document.getElementById("jobsList");
 const capabilitiesJson = document.getElementById("capabilitiesJson");
+const diagnosticsJson = document.getElementById("diagnosticsJson");
 const savedQueriesList = document.getElementById("savedQueriesList");
 const exportSavedQueriesBtn = document.getElementById("exportSavedQueriesBtn");
 const importSavedQueriesBtn = document.getElementById("importSavedQueriesBtn");
@@ -792,6 +794,17 @@ async function loadHealth() {
   const health = await fetchJson("/api/_emulator/health");
   healthStatus.textContent = health.status || "unknown";
   healthStatus.className = health.status === "ok" ? "metric status-ok" : "metric status-warn";
+}
+
+async function loadVersion() {
+  const version = await fetchJson("/api/_emulator/version");
+  versionStatus.textContent = version.version || "unknown";
+  versionStatus.title = `${version.name || "LocaQL"} ${version.version || ""} (commit ${version.commit || "none"}, built ${version.buildDate || "unknown"})`;
+}
+
+async function loadDiagnostics() {
+  const diagnostics = await fetchJson("/api/_emulator/diagnostics");
+  diagnosticsJson.textContent = JSON.stringify(diagnostics, null, 2);
 }
 
 async function loadCapabilities() {
@@ -1701,6 +1714,8 @@ async function refreshAll() {
     await Promise.all([
       loadConfig(),
       loadHealth(),
+      loadVersion(),
+      loadDiagnostics(),
       loadCapabilities(),
       loadDatasets(projectId),
       loadJobs(projectId),
