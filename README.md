@@ -849,11 +849,21 @@ make docker-build    # builds locaql:<version> and locaql:latest
 make docker-run       # runs it, publishing :9050 (REST) and :9060 (Storage API gRPC)
 ```
 
-The `Dockerfile` is a multi-stage build: a `golang:1.25` builder stage (`CGO_ENABLED=0`, matching `make build`) producing a static binary, copied into a minimal, non-root `gcr.io/distroless/static-debian12:nonroot` final image alongside `capabilities/registry.yaml` (the registry path the container's entrypoint passes explicitly, since the image has no other copy of the repo to resolve a relative path against). Only `locaql` (the emulator) is containerized — `locaql-ui` is a local dev-console tool normally run directly on the developer's machine, not typically deployed as its own container.
+The `Dockerfile` is a multi-stage, multi-arch build: a `golang:1.25` builder stage (`CGO_ENABLED=0`, matching `make build`) producing a static binary — cross-compiled via Go's own `GOOS`/`GOARCH` from `TARGETOS`/`TARGETARCH` rather than QEMU-emulating the compile itself (the builder stage is pinned to `--platform=$BUILDPLATFORM` for exactly this reason) — copied into a minimal, non-root `gcr.io/distroless/static-debian12:nonroot` final image alongside `capabilities/registry.yaml` (the registry path the container's entrypoint passes explicitly, since the image has no other copy of the repo to resolve a relative path against). Only `locaql` (the emulator) is containerized — `locaql-ui` is a local dev-console tool normally run directly on the developer's machine, not typically deployed as its own container. `make docker-build` alone only builds for the host's own architecture; a real `linux/amd64`+`linux/arm64` multi-arch image is what `.github/workflows/release.yml` publishes on every tag (see below) — reproduce that locally with `docker buildx build --platform linux/amd64,linux/arm64 .` if needed.
+
+### Published image (GitHub Container Registry)
+
+Every `vX.Y.Z` tag publishes a real multi-arch image to GHCR — no separate publish step, no manual `docker push`:
+
+```bash
+docker run --rm -p 9050:9050 -p 9060:9060 ghcr.io/lraigosov/locaql:latest
+```
+
+Tags published per release: the exact version (`X.Y.Z`), the `X.Y` minor line, and `latest`.
 
 ### Release notes
 
-[`CHANGELOG.md`](CHANGELOG.md) is the curated, user-facing summary of what changed release to release, in [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format — distinct from `devlog.md` (gitignored, not published), which is this project's full internal session-by-session build log. See `CHANGELOG.md`'s own "How releases are cut" section for the exact process.
+[`CHANGELOG.md`](CHANGELOG.md) is the curated, user-facing summary of what changed release to release, in [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format — distinct from `devlog.md` (gitignored, not published), which is this project's full internal session-by-session build log. See `CHANGELOG.md`'s own "How releases are cut" section for the exact, now-automated process (push a `vX.Y.Z` tag; `.github/workflows/release.yml` validates, publishes the GHCR image, cross-compiles every platform binary, and creates the GitHub Release with those binaries and the SBOM attached).
 
 ## Continuous Integration
 
