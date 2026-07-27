@@ -13,9 +13,24 @@ All notable user-facing changes to LocaQL are documented here, in the style of [
 - Real GoogleSQL query engine (`goccy/googlesqlite`) behind `jobs.query`/`jobs.insert`/`projects.queries`: genuine `WHERE`, projection, `JOIN`, aggregation, `ORDER BY`, `LIMIT`.
 - Views and Materialized Views as real, live-resolved resources; nested `STRUCT`/`RECORD` and `ARRAY`/`REPEATED` schemas with BigQuery's real REST wire shape; `NUMERIC`/`BIGNUMERIC` exact-precision decimal types.
 - Reproducible build pipeline: `Makefile` (`make build`, `make build-all` for a 5-platform cross-compile matrix), a multi-stage `Dockerfile` producing a minimal, non-root container image, version/commit/build-date injected via `-ldflags` and surfaced at `GET /_emulator/version`.
+- Continuous integration (`.github/workflows/ci.yml`): build/vet/test/race on Linux, end-to-end console tests, native build/vet/test on Windows/macOS, a 5-platform cross-compile matrix, a dependency license scan, and a CycloneDX SBOM (`make sbom` locally; generated fresh per CI run rather than committed, since a static copy would go stale).
+- Architecture Decision Records (`docs/adr/`) for the project's independent identity/licensing, the real GoogleSQL engine choice, and the sessions/transactions design.
 
 ### Known limitations
-See [KNOWN-DIVERGENCES.md](KNOWN-DIVERGENCES.md) for the full, severity-classified list. Highlights: Storage Write API has no BUFFERED streams/`FlushRows`; Storage Read API is Avro-only with one stream per session, no `SplitReadStream`; a session transaction's atomicity never extends to real base tables; `GET /_emulator/metrics` is plain JSON, not Prometheus text exposition; a real, verified upstream bug in the query engine makes constructing a `DATE` from a string literal off by one day.
+See [KNOWN-DIVERGENCES.md](KNOWN-DIVERGENCES.md) for the full, severity-classified list. Highlights: Storage Write API has no BUFFERED streams/`FlushRows`; Storage Read API is Avro-only with one stream per session, no `SplitReadStream`; a session transaction's atomicity never extends to real base tables; `GET /_emulator/metrics` is plain JSON, not Prometheus text exposition; the query engine only runs correctly on Linux (including WSL) — it traps at analyzer initialization on native Windows/macOS, root-caused but not yet fixable from LocaQL's side (see Blocking #3).
+
+## Versioning and deprecation policy
+
+LocaQL follows [Semantic Versioning](https://semver.org/): `MAJOR.MINOR.PATCH`, where `MAJOR` bumps on a breaking
+REST/gRPC contract change or a removed capability, `MINOR` adds capability without breaking existing behavior, and
+`PATCH` is a fix with no contract change. Because this is a compatibility-surface emulator, "breaking" is judged
+against `capabilities/registry.yaml`'s documented contract, not internal implementation details.
+
+A capability is never removed silently: dropping or narrowing one that was previously `supported`/`partial` requires
+a `MAJOR` bump, an entry in this file's release notes explaining what changed and why, and (if a replacement exists)
+a pointer to it. There is no fixed support window for old versions today — this is a single-maintainer, locally-run
+tool, not a hosted service with an SLA — but every release remains tagged and buildable from source indefinitely, so
+pinning to an older version is always a real option for a consumer who isn't ready to move.
 
 ## How releases are cut
 
