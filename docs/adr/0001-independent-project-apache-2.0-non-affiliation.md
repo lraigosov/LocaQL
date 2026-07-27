@@ -37,3 +37,7 @@ somehow endorsed by Google/BigQuery, neither of which is true.
   "the license was fine over there."
 - The `upstream` remote is a local git-config convenience (each clone that wants it must add it itself); it is not
   and cannot be part of the repository's own tracked history.
+- This ADR covers non-affiliation and top-level licensing; it does not by itself cover attribution for specific
+  third-party code actually embedded in LocaQL's own binaries. See ADR 0002 for a real gap found and fixed there:
+  the query engine transpiles Google's own Apache-2.0-licensed `google/googlesql` source, which needed its own
+  `NOTICE` entry distinct from the `goccy/bigquery-emulator` inspiration-only note above.
