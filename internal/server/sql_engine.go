@@ -278,9 +278,9 @@ func stripProjectPrefix(queryText, projectID string) string {
 // ElementType set to T's descriptor; STRUCT<...> has FieldTypes set to its
 // nested named fields (each recursively the same shape).
 type sqlTypeDescriptor struct {
-	Name        string         `json:"name"`
+	Name        string             `json:"name"`
 	ElementType *sqlTypeDescriptor `json:"elementType"`
-	FieldTypes  []sqlNamedType `json:"fieldTypes"`
+	FieldTypes  []sqlNamedType     `json:"fieldTypes"`
 }
 
 type sqlNamedType struct {
@@ -334,11 +334,28 @@ func (s *Server) executeRealSQLQuery(projectID, queryText string, sess *sessionR
 	return s.executeRealSQLQueryVisiting(projectID, queryText, map[string]bool{}, sess)
 }
 
+// executeRealSQLQueryWithParams is executeRealSQLQuery plus real BigQuery
+// queryParameters (see query_parameters.go) bound into the query via Go's
+// standard database/sql mechanism (sql.Named for NAMED mode, positional
+// args for POSITIONAL) rather than left for the client's `@name`/`?`
+// placeholders to fail unbound in the analyzer.
+func (s *Server) executeRealSQLQueryWithParams(projectID, queryText string, sess *sessionRecord, paramMode string, params []storedQueryParameter) ([]tableField, [][]string, error) {
+	return s.executeRealSQLQueryVisitingWithParams(projectID, queryText, map[string]bool{}, sess, paramMode, params)
+}
+
 // executeRealSQLQueryVisiting is executeRealSQLQuery plus the view-cycle
 // guard threaded through resolveTableRowsVisiting: a referenced table may
 // itself be a view, which is resolved by recursively executing its own
 // query here.
 func (s *Server) executeRealSQLQueryVisiting(projectID, queryText string, visiting map[string]bool, sess *sessionRecord) ([]tableField, [][]string, error) {
+	return s.executeRealSQLQueryVisitingWithParams(projectID, queryText, visiting, sess, "", nil)
+}
+
+// executeRealSQLQueryVisitingWithParams is executeRealSQLQueryVisiting plus
+// query parameter binding; every other caller (views, Storage Read, session
+// temp-table resolution) has no client-supplied parameters and goes through
+// executeRealSQLQueryVisiting/executeRealSQLQuery with none.
+func (s *Server) executeRealSQLQueryVisitingWithParams(projectID, queryText string, visiting map[string]bool, sess *sessionRecord, paramMode string, params []storedQueryParameter) ([]tableField, [][]string, error) {
 	db, err := sql.Open("googlesqlite", ":memory:")
 	if err != nil {
 		return nil, nil, fmt.Errorf("open real SQL engine: %w", err)
@@ -376,7 +393,11 @@ func (s *Server) executeRealSQLQueryVisiting(projectID, queryText string, visiti
 		}
 	}
 
-	rows, err := db.Query(stripProjectPrefix(queryText, projectID))
+	args, err := buildQueryArgs(paramMode, params)
+	if err != nil {
+		return nil, nil, err
+	}
+	rows, err := db.Query(stripProjectPrefix(queryText, projectID), args...)
 	if err != nil {
 		return nil, nil, err
 	}

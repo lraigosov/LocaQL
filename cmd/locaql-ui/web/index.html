@@ -15,7 +15,7 @@
       <button id="navCollapseBtn" type="button" class="icon-button" aria-label="Toggle navigation">☰</button>
       <div class="appbar-brand">
         <span class="appbar-brand-label">LocaQL</span>
-        <span class="appbar-brand-subtitle">Studio</span>
+        <span class="appbar-brand-subtitle" id="appbarDisclaimer" title="This project is an independent local development tool compatible with selected Google BigQuery APIs. It is not affiliated with, sponsored by, or endorsed by Google LLC.">Not affiliated with Google</span>
       </div>
       <div class="project-switcher">
         <span class="project-switcher-label">Project</span>
@@ -46,7 +46,7 @@
       <div class="brand">
         <p class="brand-kicker">Local analytics workspace</p>
         <h1>LocaQL Studio</h1>
-        <p class="brand-note">A BigQuery-like shell for local development. No Google branding.</p>
+        <p class="brand-note">This project is an independent local development tool compatible with selected Google BigQuery APIs. It is not affiliated with, sponsored by, or endorsed by Google LLC.</p>
       </div>
 
       <section class="sidebar-section">
@@ -231,11 +231,16 @@
           <span class="tab" data-target="load-extract-workspace">Load / Extract</span>
           <span class="tab" data-target="workspace-portability">Workspace</span>
           <span class="tab" data-target="capabilities-view">Capabilities</span>
+          <span class="tab" data-target="diagnostics-view">Diagnostics</span>
         </div>
         <div class="status-strip">
           <article class="status-card">
             <h3>Runtime</h3>
             <p id="healthStatus" class="metric">-</p>
+          </article>
+          <article class="status-card">
+            <h3>Version</h3>
+            <p id="versionStatus" class="metric">-</p>
           </article>
           <article class="status-card">
             <h3>Capabilities</h3>
@@ -555,10 +560,18 @@
           </div>
           <pre id="capabilitiesJson" class="code-block"></pre>
         </article>
+
+        <article class="panel panel-wide" id="diagnostics-view">
+          <div class="panel-head">
+            <h3>Guided Troubleshooting</h3>
+            <span class="meta-text">Persistence health, recent job failures, contended resource locks, active sessions, effective LOCAQL_* environment variables.</span>
+          </div>
+          <pre id="diagnosticsJson" class="code-block"></pre>
+        </article>
       </section>
     </section>
   </main>
 
-  <script src="/web/app.js?v=24" type="module"></script>
+  <script src="/web/app.js?v=25" type="module"></script>
 </body>
 </html>

@@ -48,6 +48,8 @@ type jobRecord struct {
 	RequestID                string
 	UserEmail                string
 	QueryText                string
+	ParameterMode            string
+	QueryParameters          []storedQueryParameter
 	IsScript                 bool
 	SessionID                string
 	Statistics               jobStatistics
@@ -98,6 +100,8 @@ type jobInsertOptions struct {
 	ParentJobID              string
 	UserEmail                string
 	QueryText                string
+	ParameterMode            string
+	QueryParameters          []storedQueryParameter
 	JobType                  string
 	Priority                 string
 	SourceTables             []tableReference
@@ -272,6 +276,8 @@ func (s *jobService) insert(opts jobInsertOptions) (*jobRecord, bool) {
 		RequestID:                requestID,
 		UserEmail:                opts.UserEmail,
 		QueryText:                opts.QueryText,
+		ParameterMode:            opts.ParameterMode,
+		QueryParameters:          cloneQueryParameters(opts.QueryParameters),
 		IsScript:                 opts.IsScript,
 		SessionID:                opts.SessionID,
 		Statistics:               newSimulatedStatistics(normalizeJobType(opts)),
@@ -805,6 +811,15 @@ func cloneTableReferences(refs []tableReference) []tableReference {
 	}
 	out := make([]tableReference, len(refs))
 	copy(out, refs)
+	return out
+}
+
+func cloneQueryParameters(params []storedQueryParameter) []storedQueryParameter {
+	if len(params) == 0 {
+		return nil
+	}
+	out := make([]storedQueryParameter, len(params))
+	copy(out, params)
 	return out
 }
 

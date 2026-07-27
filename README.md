@@ -168,6 +168,25 @@ curl -X POST http://localhost:9050/bigquery/v2/projects/p1/queries \
   -d '{"query": "SELECT region, COUNT(*) AS n, SUM(amount) AS total FROM p1.analytics.orders WHERE amount > 10 GROUP BY region ORDER BY total DESC"}'
 ```
 
+### Query Parameters (NAMED and POSITIONAL)
+
+`queryParameters`/`parameterMode` (both `jobs.query`/`projects.queries` and `jobs.insert`'s `configuration.query`) bind real values into `@name` or `?` placeholders via Go's standard `database/sql` mechanism — not left for the client's placeholders to fail unbound. A genuinely `NULL`-valued parameter (`parameterValue` with no `value` key) binds as a real SQL `NULL`, including inside a `WHERE` comparison against a real column.
+
+```bash
+curl -X POST http://localhost:9050/bigquery/v2/projects/p1/queries \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "query": "SELECT * FROM p1.analytics.orders WHERE region = @region AND amount > @min_amount",
+    "parameterMode": "NAMED",
+    "queryParameters": [
+      {"name": "region", "parameterType": {"type": "STRING"}, "parameterValue": {"value": "us-east"}},
+      {"name": "min_amount", "parameterType": {"type": "FLOAT64"}, "parameterValue": {"value": "10.0"}}
+    ]
+  }'
+```
+
+Supported `parameterType.type` values: `STRING`, `INT64`, `FLOAT64`, `BOOL`, `BYTES` (base64, matching BigQuery's own wire convention), `DATE`, `DATETIME`, `TIME`, `TIMESTAMP` — for any of them, `parameterValue` with no `value` key binds a real `NULL`. `ARRAY`/`STRUCT`/`NUMERIC`/`BIGNUMERIC` parameter types are rejected explicitly with a `400` rather than silently mishandled; see [Known Divergences](KNOWN-DIVERGENCES.md) for exactly why `NUMERIC`/`BIGNUMERIC` specifically can't just be added later without rewriting client SQL text.
+
 ## Concurrency and Isolation Notes
 
 - `jobs.get` and `jobs.list` use read locks while mutating paths use exclusive locks.
@@ -784,10 +803,13 @@ UI notes:
 - The UI integrates dynamically through `/_emulator/capabilities` and REST APIs.
 - The UI backend proxies `/api/*` to the emulator to avoid browser CORS issues.
 - Default UI port: `9070`.
+- **Non-affiliation disclaimer**: "This project is an independent local development tool compatible with selected Google BigQuery APIs. It is not affiliated with, sponsored by, or endorsed by Google LLC." is shown in the sidebar and as a persistent appbar subtitle that stays visible even with the sidebar collapsed.
 
 Current UI scope:
 
-- Studio-style layout with navigation, a resource Explorer, and a tabbed workspace (Query, Jobs, Load / Extract, Capabilities).
+- Studio-style layout with navigation, a resource Explorer, and a tabbed workspace (Query, Jobs, Load / Extract, Capabilities, Diagnostics).
+- Status strip shows the real emulator version (`GET /_emulator/version`) alongside runtime health and capability counts, refreshed on every poll cycle.
+- **Diagnostics tab**: renders the real `GET /_emulator/diagnostics` payload (see [Guided Troubleshooting](#guided-troubleshooting)) — persistence write health, recent job failures, contended resource locks, active sessions, effective `LOCAQL_*` environment variables.
 - Explorer with a hierarchical Project > Dataset > Table tree, local resource search, and capability-status badges (`SUPPORTED`, `PARTIAL`, `UNSUPPORTED`, `CONTEXT`) with a persisted filter and legend. Dataset and Table nodes additionally show a smaller `UI ...` badge reflecting the console-only `console.ui.*` registry entry for that resource; it is informational (tooltip shows the underlying `reason`) and is not counted by the capability filter, which reflects REST capability only.
 - Real `Routines` and `Models` nodes in the Explorer tree, wired to the emulator's metadata CRUD endpoints (see [Routines and Models: Metadata CRUD](#routines-and-models-metadata-crud)): sidebar forms create a routine (type, language, `definitionBody`, optional `arguments` JSON) or a model (`modelType`) under a dataset, and selecting a node opens a resource details panel with raw JSON, a `friendlyName`/`description` editor, and delete.
 - Dataset create/update/delete (with labels and `defaultTableExpirationMs` editing), plus a **Dataset Undelete** form that restores a soft-deleted dataset's metadata from its tombstone (see [Dataset Lifecycle: Delete Contents and Undelete](#dataset-lifecycle-delete-contents-and-undelete)); deleting a non-empty dataset surfaces the backend's `deleteContents` requirement and offers to retry with it. A selected-dataset summary panel (ID, friendly name, location, table count, labels) adds quick actions to draft a dataset query, draft a table listing query, or copy the dataset ID.
