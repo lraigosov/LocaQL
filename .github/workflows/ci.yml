@@ -95,7 +95,7 @@ jobs:
       - run: go build -o /dev/null ./cmd/locaql-ui
 
   license-scan:
-    name: Dependency license scan
+    name: Dependency license scan and SBOM
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -116,3 +116,10 @@ jobs:
           path: licenses.csv
       - name: Fail on forbidden (copyleft-incompatible) licenses
         run: go-licenses check ./...
+      - run: go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@latest
+      - name: Generate CycloneDX SBOM (artifact; not committed — see `make sbom`)
+        run: cyclonedx-gomod app -json -output sbom.json -main cmd/locaql -licenses .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.json

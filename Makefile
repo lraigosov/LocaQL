@@ -11,7 +11,7 @@ DIST        := dist
 PLATFORMS   := linux/amd64 linux/arm64 windows/amd64 darwin/amd64 darwin/arm64
 BINARIES    := locaql locaql-ui
 
-.PHONY: build build-all docker-build docker-run clean test vet
+.PHONY: build build-all docker-build docker-run clean test vet sbom
 
 # build compiles both binaries for the host platform into ./dist, matching
 # GOOS/GOARCH already set in the environment (cross-compiling from WSL for
@@ -61,3 +61,13 @@ vet:
 
 clean:
 	rm -rf $(DIST)
+
+# sbom generates a CycloneDX SBOM for the locaql binary (build-constraint-aware:
+# only what cmd/locaql actually imports, not every module in go.sum) into
+# dist/sbom.json. Not committed to the repo — it would go stale the moment a
+# dependency changes — generate it fresh per release instead (also done in CI,
+# see .github/workflows/ci.yml's license-scan job).
+sbom:
+	@mkdir -p $(DIST)
+	@command -v cyclonedx-gomod >/dev/null || go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@latest
+	cyclonedx-gomod app -json -output $(DIST)/sbom.json -main cmd/locaql -licenses .
