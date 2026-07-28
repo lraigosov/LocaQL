@@ -51,7 +51,7 @@ docker-build:
 		-t locaql:$(VERSION) -t locaql:latest .
 
 docker-run:
-	docker run --rm -p 9050:9050 -p 9060:9060 locaql:latest
+	docker run --rm -p 9050:9050 -p 9060:9060 -p 9070:9070 locaql:latest
 
 test:
 	go test ./...

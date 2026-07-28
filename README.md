@@ -846,18 +846,20 @@ A plain `go run`/`go build` with no `-ldflags` (ordinary local development, unaf
 
 ```bash
 make docker-build    # builds locaql:<version> and locaql:latest
-make docker-run       # runs it, publishing :9050 (REST) and :9060 (Storage API gRPC)
+make docker-run       # runs it, publishing :9050 (REST), :9060 (Storage API gRPC), and :9070 (console)
 ```
 
-The `Dockerfile` is a multi-stage, multi-arch build: a `golang:1.25` builder stage (`CGO_ENABLED=0`, matching `make build`) producing a static binary — cross-compiled via Go's own `GOOS`/`GOARCH` from `TARGETOS`/`TARGETARCH` rather than QEMU-emulating the compile itself (the builder stage is pinned to `--platform=$BUILDPLATFORM` for exactly this reason) — copied into a minimal, non-root `gcr.io/distroless/static-debian12:nonroot` final image alongside `capabilities/registry.yaml` (the registry path the container's entrypoint passes explicitly, since the image has no other copy of the repo to resolve a relative path against). Only `locaql` (the emulator) is containerized — `locaql-ui` is a local dev-console tool normally run directly on the developer's machine, not typically deployed as its own container. `make docker-build` alone only builds for the host's own architecture; a real `linux/amd64`+`linux/arm64` multi-arch image is what `.github/workflows/release.yml` publishes on every tag (see below) — reproduce that locally with `docker buildx build --platform linux/amd64,linux/arm64 .` if needed.
+The `Dockerfile` is a multi-stage, multi-arch build: a `golang:1.25` builder stage (`CGO_ENABLED=0`, matching `make build`) producing three static binaries — cross-compiled via Go's own `GOOS`/`GOARCH` from `TARGETOS`/`TARGETARCH` rather than QEMU-emulating the compile itself (the builder stage is pinned to `--platform=$BUILDPLATFORM` for exactly this reason) — copied into a minimal, non-root `gcr.io/distroless/static-debian12:nonroot` final image alongside `capabilities/registry.yaml` (the registry path the container's entrypoint passes explicitly, since the image has no other copy of the repo to resolve a relative path against). The image ships the full solution, not just the emulator: `locaql` (the emulator), `locaql-ui` (the console), and `locaql-supervisor` — the container's actual `ENTRYPOINT` — which starts both as real subprocesses of the one container (`docker top` shows all three), forwards `SIGTERM` to each for a graceful shutdown, and exits non-zero if either one crashes rather than leaving the container looking "up" with half its processes dead. No shell is involved anywhere in this, since `distroless/static` doesn't have one — `locaql-supervisor` execs both children directly by absolute path. `make docker-build` alone only builds for the host's own architecture; a real `linux/amd64`+`linux/arm64` multi-arch image is what `.github/workflows/release.yml` publishes on every tag (see below) — reproduce that locally with `docker buildx build --platform linux/amd64,linux/arm64 .` if needed.
 
 ### Published image (GitHub Container Registry)
 
-Every `vX.Y.Z` tag publishes a real multi-arch image to GHCR — no separate publish step, no manual `docker push`:
+Every `vX.Y.Z` tag publishes a real multi-arch image to GHCR — no separate publish step, no manual `docker push`. It's the full solution in one container: the emulator and the console, both already wired to talk to each other.
 
 ```bash
-docker run --rm -p 9050:9050 -p 9060:9060 ghcr.io/lraigosov/locaql:latest
+docker run --rm -p 9050:9050 -p 9060:9060 -p 9070:9070 ghcr.io/lraigosov/locaql:latest
 ```
+
+Open `http://localhost:9070` for the console; the emulator's REST/gRPC-JSON API is at `:9050` directly if you want to skip the console entirely.
 
 Tags published per release: the exact version (`X.Y.Z`), the `X.Y` minor line, and `latest`.
 
