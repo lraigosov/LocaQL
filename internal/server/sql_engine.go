@@ -65,12 +65,17 @@ func quoteIdent(id string) string {
 	return "`" + strings.ReplaceAll(id, "`", "``") + "`"
 }
 
-// convertScalarForInsert parses a BigQuery REST-convention scalar string
-// cell into a typed value for a parameterized INSERT. An empty string is
-// treated as NULL for INT64/FLOAT64/BOOL, since none of those types can
-// otherwise hold "" — this does not change STRING behavior, which keeps
-// empty strings as-is.
+// convertScalarForInsert parses one lossless stored scalar cell into a typed
+// value for a parameterized INSERT. The explicit null tag is SQL NULL for
+// every type; an empty STRING remains a real empty string. Empty numeric and
+// boolean cells retain the legacy-null behavior because those types cannot
+// represent an empty string and old CSV-backed rows used that convention.
 func convertScalarForInsert(fieldType, cell string) (any, error) {
+	var isNull bool
+	cell, isNull = loadStoredCell(cell)
+	if isNull {
+		return nil, nil
+	}
 	switch strings.ToUpper(strings.TrimSpace(fieldType)) {
 	case "INT64":
 		if cell == "" {
@@ -106,6 +111,11 @@ func convertScalarForInsert(fieldType, cell string) (any, error) {
 // found unreliable for the same underlying reason) but a real quirk of this
 // query engine's placeholder-type inference inside literal expressions.
 func buildInsertValueExpr(field tableField, cell string) (string, []any, error) {
+	decodedCell, isNull := loadStoredCell(cell)
+	if isNull {
+		return "NULL", nil, nil
+	}
+	cell = decodedCell
 	if field.Mode == "REPEATED" {
 		if cell == "" {
 			return "NULL", nil, nil
@@ -221,10 +231,10 @@ func exprForDecodedValue(field tableField, decoded any) (string, []any, error) {
 	return "CAST(? AS " + sqliteColumnType(tableField{Type: field.Type}) + ")", []any{v}, nil
 }
 
-// tableRefPattern finds dotted table references following FROM/JOIN, with
+// tableRefPattern finds dotted table references following FROM/JOIN/USING, with
 // 2 parts (dataset.table) or 3 (project.dataset.table), optionally wrapped
 // in a single pair of backticks around the whole reference.
-var tableRefPattern = regexp.MustCompile("(?i)\\b(?:FROM|JOIN)\\s+`?([A-Za-z0-9_]+(?:\\.[A-Za-z0-9_]+){1,2})`?")
+var tableRefPattern = regexp.MustCompile("(?i)\\b(?:FROM|JOIN|USING)\\s+`?([A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+){1,2})`?")
 
 type datasetTableRef struct {
 	datasetID string
@@ -269,8 +279,14 @@ func stripProjectPrefix(queryText, projectID string) string {
 	if projectID == "" {
 		return queryText
 	}
-	pattern := regexp.MustCompile("(?i)`?" + regexp.QuoteMeta(projectID) + "`?\\.([A-Za-z0-9_]+\\.[A-Za-z0-9_]+)")
-	return pattern.ReplaceAllString(queryText, "$1")
+	project := regexp.QuoteMeta(projectID)
+	// A single pair of backticks quotes the whole BigQuery reference. Consume
+	// both of them together; the previous optional-backtick expression removed
+	// only the opening tick and left an invalid trailing tick behind.
+	wholeQuoted := regexp.MustCompile("(?i)`" + project + "\\.([A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+)`")
+	queryText = wholeQuoted.ReplaceAllString(queryText, "$1")
+	bare := regexp.MustCompile("(?i)\\b" + project + "\\.([A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+)\\b")
+	return bare.ReplaceAllString(queryText, "$1")
 }
 
 // sqlTypeDescriptor mirrors the JSON shape of googlesqlite's
@@ -356,42 +372,11 @@ func (s *Server) executeRealSQLQueryVisiting(projectID, queryText string, visiti
 // temp-table resolution) has no client-supplied parameters and goes through
 // executeRealSQLQueryVisiting/executeRealSQLQuery with none.
 func (s *Server) executeRealSQLQueryVisitingWithParams(projectID, queryText string, visiting map[string]bool, sess *sessionRecord, paramMode string, params []storedQueryParameter) ([]tableField, [][]string, error) {
-	db, err := sql.Open("googlesqlite", ":memory:")
+	db, err := s.openMaterializedSQLDatabase(projectID, queryText, visiting, sess, nil)
 	if err != nil {
-		return nil, nil, fmt.Errorf("open real SQL engine: %w", err)
+		return nil, nil, err
 	}
 	defer db.Close()
-
-	createdSchemas := map[string]bool{}
-	for _, ref := range referencedTables(queryText, projectID) {
-		var fields []tableField
-		var rows [][]string
-		if sess != nil && strings.EqualFold(ref.datasetID, sessionDatasetName) {
-			t, ok := sess.getTempTable(ref.tableID)
-			if !ok {
-				continue
-			}
-			fields, rows = t.Fields, t.Rows
-		} else {
-			var ok bool
-			fields, rows, ok, err = s.resolveTableRowsVisiting(projectID, ref.datasetID, ref.tableID, visiting)
-			if !ok {
-				continue
-			}
-			if err != nil {
-				return nil, nil, err
-			}
-		}
-		if !createdSchemas[ref.datasetID] {
-			if _, err := db.Exec("CREATE SCHEMA " + quoteIdent(ref.datasetID)); err != nil {
-				return nil, nil, fmt.Errorf("materialize dataset %s: %w", ref.datasetID, err)
-			}
-			createdSchemas[ref.datasetID] = true
-		}
-		if err := materializeTable(db, ref.datasetID, ref.tableID, fields, rows); err != nil {
-			return nil, nil, fmt.Errorf("materialize table %s.%s: %w", ref.datasetID, ref.tableID, err)
-		}
-	}
 
 	args, err := buildQueryArgs(paramMode, params)
 	if err != nil {
@@ -403,6 +388,64 @@ func (s *Server) executeRealSQLQueryVisitingWithParams(projectID, queryText stri
 	}
 	defer rows.Close()
 	return scanRealSQLRows(rows)
+}
+
+// openMaterializedSQLDatabase builds the isolated GoogleSQL database used by
+// both read-only queries and persistent DDL/DML. extraRefs is primarily the
+// mutation target: INSERT/UPDATE/MERGE targets do not necessarily occur after
+// FROM/JOIN, while a CREATE TABLE target needs its dataset schema created even
+// though the table does not exist yet.
+func (s *Server) openMaterializedSQLDatabase(projectID, queryText string, visiting map[string]bool, sess *sessionRecord, extraRefs []datasetTableRef) (*sql.DB, error) {
+	db, err := sql.Open("googlesqlite", ":memory:")
+	if err != nil {
+		return nil, fmt.Errorf("open real SQL engine: %w", err)
+	}
+
+	refs := referencedTables(queryText, projectID)
+	seen := make(map[datasetTableRef]bool, len(refs)+len(extraRefs))
+	combined := make([]datasetTableRef, 0, len(refs)+len(extraRefs))
+	for _, ref := range append(refs, extraRefs...) {
+		if seen[ref] {
+			continue
+		}
+		seen[ref] = true
+		combined = append(combined, ref)
+	}
+	createdSchemas := map[string]bool{}
+	for _, ref := range combined {
+		var fields []tableField
+		var rows [][]string
+		found := false
+		if sess != nil && strings.EqualFold(ref.datasetID, sessionDatasetName) {
+			t, ok := sess.getTempTable(ref.tableID)
+			if ok {
+				fields, rows, found = t.Fields, t.Rows, true
+			}
+		} else {
+			var ok bool
+			fields, rows, ok, err = s.resolveTableRowsVisiting(projectID, ref.datasetID, ref.tableID, visiting)
+			if err != nil {
+				db.Close()
+				return nil, err
+			}
+			found = ok
+		}
+		if !createdSchemas[ref.datasetID] {
+			if _, err := db.Exec("CREATE SCHEMA " + quoteIdent(ref.datasetID)); err != nil {
+				db.Close()
+				return nil, fmt.Errorf("materialize dataset %s: %w", ref.datasetID, err)
+			}
+			createdSchemas[ref.datasetID] = true
+		}
+		if !found {
+			continue
+		}
+		if err := materializeTable(db, ref.datasetID, ref.tableID, fields, rows); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("materialize table %s.%s: %w", ref.datasetID, ref.tableID, err)
+		}
+	}
+	return db, nil
 }
 
 func materializeTable(db *sql.DB, datasetID, tableID string, fields []tableField, rows [][]string) error {
@@ -438,7 +481,7 @@ func materializeTable(db *sql.DB, datasetID, tableID string, fields []tableField
 	for _, row := range rows {
 		values := make([]any, len(fields))
 		for i, f := range fields {
-			cell := ""
+			cell := storedNullCell
 			if i < len(row) {
 				cell = row[i]
 			}
@@ -468,7 +511,7 @@ func materializeNestedRows(db *sql.DB, qualified string, fields []tableField, ro
 		exprs := make([]string, len(fields))
 		var params []any
 		for i, f := range fields {
-			cell := ""
+			cell := storedNullCell
 			if i < len(row) {
 				cell = row[i]
 			}
@@ -535,7 +578,7 @@ func cellFromScannedValue(field tableField, v any) (string, error) {
 		return scalarValueToString(v), nil
 	}
 	if v == nil {
-		return "", nil
+		return storedNullCell, nil
 	}
 	normalized, err := normalizeScannedValue(field, v)
 	if err != nil {

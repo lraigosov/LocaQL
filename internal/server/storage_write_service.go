@@ -335,7 +335,10 @@ func protoMessageToRow(msg *dynamicpb.Message, fields []tableField) ([]string, e
 	for i, f := range fields {
 		fd := md.Fields().ByName(protoreflect.Name(f.Name))
 		if fd == nil || !msg.Has(fd) {
-			row[i] = ""
+			if normalizeMode(f.Mode) == "REQUIRED" {
+				return nil, fmt.Errorf("column %s is REQUIRED but absent", f.Name)
+			}
+			row[i] = storedNullCell
 			continue
 		}
 		if fd.Cardinality() == protoreflect.Repeated {

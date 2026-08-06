@@ -63,6 +63,9 @@ func TestGCSObjectUploadGetDownloadDelete(t *testing.T) {
 	if uploaded["name"] != "events.csv" || uploaded["bucket"] != "mybucket" || uploaded["size"] != "16" {
 		t.Fatalf("unexpected object resource: %v", uploaded)
 	}
+	if uploaded["mediaLink"] != "http://example.com/download/storage/v1/b/mybucket/o/events.csv?alt=media" {
+		t.Fatalf("expected official absolute download mediaLink, got %v", uploaded["mediaLink"])
+	}
 
 	// Metadata get.
 	metaReq := httptest.NewRequest(http.MethodGet, "/storage/v1/b/mybucket/o/events.csv", nil)
@@ -95,6 +98,81 @@ func TestGCSObjectUploadGetDownloadDelete(t *testing.T) {
 	s.Handler().ServeHTTP(getAfterDeleteRes, getAfterDeleteReq)
 	if getAfterDeleteRes.Code != http.StatusNotFound {
 		t.Fatalf("expected 404 after delete, got %d", getAfterDeleteRes.Code)
+	}
+}
+
+func TestGCSOfficialDownloadPathSupportsEncodedNamesRangesAndHead(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("LOCAQL_FAKE_GCS_ROOT", root)
+	s := newTestServer()
+	payload := "0123456789abcdef"
+
+	uploadReq := httptest.NewRequest(
+		http.MethodPost,
+		"/upload/storage/v1/b/mybucket/o?uploadType=media&name=folder%2Fnested%20report.txt",
+		strings.NewReader(payload),
+	)
+	uploadRes := httptest.NewRecorder()
+	s.Handler().ServeHTTP(uploadRes, uploadReq)
+	if uploadRes.Code != http.StatusOK {
+		t.Fatalf("expected 200 uploading encoded object name, got %d: %s", uploadRes.Code, uploadRes.Body.String())
+	}
+	var uploaded map[string]any
+	if err := json.NewDecoder(uploadRes.Body).Decode(&uploaded); err != nil {
+		t.Fatalf("decode upload response: %v", err)
+	}
+	wantMediaLink := "http://example.com/download/storage/v1/b/mybucket/o/folder%2Fnested%20report.txt?alt=media"
+	if uploaded["mediaLink"] != wantMediaLink {
+		t.Fatalf("expected encoded official mediaLink %q, got %v", wantMediaLink, uploaded["mediaLink"])
+	}
+
+	downloadPath := "/download/storage/v1/b/mybucket/o/folder%2Fnested%20report.txt?alt=media"
+	downloadReq := httptest.NewRequest(http.MethodGet, downloadPath, nil)
+	downloadRes := httptest.NewRecorder()
+	s.Handler().ServeHTTP(downloadRes, downloadReq)
+	if downloadRes.Code != http.StatusOK || downloadRes.Body.String() != payload {
+		t.Fatalf("expected full official-path download, got %d: %q", downloadRes.Code, downloadRes.Body.String())
+	}
+	if downloadRes.Header().Get("Accept-Ranges") != "bytes" || !strings.HasPrefix(downloadRes.Header().Get("X-Goog-Hash"), "md5=") {
+		t.Fatalf("expected range and checksum headers, got %v", downloadRes.Header())
+	}
+
+	rangeReq := httptest.NewRequest(http.MethodGet, downloadPath, nil)
+	rangeReq.Header.Set("Range", "bytes=4-9")
+	rangeRes := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rangeRes, rangeReq)
+	if rangeRes.Code != http.StatusPartialContent || rangeRes.Body.String() != "456789" {
+		t.Fatalf("expected 206 bytes 4-9, got %d: %q", rangeRes.Code, rangeRes.Body.String())
+	}
+	if got := rangeRes.Header().Get("Content-Range"); got != "bytes 4-9/16" {
+		t.Fatalf("expected Content-Range bytes 4-9/16, got %q", got)
+	}
+
+	headReq := httptest.NewRequest(http.MethodHead, downloadPath, nil)
+	headRes := httptest.NewRecorder()
+	s.Handler().ServeHTTP(headRes, headReq)
+	if headRes.Code != http.StatusOK || headRes.Body.Len() != 0 || headRes.Header().Get("Content-Length") != "16" {
+		t.Fatalf("expected HEAD 200 with no body and length 16, got %d headers=%v body=%q", headRes.Code, headRes.Header(), headRes.Body.String())
+	}
+}
+
+func TestGCSOfficialDownloadPathErrorsUseStorageContract(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("LOCAQL_FAKE_GCS_ROOT", root)
+	s := newTestServer()
+
+	missingReq := httptest.NewRequest(http.MethodGet, "/download/storage/v1/b/mybucket/o/missing.txt?alt=media", nil)
+	missingRes := httptest.NewRecorder()
+	s.Handler().ServeHTTP(missingRes, missingReq)
+	if missingRes.Code != http.StatusNotFound || !strings.Contains(missingRes.Body.String(), `"error"`) {
+		t.Fatalf("expected GCS-shaped 404, got %d: %s", missingRes.Code, missingRes.Body.String())
+	}
+
+	postReq := httptest.NewRequest(http.MethodPost, "/download/storage/v1/b/mybucket/o/missing.txt?alt=media", nil)
+	postRes := httptest.NewRecorder()
+	s.Handler().ServeHTTP(postRes, postReq)
+	if postRes.Code != http.StatusMethodNotAllowed || !strings.Contains(postRes.Body.String(), `"error"`) {
+		t.Fatalf("expected GCS-shaped 405, got %d: %s", postRes.Code, postRes.Body.String())
 	}
 }
 

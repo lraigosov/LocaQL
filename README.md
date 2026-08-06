@@ -8,7 +8,7 @@ This repository currently implements incremental scope from the master plan:
 - Foundation emulator endpoints and capability registry.
 - REST pagination baseline for datasets, tables, jobs, and tabledata.
 - Async jobs engine with cancel, polling, idempotency (TTL), and script parent/child jobs.
-- Simulated query/load/extract/copy executors with synthetic statistics.
+- Real query/load/extract/copy executors; query DDL/DML persists atomically while slot timing remains synthetic.
 - Configurable worker limits and resource-level serialization for conflicting job mutations.
 
 ## Table of Contents
@@ -20,6 +20,7 @@ This repository currently implements incremental scope from the master plan:
 - [Known Divergences from Real BigQuery](#known-divergences-from-real-bigquery)
 - [Runtime Architecture](#runtime-architecture)
 - [Query Engine: Real GoogleSQL via an Embedded SQLite Backend](#query-engine-real-googlesql-via-an-embedded-sqlite-backend)
+- [Persistent DDL and DML](#persistent-ddl-and-dml)
 - [Concurrency and Isolation Notes](#concurrency-and-isolation-notes)
 - [Job State Model](#job-state-model)
 - [Operational Observability: Structured Logging, Request Metrics, and Extended Health](#operational-observability-structured-logging-request-metrics-and-extended-health)
@@ -92,12 +93,12 @@ Registry file:
 | Opaque pagination tokens | Supported | `nextPageToken` is opaque; legacy numeric token input remains accepted |
 | Jobs lifecycle | Supported | `PENDING -> RUNNING -> DONE`, cancel before/during run |
 | requestId idempotency | Partial | Implemented for `jobs.insert` and `projects.queries` with TTL |
-| Job executors (query/load/extract/copy) | Partial | Query jobs execute real GoogleSQL — `WHERE`, projection, `JOIN`, aggregation, `ORDER BY`, `LIMIT` — via an embedded engine (see [Query Engine](#query-engine-real-googlesql-via-an-embedded-sqlite-backend)), reporting real `outputRows`/`processedBytes` (`totalSlotMs` stays synthetic by design); copy jobs create real destination table data; load jobs materialize destination schema and ingest real rows from `sourceUris` (`NEWLINE_DELIMITED_JSON`, `CSV`, `AVRO` or `PARQUET`, with optional `GZIP` decompression for CSV/NDJSON); extract jobs read a real source table and write `destinationUris` in the same four formats with optional `compression` (`GZIP` for CSV/NDJSON, `SNAPPY`/`DEFLATE` for Avro, `SNAPPY`/`GZIP` for Parquet), and split into multiple real shard files once `LOCAQL_EXTRACT_SHARD_MAX_BYTES` is set and exceeded (single shard by default). `sourceUris`/`destinationUris` are local paths by default; `gs://` resolves onto a local directory only when `LOCAQL_FAKE_GCS_ROOT` is set (multi-wildcard `destinationUris` and `ORC` are rejected explicitly) |
+| Job executors (query/load/extract/copy) | Partial | Query jobs execute real GoogleSQL — including persistent `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `TRUNCATE TABLE`, `CREATE [OR REPLACE] TABLE [AS SELECT]` and `DROP TABLE` — with target-table serialization, atomic version-checked catalog commits, query parameters and BigQuery-shaped DML statistics. `SELECT`, copy, load and extract retain their existing real execution paths; `totalSlotMs` stays synthetic by design. See [Persistent DDL and DML](#persistent-ddl-and-dml) for the precise transaction/script limits. |
 | Routines and Models | Supported | `routines`/`models` `insert`/`get`/`list`/`patch`/`delete` are metadata-only (no SQL execution or ML training/inference backend exists; nothing is fabricated beyond stored fields) |
 | External tables | Partial | `tables.insert` accepts `externalDataConfiguration` (`NEWLINE_DELIMITED_JSON`/`CSV`/`AVRO`/`PARQUET`, explicit schema, no autodetect); `sourceUris` are read fresh from disk/fake-GCS on every query/`tabledata.list`/copy/extract access rather than materialized at creation. Patching `externalDataConfiguration`, autodetect, Hive partitioning and compression options are not supported |
 | Views and Materialized Views | Partial | `tables.insert` accepts `view.query`/`materializedView.query`, validated and schema-derived by executing the query through the real query engine at creation; every access re-executes the stored query live (see [Views and Materialized Views](#views-and-materialized-views-real-resources-backed-by-the-query-engine)). No patch-based redefinition; materialized views are not actually cached/refreshed |
 | Nested schemas and column evolution | Partial | `schema.fields` supports real `mode` (`NULLABLE`/`REQUIRED`/`REPEATED`) and nested `fields` (`RECORD`/`STRUCT`), rendered end-to-end with BigQuery's real nested REST shape; `tables.patch` can append `NULLABLE` columns and relax `REQUIRED`→`NULLABLE` (see [Nested Schemas](#nested-schemas-structrecord-and-arrayrepeated)). Real nested load/extract is `NEWLINE_DELIMITED_JSON`-only; `CSV`/`AVRO`/`PARQUET` reject nested fields explicitly |
-| Fake GCS JSON API | Partial | Buckets (insert/list/get) and objects (insert via media or multipart upload, get/download/list/delete) on the real endpoint paths, backed by `LOCAQL_FAKE_GCS_ROOT`; verified against `cloud.google.com/go/storage`. No resumable uploads, IAM, versioning, lifecycle rules, notifications, or signed URLs |
+| Fake GCS JSON API | Partial | Buckets (insert/list/get) and objects (insert via media or multipart upload, get/download/list/delete) on the real endpoint paths, backed by `LOCAQL_FAKE_GCS_ROOT`; upload verified against `cloud.google.com/go/storage`, and full/ranged downloads verified against `google-cloud-storage 3.13.1`. No resumable uploads, IAM, versioning, lifecycle rules, notifications, or signed URLs |
 | Job persistence across restart | Partial | Optional local file persistence |
 | Job concurrency limit | Partial | Controlled with `LOCAQL_JOB_WORKERS` |
 | Storage Write backpressure | Partial | `load/copy` jobs throttled by `LOCAQL_STORAGE_WRITE_WORKERS` |
@@ -158,7 +159,7 @@ Known scope, declared explicitly:
 
 - A `project.dataset.table` reference only resolves when the leading component matches the request's own `projectID` (case-insensitive); the engine has no project-level concept, only one SQL schema per dataset. A genuine cross-project reference fails with "table not found" rather than silently resolving against the wrong project.
 - Nested `STRUCT`/`ARRAY` result columns execute correctly and get a real BigQuery-shaped `RECORD`/`REPEATED` schema entry and REST cell shape (see [Nested Schemas](#nested-schemas-structrecord-and-arrayrepeated)).
-- Only `SELECT` is routed through the real engine. `INSERT`/`UPDATE`/`DELETE`/`CREATE TABLE AS SELECT` issued as a query job's text are not wired to LocaQL's catalog — table mutation still goes exclusively through the existing REST job executors (load/copy/extract) and direct `tables`/`datasets` endpoints.
+- Single-statement base-table DDL/DML is routed through the real engine and committed atomically to the catalog; see [Persistent DDL and DML](#persistent-ddl-and-dml). Multi-statement scripts and base-table DML inside a session transaction remain explicitly bounded.
 - `INFORMATION_SCHEMA.X` queries are still handled by LocaQL's own dedicated builders (see the [Current Scope Matrix](#current-scope-matrix)), since those reflect LocaQL's catalog metadata rather than user table data.
 - `totalSlotMs` and dry-run byte estimates remain synthetic, as already declared — there is no query-plan/cost estimation.
 
@@ -187,11 +188,21 @@ curl -X POST http://localhost:9050/bigquery/v2/projects/p1/queries \
 
 Supported `parameterType.type` values: `STRING`, `INT64`, `FLOAT64`, `BOOL`, `BYTES` (base64, matching BigQuery's own wire convention), `DATE`, `DATETIME`, `TIME`, `TIMESTAMP` — for any of them, `parameterValue` with no `value` key binds a real `NULL`. `ARRAY`/`STRUCT`/`NUMERIC`/`BIGNUMERIC` parameter types are rejected explicitly with a `400` rather than silently mishandled; see [Known Divergences](KNOWN-DIVERGENCES.md) for exactly why `NUMERIC`/`BIGNUMERIC` specifically can't just be added later without rewriting client SQL text.
 
+### Persistent DDL and DML
+
+Query jobs now persist real catalog mutations instead of executing them in a disposable engine and losing the result. Supported single-statement forms are `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `TRUNCATE TABLE`, `CREATE TABLE`, `CREATE TABLE AS SELECT`, `CREATE OR REPLACE TABLE` and `DROP TABLE` (including `IF [NOT] EXISTS`). Named and positional query parameters work in DML through the same binding path as `SELECT`.
+
+Execution is statement-atomic: LocaQL materializes the referenced tables into an isolated GoogleSQL database, runs the statement, validates the final schema/`REQUIRED` cells, then commits the final table image only if the catalog version analyzed by the job is still current. Query jobs targeting the same `project:dataset.table` share the existing resource lock and storage-write backpressure limiter; a concurrent direct REST write causes an explicit retryable conflict instead of a lost update. Polling a pending mutation never executes it early or twice.
+
+Job resources expose `statistics.query.statementType` and `numDmlAffectedRows`; simple INSERT/UPDATE/DELETE also expose their unambiguous `dmlStats` category. Query responses expose `numDmlAffectedRows`. This is verified in CI with pinned `google-cloud-bigquery 3.42.3`, including SDK-visible affected-row counts for INSERT/UPDATE/MERGE/DELETE and persisted CTAS/DROP behavior.
+
+Declared limits: cross-project mutation targets, DML against views/external tables, DML targeting `_SESSION`, and persistent DDL/DML while a session transaction is open fail explicitly. Multi-statement script execution is not yet an atomic persistent transaction. `ALTER TABLE`/procedural SQL are not part of this increment.
+
 ## Concurrency and Isolation Notes
 
 - `jobs.get` and `jobs.list` use read locks while mutating paths use exclusive locks.
 - Conflicting table mutations are serialized by resource key (`project:dataset.table`).
-- `load/copy` jobs can be throttled independently from generic job workers through `LOCAQL_STORAGE_WRITE_WORKERS`.
+- `load`/`copy` and persistent DDL/DML query jobs share the storage-write backpressure limit configured by `LOCAQL_STORAGE_WRITE_WORKERS`.
 - When persistence is enabled, metadata and request-id index are written in one snapshot file commit.
 - Snapshot commit uses a temp file and replace strategy so failed writes do not leave partial catalog content.
 
@@ -323,16 +334,47 @@ The console's **Workspace** tab exposes the same four operations as forms over t
 - `AVRO`: records read from an Avro Object Container File and projected onto `schema.fields` by **name**, same as NDJSON. The emulator does not autodetect a BigQuery schema from the file's embedded Avro schema — `schema.fields` is still required.
 - `PARQUET`: rows read via [`parquet-go/parquet-go`](https://github.com/parquet-go/parquet-go) using a Parquet schema built from `schema.fields`, projected by **name** just like Avro/NDJSON. Same no-schema-autodetect limitation applies.
 
+Direct uploads use BigQuery's real upload endpoints, so the official Python client can call `Client.load_table_from_file` without staging the file in GCS. LocaQL supports both protocols selected by that method: `multipart/related` for a known file smaller than 5 MiB, and resumable sessions (`POST` initiation, chunked `PUT`, `308` progress responses and `200` completion) when `size=None` or the client selects resumable upload. The returned resource includes `configuration.load` and nested `statistics.load`, so the SDK returns a real `LoadJob`, `job.result()` polls normally and `output_rows` is populated. This exact flow is covered by the pinned official-client smoke test in `test/clients/python/load_table_from_file.py` and its dedicated CI job.
+
+Top-level scalar nullability is lossless across load, catalog, query execution, `tabledata.list`, extract and Storage Read/Write. A JSON `null` or absent nullable field is stored as SQL `NULL`, while `""`, numeric zero and `false` remain present values. `IS NULL`, `COALESCE` and `COUNT(column)` therefore operate on the real distinction. The internal string-backed catalog uses an escaped NUL-prefixed tag for compatibility with existing snapshots; user strings that equal an internal tag are escaped and round-trip unchanged. NDJSON emits native `null`; nullable Avro fields use `['null', base]` unions; nullable Parquet fields use optional nodes. Missing/explicit-null `REQUIRED` fields fail the load rather than entering the catalog. The pinned official Python smoke verifies that `google-cloud-bigquery` returns `(None, "", 0, False)` and that `COUNT(NULL)=0` while `COUNT("")=1`.
+
+```python
+import io
+
+from google.auth.credentials import AnonymousCredentials
+from google.cloud import bigquery
+
+client = bigquery.Client(
+    project="p1",
+    credentials=AnonymousCredentials(),
+    client_options={"api_endpoint": "http://localhost:9050"},
+)
+config = bigquery.LoadJobConfig(
+    schema=[bigquery.SchemaField("event_id", "INT64")],
+    source_format=bigquery.SourceFormat.CSV,
+    skip_leading_rows=1,
+)
+payload = b"event_id\n1\n"
+job = client.load_table_from_file(
+    io.BytesIO(payload),
+    "p1.analytics.events",
+    job_config=config,
+    size=len(payload),  # omit / use None to exercise resumable upload
+)
+job.result()
+```
+
 `sourceUris` resolve to local file paths by default (optionally prefixed with `file://`). Setting `LOCAQL_FAKE_GCS_ROOT=/some/dir` before starting the emulator makes `gs://bucket/object` URIs resolve onto `/some/dir/bucket/object` instead — a local-disk convenience mapping, **not** a GCS-compatible API. Without that env var, `gs://` is rejected explicitly.
 
 `configuration.load.compression` (optional, default `NONE`) decompresses the source file before parsing: `GZIP` is accepted for `CSV`/`NEWLINE_DELIMITED_JSON`. Avro and Parquet already carry their own codec inside the file and are decoded transparently regardless of which one was used to write them, so `compression` is not applicable there — setting it to anything other than `NONE` for those two formats fails the job explicitly instead of silently doing nothing.
 
 Known limitations, declared explicitly rather than silently ignored:
 
-- Only `NEWLINE_DELIMITED_JSON`, `CSV`, `AVRO` and `PARQUET` are supported; other formats (`ORC`, the BigQuery default when `sourceFormat` is omitted) fail the job explicitly.
-- `schema.fields` is required when `sourceUris` is set; there is no schema autodetect yet.
+- Only `NEWLINE_DELIMITED_JSON`, `CSV`, `AVRO` and `PARQUET` are supported; other formats such as `ORC` fail the job explicitly. When `sourceFormat` is omitted, LocaQL now uses BigQuery's real default, `CSV`.
+- `schema.fields` is required when `sourceUris` or direct uploaded media is used; there is no schema autodetect yet.
 - No `maxBadRecords`/per-row error tolerance yet: any malformed row fails the whole job.
-- Avro and Parquet fields are encoded as non-nullable scalars: this codebase has no NULLABLE/REQUIRED mode tracking for any format yet.
+- Avro and Parquet preserve scalar `NULLABLE`/`REQUIRED` modes; nested `RECORD`/`REPEATED` fields remain supported only by NDJSON and are rejected explicitly for CSV/Avro/Parquet.
+- Resumable upload sessions are process-local and expire after one hour of inactivity. Incomplete media is buffered in memory rather than spooled to disk, so this is intended for local integration tests, not unbounded production-size uploads. Completed jobs and sessions release their media buffers immediately.
 
 ```bash
 curl -X POST http://localhost:9050/bigquery/v2/projects/p1/jobs \
@@ -594,7 +636,7 @@ Known limitations, declared explicitly:
 
 - Only the `` _SESSION.<table> `` qualified reference form resolves against a session; a bare unqualified temp table name does not.
 - Only the single-statement `CREATE TEMP TABLE <name> AS <select>` form is recognized; a separate `CREATE TEMP TABLE (schema...)` followed by standalone `INSERT` statements is not.
-- A session transaction's atomicity covers only that session's own temp tables — `INSERT`/`UPDATE`/`DELETE` against a real base table inside `BEGIN`/`COMMIT`/`ROLLBACK TRANSACTION` still does not mutate LocaQL's catalog at all, matching the existing, independent [Query Engine](#query-engine-real-googlesql-via-an-embedded-sqlite-backend) limitation that only `SELECT` is routed through the real engine.
+- A session transaction's atomicity covers only that session's own temp tables. Base-table DDL/DML is persistent outside a transaction, but is rejected explicitly while a session transaction is open so `ROLLBACK` can never claim to undo a catalog mutation it did not actually govern.
 
 ## BigQuery Storage API: Real gRPC Read Sessions (Avro) and Write Streams (Protobuf)
 
@@ -646,7 +688,7 @@ Deliberately bounded, confirmed with the user before building it:
 
 - **BUFFERED streams are not supported.** `CreateWriteStream` with `type: BUFFERED` returns an explicit `Unimplemented` status; `FlushRows` (which only ever applies to BUFFERED streams) is likewise `Unimplemented`.
 - **A repeated or nested-message proto field is rejected per row** (via `RowErrors` on that specific row, not the whole request) rather than silently flattened or corrupted; a destination table with a `RECORD`/`REPEATED` schema field is rejected even earlier, at stream creation.
-- **`missing_value_interpretations` and mid-stream schema updates are not implemented** — a field absent from a given row is always `NULL`/empty, and the destination schema is read once, not re-checked mid-stream.
+- **`missing_value_interpretations` and mid-stream schema updates are not implemented** — an absent nullable proto field is SQL `NULL`, an absent `REQUIRED` field is a row error, and the destination schema is read once, not re-checked mid-stream.
 
 Verified beyond the in-memory test suite: a disposable throwaway Go client (deleted after use) drove `CreateWriteStream`/`AppendRows` over a **real TCP network connection** against a running `locaql` binary, confirming genuine wire-protocol interoperability, not just the bufconn-based unit tests.
 
@@ -668,13 +710,16 @@ Implemented, matching the real endpoint paths (verified against `cloud.google.co
 | `objects.insert` (media) | `POST /upload/storage/v1/b/{bucket}/o?uploadType=media&name=...` — body is the raw object bytes |
 | `objects.insert` (multipart) | `POST /upload/storage/v1/b/{bucket}/o?uploadType=multipart` — `multipart/related` body (JSON metadata part, then data part) |
 | `objects.get` | `GET /storage/v1/b/{bucket}/o/{object}` |
-| `objects.get` (download) | `GET /storage/v1/b/{bucket}/o/{object}?alt=media` |
+| Official media download | `GET /download/storage/v1/b/{bucket}/o/{url-escaped-object}?alt=media` — supports `Range`, `206`, `Content-Range`, `HEAD` and `X-Goog-Hash` |
+| Legacy media-download alias | `GET /storage/v1/b/{bucket}/o/{object}?alt=media` |
 | `objects.list` | `GET /storage/v1/b/{bucket}/o` (optional `?prefix=`) |
 | `objects.delete` | `DELETE /storage/v1/b/{bucket}/o/{object}` |
 
 Storage is local disk under `LOCAQL_FAKE_GCS_ROOT` (required — without it, every route above returns a `503` naming the missing env var), using the **same** bucket/object path-join convention as the `gs://` mapping used by load/extract/external tables. This means the two mechanisms interoperate: a file uploaded through this JSON API is immediately readable via a `gs://` `sourceUris` load job, and a file already sitting under `LOCAQL_FAKE_GCS_ROOT` is immediately visible through this API.
 
-**Verified against the real client, not just this project's own tests:** running `cloud.google.com/go/storage` with `STORAGE_EMULATOR_HOST` against a live instance of this emulator confirmed `bucket.Create` and `object.NewWriter` (upload) work as-is. That test also surfaced a real, non-obvious fact: the official Go client's `NewWriter` does **not** default to the simple media upload — it sends a `multipart/related` request, which is why multipart is implemented here rather than media alone. `object.NewReader` (download) failed in that same run, but not due to a bug here: the request never reached this server at all, because the official client has a known, currently-open upstream issue where `NewReader` ignores `STORAGE_EMULATOR_HOST`/endpoint overrides and calls real GCS instead ([googleapis/google-cloud-go#1619](https://github.com/googleapis/google-cloud-go/issues/1619), filed P1). Download/get/list/delete are covered directly by this project's own test suite instead, which talks to the HTTP handlers directly and isn't affected by that client-side bug.
+**Verified against real clients, not just this project's own handlers:** running `cloud.google.com/go/storage` with `STORAGE_EMULATOR_HOST` against a live LocaQL instance confirmed `bucket.Create` and `object.NewWriter` (upload) work as-is. That test surfaced that the Go writer sends `multipart/related`, which is why multipart is implemented here rather than media alone. Separately, the pinned `google-cloud-storage 3.13.1` Python smoke test creates a bucket, uploads an object named `folder/nested report.txt`, follows the absolute encoded `mediaLink` through `/download/storage/v1/...`, validates all 16 bytes with MD5, and performs a partial `bytes=4-9` download receiving `206`/`Content-Range`. This runs in CI via `test/clients/python/storage_download.py`.
+
+The Go client's `object.NewReader` still cannot be used for that particular verification because of a known upstream issue: it ignores `STORAGE_EMULATOR_HOST`/endpoint overrides and calls real GCS instead ([googleapis/google-cloud-go#1619](https://github.com/googleapis/google-cloud-go/issues/1619), filed P1). That client-side issue is independent of LocaQL's download implementation; Python official-client and HTTP handler coverage verify the server contract.
 
 Explicitly **not** implemented, matching real fields/paths rather than inventing partial ones: resumable uploads (`uploadType=resumable`), IAM/ACLs, object versioning/generations, lifecycle rules, notifications, signed URLs. A resumable upload attempt fails explicitly (`501`) instead of silently mishandling the request.
 

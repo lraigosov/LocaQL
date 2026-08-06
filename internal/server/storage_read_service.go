@@ -198,10 +198,10 @@ func (s *storageReadService) ReadRows(req *storagepb.ReadRowsRequest, stream sto
 		record := make(map[string]any, len(st.fields))
 		for i, field := range st.fields {
 			if i >= len(row) {
-				record[field.Name] = avroZeroValue(field.Type)
+				record[field.Name] = nil
 				continue
 			}
-			record[field.Name] = stringToAvroValue(row[i], field.Type)
+			record[field.Name] = stringToAvroValue(row[i], field)
 		}
 		var err error
 		binary, err = st.codec.BinaryFromNative(binary, record)

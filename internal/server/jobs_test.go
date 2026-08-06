@@ -841,7 +841,7 @@ func TestExtractJobWritesAvroDestination(t *testing.T) {
 	if len(records) != 4 {
 		t.Fatalf("expected 4 extracted avro records, got %d", len(records))
 	}
-	if records[0]["event_id"] != int64(1) || records[0]["event_name"] != "page_view" {
+	if unwrapAvroUnion(records[0]["event_id"]) != int64(1) || unwrapAvroUnion(records[0]["event_name"]) != "page_view" {
 		t.Fatalf("unexpected first extracted avro record: %v", records[0])
 	}
 }
@@ -1968,6 +1968,9 @@ func TestJobsGetQueryResults(t *testing.T) {
 	schema, ok := out["schema"].(map[string]any)
 	if !ok || schema["fields"] == nil {
 		t.Fatalf("expected schema fields in query results")
+	}
+	if _, present := out["pageToken"]; present {
+		t.Fatalf("expected final query-results page to omit pageToken, got %v", out["pageToken"])
 	}
 }
 
