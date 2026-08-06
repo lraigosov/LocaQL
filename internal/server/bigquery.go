@@ -1011,7 +1011,7 @@ func parseExternalDataConfig(raw map[string]any) externalDataConfigParsed {
 	if value, ok := raw["fieldDelimiter"].(string); ok {
 		out.FieldDelimiter = value
 	}
-	if value, ok := raw["skipLeadingRows"].(float64); ok {
+	if value, ok := parseFlexibleInt64FromAny(raw["skipLeadingRows"]); ok && value >= 0 {
 		out.SkipLeadingRows = int(value)
 	}
 	return out
@@ -1065,6 +1065,7 @@ func (s *Server) listJobs(w http.ResponseWriter, r *http.Request, projectID stri
 }
 
 func (s *Server) insertJob(w http.ResponseWriter, r *http.Request, projectID string) {
+	uploadedMedia, hasUploadedMedia := uploadedLoadMediaFromRequest(r)
 	requestID := r.URL.Query().Get("requestId")
 	userEmail := r.URL.Query().Get("userEmail")
 	if userEmail == "" {
@@ -1078,6 +1079,9 @@ func (s *Server) insertJob(w http.ResponseWriter, r *http.Request, projectID str
 	sourceTables := []tableReference(nil)
 	loadSchema := []tableField(nil)
 	loadSourceURIs := []string(nil)
+	loadInlineData := []byte(nil)
+	loadInlineName := ""
+	loadInline := false
 	loadSourceFormat := ""
 	loadFieldDelimiter := ""
 	loadSkipLeadingRows := 0
@@ -1191,6 +1195,15 @@ func (s *Server) insertJob(w http.ResponseWriter, r *http.Request, projectID str
 		writeError(w, http.StatusBadRequest, queryParametersErr.Error(), "invalid")
 		return
 	}
+	if hasUploadedMedia {
+		if jobType != "load" {
+			writeError(w, http.StatusBadRequest, "uploaded media requires configuration.load", "invalid")
+			return
+		}
+		loadInlineData = uploadedMedia.Data
+		loadInlineName = uploadedMedia.Name
+		loadInline = true
+	}
 	if len(splitScriptStatements(queryText)) > 1 {
 		isScript = true
 	}
@@ -1212,6 +1225,9 @@ func (s *Server) insertJob(w http.ResponseWriter, r *http.Request, projectID str
 		SourceTables:             sourceTables,
 		LoadSchema:               loadSchema,
 		LoadSourceURIs:           loadSourceURIs,
+		LoadInlineData:           loadInlineData,
+		LoadInlineName:           loadInlineName,
+		LoadInline:               loadInline,
 		LoadSourceFormat:         loadSourceFormat,
 		LoadFieldDelimiter:       loadFieldDelimiter,
 		LoadSkipLeadingRows:      loadSkipLeadingRows,
@@ -1405,6 +1421,10 @@ func (s *Server) writeQueryResults(w http.ResponseWriter, r *http.Request, proje
 		writeError(w, http.StatusBadRequest, "Query results only available for query jobs", "invalid")
 		return
 	}
+	if j.State == jobStateDone && j.ErrorReason != "" {
+		writeError(w, http.StatusBadRequest, j.ErrorMessage, j.ErrorReason)
+		return
+	}
 
 	start, size := parsePagination(r, 20, 1000)
 	// A DONE query job's result set was already computed once by
@@ -1420,11 +1440,22 @@ func (s *Server) writeQueryResults(w http.ResponseWriter, r *http.Request, proje
 	if j.State == jobStateDone && j.Statistics.ResultSchema != nil {
 		schema, values = j.Statistics.ResultSchema, j.Statistics.ResultRows
 	} else {
-		var err error
-		schema, values, err = s.simulateQueryResultTable(projectID, j.SessionID, j.QueryText, j.UserEmail, j.ParameterMode, j.QueryParameters)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, err.Error(), "invalid")
-			return
+		// Preserve the existing early-result behavior for side-effect-free
+		// SELECTs, but never execute DDL/DML or session control merely because a
+		// PENDING/RUNNING job was polled. A mutation must run exactly once after
+		// its job acquires the target-table lock.
+		_, mutating, _ := parsePersistentSQLStatement(projectID, j.QueryText)
+		trimmedQuery := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(j.QueryText), ";"))
+		sessionControl := sessionBeginPattern.MatchString(trimmedQuery) || sessionCommitPattern.MatchString(trimmedQuery) || sessionRollbackPattern.MatchString(trimmedQuery) || sessionCreateTempTablePattern.MatchString(trimmedQuery)
+		if mutating || sessionControl {
+			schema, values = []tableField{}, [][]string{}
+		} else {
+			var err error
+			schema, values, err = s.simulateQueryResultTable(projectID, j.SessionID, j.QueryText, j.UserEmail, j.ParameterMode, j.QueryParameters)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, err.Error(), "invalid")
+				return
+			}
 		}
 	}
 	end := clampEnd(start, size, len(values))
@@ -1442,7 +1473,6 @@ func (s *Server) writeQueryResults(w http.ResponseWriter, r *http.Request, proje
 		"rows":           rows,
 		"totalRows":      strconv.Itoa(len(values)),
 		"jobComplete":    j.State == jobStateDone,
-		"pageToken":      strconv.Itoa(start),
 		"maxResults":     size,
 		"startIndexUsed": start,
 	}
@@ -1452,14 +1482,26 @@ func (s *Server) writeQueryResults(w http.ResponseWriter, r *http.Request, proje
 	if j.SessionID != "" {
 		resp["sessionInfo"] = map[string]string{"sessionId": j.SessionID}
 	}
+	if isDMLStatementType(j.Statistics.StatementType) {
+		resp["numDmlAffectedRows"] = strconv.FormatInt(j.Statistics.DMLAffectedRows, 10)
+	}
 
 	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) simulateQueryResultTable(projectID, sessionID, queryText, callingUserEmail string, paramMode string, params []storedQueryParameter) ([]tableField, [][]string, error) {
+	result, err := s.executeQueryStatement(projectID, sessionID, queryText, callingUserEmail, paramMode, params)
+	return result.schema, result.rows, err
+}
+
+// executeQueryStatement is the single execution dispatcher for SELECT,
+// INFORMATION_SCHEMA, session control, and persistent DDL/DML. Keeping the
+// mutation path here ensures jobs.query and jobs.insert share exactly the same
+// semantics and that executeQueryJob can retain statement-specific statistics.
+func (s *Server) executeQueryStatement(projectID, sessionID, queryText, callingUserEmail string, paramMode string, params []storedQueryParameter) (persistentSQLResult, error) {
 	trimmed := strings.TrimSpace(queryText)
 	if trimmed == "" {
-		return []tableField{{Name: "result", Type: "STRING"}}, [][]string{{"query job executed"}}, nil
+		return persistentSQLResult{schema: []tableField{{Name: "result", Type: "STRING"}}, rows: [][]string{{"query job executed"}}, statementType: "SELECT"}, nil
 	}
 	trimmed = strings.TrimSpace(strings.TrimSuffix(trimmed, ";"))
 
@@ -1471,15 +1513,19 @@ func (s *Server) simulateQueryResultTable(projectID, sessionID, queryText, calli
 		var err error
 		sess, handled, schema, rows, err = s.executeSessionControlStatement(projectID, sessionID, trimmed)
 		if handled {
-			return schema, rows, err
+			return persistentSQLResult{schema: schema, rows: rows, statementType: "SCRIPT"}, err
 		}
 	}
 
 	lower := strings.ToLower(trimmed)
 	if schema, rows, ok := s.simulateInformationSchemaQuery(projectID, trimmed, lower, callingUserEmail); ok {
-		return flatSchemaToTableFields(schema), rows, nil
+		return persistentSQLResult{schema: flatSchemaToTableFields(schema), rows: rows, statementType: "SELECT"}, nil
 	}
-	return s.executeRealSQLQueryWithParams(projectID, trimmed, sess, paramMode, params)
+	if result, handled, err := s.executePersistentSQLStatement(projectID, trimmed, sess, paramMode, params); handled {
+		return result, err
+	}
+	schema, rows, err := s.executeRealSQLQueryWithParams(projectID, trimmed, sess, paramMode, params)
+	return persistentSQLResult{schema: schema, rows: rows, statementType: "SELECT"}, err
 }
 
 // flatSchemaToTableFields converts an INFORMATION_SCHEMA builder's flat
@@ -1582,7 +1628,7 @@ func renderRESTRows(schema []tableField, rows [][]string) []map[string]any {
 	for _, row := range rows {
 		cells := make([]map[string]any, len(schema))
 		for i, field := range schema {
-			var raw string
+			raw := storedNullCell
 			if i < len(row) {
 				raw = row[i]
 			}
@@ -1602,6 +1648,11 @@ func renderRESTRows(schema []tableField, rows [][]string) []map[string]any {
 // that fails to parse as the expected JSON shape falls back to the raw
 // string rather than failing the whole response.
 func renderCellForREST(field tableField, raw string) any {
+	var isNull bool
+	raw, isNull = loadStoredCell(raw)
+	if isNull {
+		return nil
+	}
 	if raw == "" {
 		return raw
 	}
@@ -1632,6 +1683,9 @@ func renderCellForREST(field tableField, raw string) any {
 // that has already been json.Unmarshal-decoded (used for elements inside a
 // REPEATED array, which have no separate raw string of their own).
 func renderDecodedCellForREST(field tableField, decoded any) any {
+	if decoded == nil {
+		return nil
+	}
 	if isRecordType(field.Type) {
 		obj, _ := decoded.(map[string]any)
 		cells := make([]map[string]any, len(field.Fields))
@@ -1640,7 +1694,7 @@ func renderDecodedCellForREST(field tableField, decoded any) any {
 		}
 		return map[string]any{"f": cells}
 	}
-	return scalarValueToString(decoded)
+	return scalarValueToPlainString(decoded)
 }
 
 func extractTableRef(v any, defaultProjectID string) tableReference {
@@ -1700,7 +1754,7 @@ func parseLoadConfig(loadCfg map[string]any, projectID string) loadConfigParsed 
 	if value, ok := loadCfg["fieldDelimiter"].(string); ok {
 		out.FieldDelimiter = value
 	}
-	if value, ok := loadCfg["skipLeadingRows"].(float64); ok {
+	if value, ok := parseFlexibleInt64FromAny(loadCfg["skipLeadingRows"]); ok && value >= 0 {
 		out.SkipLeadingRows = int(value)
 	}
 	if value, ok := loadCfg["compression"].(string); ok {
@@ -2199,11 +2253,11 @@ func (s *Server) executeQueryJob(job *jobRecord) (jobStatistics, error) {
 	if strings.Contains(strings.ToUpper(job.QueryText), "FORCE_ERROR") {
 		return jobStatistics{Executor: "query", Simulated: false}, fmt.Errorf("simulated forced error from query text")
 	}
-	schema, rows, err := s.simulateQueryResultTable(job.ProjectID, job.SessionID, job.QueryText, job.UserEmail, job.ParameterMode, job.QueryParameters)
+	result, err := s.executeQueryStatement(job.ProjectID, job.SessionID, job.QueryText, job.UserEmail, job.ParameterMode, job.QueryParameters)
 	if err != nil {
 		return jobStatistics{Executor: "query", Simulated: false}, err
 	}
-	return jobStatistics{Executor: "query", Simulated: false, TotalSlotMs: 60, ProcessedBytes: estimateRowsByteSize(rows), OutputRows: int64(len(rows)), ResultSchema: schema, ResultRows: rows}, nil
+	return jobStatistics{Executor: "query", Simulated: false, TotalSlotMs: 60, ProcessedBytes: estimateRowsByteSize(result.rows), OutputRows: int64(len(result.rows)), StatementType: result.statementType, DMLAffectedRows: result.dmlAffectedRows, ResultSchema: result.schema, ResultRows: result.rows}, nil
 }
 
 func estimateRowsByteSize(rows [][]string) int64 {
@@ -2268,7 +2322,7 @@ func (s *Server) executeLoadJob(job *jobRecord) (jobStatistics, error) {
 
 	schema := cloneTableFields(job.LoadSchema)
 
-	if len(job.LoadSourceURIs) == 0 {
+	if len(job.LoadSourceURIs) == 0 && !job.LoadInline {
 		if len(schema) == 0 {
 			schema = []tableField{{Name: "col_1", Type: "STRING"}}
 		}
@@ -2286,11 +2340,21 @@ func (s *Server) executeLoadJob(job *jobRecord) (jobStatistics, error) {
 	}
 
 	if len(schema) == 0 {
-		return jobStatistics{Executor: "load", Simulated: false}, fmt.Errorf("schema.fields is required to ingest rows from sourceUris")
+		return jobStatistics{Executor: "load", Simulated: false}, fmt.Errorf("schema.fields is required to ingest uploaded media or rows from sourceUris")
 	}
 
-	rows, totalBytes, err := loadRowsFromSourceURIs(job, schema)
+	var rows [][]string
+	var totalBytes int64
+	var err error
+	if job.LoadInline {
+		rows, totalBytes, err = readRowsFromData(job.LoadSourceFormat, job.LoadInlineName, job.LoadInlineData, job.LoadFieldDelimiter, job.LoadSkipLeadingRows, schema, job.LoadCompression)
+	} else {
+		rows, totalBytes, err = loadRowsFromSourceURIs(job, schema)
+	}
 	if err != nil {
+		return jobStatistics{Executor: "load", Simulated: false}, err
+	}
+	if err := validateStoredRows(schema, rows); err != nil {
 		return jobStatistics{Executor: "load", Simulated: false}, err
 	}
 
@@ -2548,7 +2612,7 @@ func encodeNDJSON(schema []tableField, rows [][]string) ([]byte, error) {
 	for _, row := range rows {
 		record := make(map[string]any, len(schema))
 		for i, field := range schema {
-			if i >= len(row) || row[i] == "" {
+			if i >= len(row) || storedCellIsNull(row[i]) {
 				record[field.Name] = nil
 				continue
 			}
@@ -2601,7 +2665,17 @@ func encodeCSV(schema []tableField, rows [][]string, fieldDelimiter string, prin
 		}
 	}
 	for _, row := range rows {
-		if err := writer.Write(row); err != nil {
+		encodedRow := make([]string, len(schema))
+		for i := range encodedRow {
+			if i >= len(row) {
+				continue
+			}
+			value, isNull := loadStoredCell(row[i])
+			if !isNull {
+				encodedRow[i] = value
+			}
+		}
+		if err := writer.Write(encodedRow); err != nil {
 			return nil, fmt.Errorf("failed to write CSV row: %w", err)
 		}
 	}
@@ -2619,6 +2693,11 @@ func encodeCSV(schema []tableField, rows [][]string, fieldDelimiter string, prin
 // sql_engine.go), so they are parsed and embedded as real nested JSON
 // rather than double-encoded as a JSON string.
 func stringToJSONValue(v string, field tableField) (any, error) {
+	var isNull bool
+	v, isNull = loadStoredCell(v)
+	if isNull {
+		return nil, nil
+	}
 	if field.Mode == "REPEATED" || isRecordType(field.Type) {
 		var decoded any
 		if err := json.Unmarshal([]byte(v), &decoded); err != nil {
@@ -2668,7 +2747,7 @@ func parseAvroRows(uri string, data []byte, schema []tableField) ([][]string, er
 		}
 		row := make([]string, len(schema))
 		for i, field := range schema {
-			row[i] = scalarValueToString(record[field.Name])
+			row[i] = scalarValueToString(unwrapAvroUnion(record[field.Name]))
 		}
 		rows = append(rows, row)
 	}
@@ -2679,11 +2758,9 @@ func parseAvroRows(uri string, data []byte, schema []tableField) ([][]string, er
 }
 
 // encodeAvro writes rows as an Avro Object Container File using a record
-// schema derived from schema field names/types. Fields are encoded as
-// non-nullable scalars (no union/null branch): mode tracking (NULLABLE/
-// REQUIRED) exists in the schema now but Avro encode/decode doesn't observe
-// it yet, so Avro follows the same bound as CSV rather than inventing null
-// support only here. RECORD/REPEATED fields are rejected explicitly (see
+// schema derived from schema field names/types. NULLABLE fields use a real
+// ["null", base] union while REQUIRED fields use the base scalar directly.
+// RECORD/REPEATED fields are rejected explicitly (see
 // rejectNestedFields) rather than attempted — real nested Avro schema/codec
 // support is deferred. A row value that fails to parse as its declared type
 // falls back to that type's zero value instead of failing the whole encode.
@@ -2707,10 +2784,10 @@ func encodeAvro(schema []tableField, rows [][]string, codecName string) ([]byte,
 		record := make(map[string]any, len(schema))
 		for i, field := range schema {
 			if i >= len(row) {
-				record[field.Name] = avroZeroValue(field.Type)
+				record[field.Name] = nil
 				continue
 			}
-			record[field.Name] = stringToAvroValue(row[i], field.Type)
+			record[field.Name] = stringToAvroValue(row[i], field)
 		}
 		records = append(records, record)
 	}
@@ -2724,7 +2801,7 @@ func encodeAvro(schema []tableField, rows [][]string, codecName string) ([]byte,
 
 type avroFieldSchema struct {
 	Name string `json:"name"`
-	Type string `json:"type"`
+	Type any    `json:"type"`
 }
 
 type avroRecordSchema struct {
@@ -2736,7 +2813,11 @@ type avroRecordSchema struct {
 func buildAvroSchemaJSON(schema []tableField) (string, error) {
 	fields := make([]avroFieldSchema, 0, len(schema))
 	for _, field := range schema {
-		fields = append(fields, avroFieldSchema{Name: field.Name, Type: avroTypeFor(field.Type)})
+		avroType := any(avroTypeFor(field.Type))
+		if normalizeMode(field.Mode) != "REQUIRED" {
+			avroType = []any{"null", avroType}
+		}
+		fields = append(fields, avroFieldSchema{Name: field.Name, Type: avroType})
 	}
 	encoded, err := json.Marshal(avroRecordSchema{Type: "record", Name: "LocaQLRow", Fields: fields})
 	if err != nil {
@@ -2758,7 +2839,19 @@ func avroTypeFor(bqType string) string {
 	}
 }
 
-func stringToAvroValue(v, fieldType string) any {
+func stringToAvroValue(v string, field tableField) any {
+	raw, isNull := loadStoredCell(v)
+	if isNull {
+		return nil
+	}
+	value := plainStringToAvroValue(raw, field.Type)
+	if normalizeMode(field.Mode) != "REQUIRED" {
+		return goavro.Union(avroTypeFor(field.Type), value)
+	}
+	return value
+}
+
+func plainStringToAvroValue(v, fieldType string) any {
 	switch strings.ToUpper(fieldType) {
 	case "INT64", "INTEGER":
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
@@ -2781,17 +2874,31 @@ func stringToAvroValue(v, fieldType string) any {
 }
 
 func avroZeroValue(fieldType string) any {
-	return stringToAvroValue("", fieldType)
+	return plainStringToAvroValue("", fieldType)
 }
 
-// buildParquetSchema derives a parquet.Schema from schema field names/types.
-// Fields are Required (non-nullable), matching the same NULLABLE/REQUIRED
-// scope bound already documented for Avro: this codebase has no mode
-// tracking for any format yet.
+func unwrapAvroUnion(v any) any {
+	union, ok := v.(map[string]any)
+	if !ok || len(union) != 1 {
+		return v
+	}
+	for _, value := range union {
+		return value
+	}
+	return v
+}
+
+// buildParquetSchema derives a parquet.Schema from schema field names/types;
+// NULLABLE fields are optional Parquet nodes and REQUIRED fields are required.
 func buildParquetSchema(schema []tableField) *parquet.Schema {
 	group := make(parquet.Group, len(schema))
 	for _, field := range schema {
-		group[field.Name] = parquet.Required(parquetNodeFor(field.Type))
+		node := parquetNodeFor(field.Type)
+		if normalizeMode(field.Mode) == "REQUIRED" {
+			group[field.Name] = parquet.Required(node)
+		} else {
+			group[field.Name] = parquet.Optional(node)
+		}
 	}
 	return parquet.NewSchema("LocaQLRow", group)
 }
@@ -2813,8 +2920,12 @@ func parquetNodeFor(bqType string) parquet.Node {
 // parse as its declared type falls back to that type's zero value rather
 // than failing the whole encode, same bound as the other formats' "no
 // per-row error tolerance yet" limitation.
-func stringToParquetValue(v, fieldType string) any {
-	switch strings.ToUpper(fieldType) {
+func stringToParquetValue(v string, field tableField) any {
+	v, isNull := loadStoredCell(v)
+	if isNull {
+		return nil
+	}
+	switch strings.ToUpper(field.Type) {
 	case "INT64", "INTEGER":
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
 			return n
@@ -2882,10 +2993,10 @@ func encodeParquet(schema []tableField, rows [][]string, codec pqcompress.Codec)
 		record := make(map[string]any, len(schema))
 		for i, field := range schema {
 			if i >= len(row) {
-				record[field.Name] = stringToParquetValue("", field.Type)
+				record[field.Name] = nil
 				continue
 			}
-			record[field.Name] = stringToParquetValue(row[i], field.Type)
+			record[field.Name] = stringToParquetValue(row[i], field)
 		}
 		if err := writer.Write(record); err != nil {
 			return nil, fmt.Errorf("failed to encode Parquet row: %w", err)
@@ -2996,37 +3107,67 @@ func normalizeLoadCompression(sourceFormat, compression string) (string, error) 
 // (or fake-GCS via LOCAQL_FAKE_GCS_ROOT). Kept as a single source of truth for
 // which sourceFormat values are actually supported.
 func readRowsFromURIs(sourceFormat string, sourceURIs []string, fieldDelimiter string, skipLeadingRows int, schema []tableField, compression string) ([][]string, int64, error) {
-	normalizedCompression, err := normalizeLoadCompression(sourceFormat, compression)
+	parser, err := loadRowsParser(sourceFormat, fieldDelimiter, skipLeadingRows, schema, compression)
 	if err != nil {
 		return nil, 0, err
 	}
+	return loadRowsAcrossURIs(sourceURIs, parser)
+}
+
+// readRowsFromData parses bytes supplied directly by the BigQuery upload API.
+// It deliberately shares the exact format dispatcher used by sourceUris so
+// load_table_from_file and load_table_from_uri cannot drift semantically.
+func readRowsFromData(sourceFormat, sourceName string, data []byte, fieldDelimiter string, skipLeadingRows int, schema []tableField, compression string) ([][]string, int64, error) {
+	parser, err := loadRowsParser(sourceFormat, fieldDelimiter, skipLeadingRows, schema, compression)
+	if err != nil {
+		return nil, 0, err
+	}
+	if strings.TrimSpace(sourceName) == "" {
+		sourceName = "uploaded-file"
+	}
+	rows, err := parser(sourceName, data)
+	if err != nil {
+		return nil, 0, err
+	}
+	return rows, int64(len(data)), nil
+}
+
+func loadRowsParser(sourceFormat, fieldDelimiter string, skipLeadingRows int, schema []tableField, compression string) (func(string, []byte) ([][]string, error), error) {
+	sourceFormat = strings.ToUpper(strings.TrimSpace(sourceFormat))
+	if sourceFormat == "" {
+		sourceFormat = "CSV"
+	}
+	normalizedCompression, err := normalizeLoadCompression(sourceFormat, compression)
+	if err != nil {
+		return nil, err
+	}
 	switch sourceFormat {
 	case "NEWLINE_DELIMITED_JSON":
-		return loadRowsAcrossURIs(sourceURIs, func(uri string, data []byte) ([][]string, error) {
+		return func(uri string, data []byte) ([][]string, error) {
 			data, err := maybeGunzip(data, normalizedCompression)
 			if err != nil {
 				return nil, fmt.Errorf("sourceUri %q: %w", uri, err)
 			}
 			return parseNDJSONLines(uri, data, schema)
-		})
+		}, nil
 	case "CSV":
-		return loadRowsAcrossURIs(sourceURIs, func(uri string, data []byte) ([][]string, error) {
+		return func(uri string, data []byte) ([][]string, error) {
 			data, err := maybeGunzip(data, normalizedCompression)
 			if err != nil {
 				return nil, fmt.Errorf("sourceUri %q: %w", uri, err)
 			}
 			return parseCSVRows(uri, data, schema, fieldDelimiter, skipLeadingRows)
-		})
+		}, nil
 	case "AVRO":
-		return loadRowsAcrossURIs(sourceURIs, func(uri string, data []byte) ([][]string, error) {
+		return func(uri string, data []byte) ([][]string, error) {
 			return parseAvroRows(uri, data, schema)
-		})
+		}, nil
 	case "PARQUET":
-		return loadRowsAcrossURIs(sourceURIs, func(uri string, data []byte) ([][]string, error) {
+		return func(uri string, data []byte) ([][]string, error) {
 			return parseParquetRows(uri, data, schema)
-		})
+		}, nil
 	default:
-		return nil, 0, fmt.Errorf("sourceFormat %q is not supported; local sourceUris ingestion currently supports NEWLINE_DELIMITED_JSON, CSV, AVRO and PARQUET", sourceFormat)
+		return nil, fmt.Errorf("sourceFormat %q is not supported; local ingestion currently supports NEWLINE_DELIMITED_JSON, CSV, AVRO and PARQUET", sourceFormat)
 	}
 }
 
@@ -3193,6 +3334,16 @@ func parseNDJSONRow(line string, schema []tableField) ([]string, error) {
 // (goavro) produces the Go type matching the Avro schema (int64 for "long",
 // float32 for "float", []byte for "bytes"), so both are handled here.
 func scalarValueToString(v any) string {
+	if v == nil {
+		return storedNullCell
+	}
+	return storeStringCell(scalarValueToPlainString(v))
+}
+
+// scalarValueToPlainString is used for already-decoded nested values whose
+// nullability is represented structurally by JSON nil, not by the top-level
+// stored-cell tag.
+func scalarValueToPlainString(v any) string {
 	switch val := v.(type) {
 	case nil:
 		return ""

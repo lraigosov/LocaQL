@@ -30,6 +30,9 @@ type jobRecord struct {
 	SourceTables             []tableReference
 	LoadSchema               []tableField
 	LoadSourceURIs           []string
+	LoadInlineData           []byte `json:"-"`
+	LoadInlineName           string `json:"-"`
+	LoadInline               bool   `json:"-"`
 	LoadSourceFormat         string
 	LoadFieldDelimiter       string
 	LoadSkipLeadingRows      int
@@ -69,11 +72,13 @@ type jobError struct {
 }
 
 type jobStatistics struct {
-	Executor       string
-	Simulated      bool
-	TotalSlotMs    int64
-	ProcessedBytes int64
-	OutputRows     int64
+	Executor        string
+	Simulated       bool
+	TotalSlotMs     int64
+	ProcessedBytes  int64
+	OutputRows      int64
+	StatementType   string
+	DMLAffectedRows int64
 	// ResultSchema/ResultRows cache a query job's actual result set, computed
 	// once when the job runs (see executeQueryJob) rather than recomputed on
 	// every subsequent getQueryResults/jobs.query fetch. This matters beyond
@@ -107,6 +112,9 @@ type jobInsertOptions struct {
 	SourceTables             []tableReference
 	LoadSchema               []tableField
 	LoadSourceURIs           []string
+	LoadInlineData           []byte
+	LoadInlineName           string
+	LoadInline               bool
 	LoadSourceFormat         string
 	LoadFieldDelimiter       string
 	LoadSkipLeadingRows      int
@@ -229,6 +237,12 @@ func readDefaultStorageWriteWorkerLimit() int {
 func (s *jobService) insert(opts jobInsertOptions) (*jobRecord, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if strings.TrimSpace(opts.TargetDataset) == "" && strings.TrimSpace(opts.TargetTable) == "" && !opts.IsScript {
+		if stmt, handled, err := parsePersistentSQLStatement(opts.ProjectID, opts.QueryText); handled && err == nil {
+			opts.TargetDataset = stmt.target.DatasetID
+			opts.TargetTable = stmt.target.TableID
+		}
+	}
 
 	projectID := opts.ProjectID
 	requestID := opts.RequestID
@@ -258,6 +272,9 @@ func (s *jobService) insert(opts jobInsertOptions) (*jobRecord, bool) {
 		SourceTables:             cloneTableReferences(opts.SourceTables),
 		LoadSchema:               cloneTableFields(opts.LoadSchema),
 		LoadSourceURIs:           cloneStringSlice(opts.LoadSourceURIs),
+		LoadInlineData:           cloneBytes(opts.LoadInlineData),
+		LoadInlineName:           strings.TrimSpace(opts.LoadInlineName),
+		LoadInline:               opts.LoadInline,
 		LoadSourceFormat:         strings.TrimSpace(opts.LoadSourceFormat),
 		LoadFieldDelimiter:       opts.LoadFieldDelimiter,
 		LoadSkipLeadingRows:      opts.LoadSkipLeadingRows,
@@ -331,6 +348,10 @@ func (s *jobService) insertScriptWithChildren(opts jobInsertOptions) (*jobRecord
 // metricsSnapshot; callers must already hold s.mu (all four jobStateDone
 // transition points in run() do).
 func (s *jobService) recordJobOutcomeLocked(jr *jobRecord) {
+	// Uploaded files are transient executor input. Keeping a copy on every
+	// completed job would retain potentially large payloads for the lifetime of
+	// the server even though job rendering and polling never need the bytes.
+	jr.LoadInlineData = nil
 	if jr.ErrorReason == "" {
 		s.completedTotal++
 	} else {
@@ -381,7 +402,7 @@ func (s *jobService) run(jobID, projectID string) {
 	}
 	s.mu.Unlock()
 
-	releaseStorageWrite := s.acquireStorageWriteSlot(jobType)
+	releaseStorageWrite := s.acquireStorageWriteSlot(jobType, resourceKey)
 	defer releaseStorageWrite()
 
 	releaseResource := s.acquireResourceSlot(resourceKey)
@@ -475,6 +496,7 @@ func (s *jobService) runJobExecutors(projectID, jobID, jobType string) (jobExecu
 		{jobType: "load", location: "configuration.load", execute: s.loadExecutor, prepare: func(snap *jobRecord) {
 			snap.LoadSchema = cloneTableFields(snap.LoadSchema)
 			snap.LoadSourceURIs = cloneStringSlice(snap.LoadSourceURIs)
+			snap.LoadInlineData = cloneBytes(snap.LoadInlineData)
 		}},
 		{jobType: "extract", location: "configuration.extract", execute: s.extractExecutor, prepare: func(snap *jobRecord) {
 			snap.ExtractDestinationURIs = cloneStringSlice(snap.ExtractDestinationURIs)
@@ -549,6 +571,7 @@ func (s *jobService) cancel(projectID, jobID string) (*jobRecord, bool) {
 		jr.ErrorReason = "stopped"
 		jr.ErrorMessage = "job cancelled before execution"
 		jr.EndedAt = time.Now().UTC()
+		jr.LoadInlineData = nil
 	}
 	s.projectVersions[projectID]++
 	_ = s.persistLocked()
@@ -673,11 +696,11 @@ func (s *jobService) acquireResourceSlot(resourceKey string) func() {
 	}
 }
 
-func (s *jobService) acquireStorageWriteSlot(jobType string) func() {
+func (s *jobService) acquireStorageWriteSlot(jobType, resourceKey string) func() {
 	if s.storageWriteSlots == nil {
 		return func() {}
 	}
-	if !requiresStorageWriteBackpressure(jobType) {
+	if !requiresStorageWriteBackpressure(jobType, resourceKey) {
 		return func() {}
 	}
 	s.storageWriteSlots <- struct{}{}
@@ -686,9 +709,20 @@ func (s *jobService) acquireStorageWriteSlot(jobType string) func() {
 	}
 }
 
-func requiresStorageWriteBackpressure(jobType string) bool {
+func requiresStorageWriteBackpressure(jobType, resourceKey string) bool {
 	switch strings.ToLower(strings.TrimSpace(jobType)) {
 	case "load", "copy":
+		return true
+	case "query":
+		return strings.TrimSpace(resourceKey) != ""
+	default:
+		return false
+	}
+}
+
+func isDMLStatementType(statementType string) bool {
+	switch statementType {
+	case "INSERT", "UPDATE", "DELETE", "MERGE", "TRUNCATE_TABLE":
 		return true
 	default:
 		return false
@@ -773,6 +807,24 @@ func renderJobResource(j *jobRecord) map[string]any {
 			"outputBytes": j.Statistics.ProcessedBytes,
 		}
 	}
+	if j.JobType == "query" && j.Statistics.StatementType != "" {
+		queryStats := map[string]any{
+			"statementType":       j.Statistics.StatementType,
+			"totalBytesProcessed": strconv.FormatInt(j.Statistics.ProcessedBytes, 10),
+		}
+		if isDMLStatementType(j.Statistics.StatementType) {
+			queryStats["numDmlAffectedRows"] = strconv.FormatInt(j.Statistics.DMLAffectedRows, 10)
+			switch j.Statistics.StatementType {
+			case "INSERT":
+				queryStats["dmlStats"] = map[string]string{"insertedRowCount": strconv.FormatInt(j.Statistics.DMLAffectedRows, 10), "updatedRowCount": "0", "deletedRowCount": "0"}
+			case "UPDATE":
+				queryStats["dmlStats"] = map[string]string{"insertedRowCount": "0", "updatedRowCount": strconv.FormatInt(j.Statistics.DMLAffectedRows, 10), "deletedRowCount": "0"}
+			case "DELETE":
+				queryStats["dmlStats"] = map[string]string{"insertedRowCount": "0", "updatedRowCount": "0", "deletedRowCount": strconv.FormatInt(j.Statistics.DMLAffectedRows, 10)}
+			}
+		}
+		stats["query"] = queryStats
+	}
 
 	res := map[string]any{
 		"kind": "bigquery#job",
@@ -795,6 +847,26 @@ func renderJobResource(j *jobRecord) map[string]any {
 				"priority": j.Priority,
 			},
 		}
+	}
+	if j.JobType == "load" {
+		loadConfig := map[string]any{
+			"destinationTable": map[string]string{
+				"projectId": j.ProjectID,
+				"datasetId": j.TargetDataset,
+				"tableId":   j.TargetTable,
+			},
+			"schema":            map[string]any{"fields": renderTableSchemaFields(j.LoadSchema)},
+			"sourceFormat":      j.LoadSourceFormat,
+			"createDisposition": j.CreateDisposition,
+			"writeDisposition":  j.WriteDisposition,
+			"fieldDelimiter":    j.LoadFieldDelimiter,
+			"skipLeadingRows":   j.LoadSkipLeadingRows,
+			"compression":       j.LoadCompression,
+		}
+		if len(j.LoadSourceURIs) > 0 {
+			loadConfig["sourceUris"] = cloneStringSlice(j.LoadSourceURIs)
+		}
+		res["configuration"] = map[string]any{"load": loadConfig}
 	}
 
 	return res
@@ -845,6 +917,15 @@ func cloneStringSlice(values []string) []string {
 	}
 	out := make([]string, len(values))
 	copy(out, values)
+	return out
+}
+
+func cloneBytes(value []byte) []byte {
+	if value == nil {
+		return nil
+	}
+	out := make([]byte, len(value))
+	copy(out, value)
 	return out
 }
 

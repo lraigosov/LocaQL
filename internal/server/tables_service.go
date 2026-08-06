@@ -22,11 +22,10 @@ type tableField struct {
 	Fields []tableField
 }
 
-// tableRowValue is one cell of a table row, in schema-field order. It is one
-// of: a scalar string (BigQuery's REST convention — every scalar value,
-// including numbers and booleans, is a string), a RECORD value ([]any,
-// positionally matching field.Fields), a REPEATED value ([]any of "single"
-// values for the field's base type), or nil for SQL NULL.
+// tableRowValue documents the logical cell domain. Rows remain serialized as
+// strings for backward-compatible catalog/job/session snapshots, but
+// cell_storage.go adds an escaped, lossless SQL NULL tag; nested/repeated
+// values remain canonical JSON and preserve their own recursive nulls.
 type tableRowValue = any
 
 type tableReference struct {
@@ -290,6 +289,28 @@ func (s *tableService) delete(projectID, datasetID, tableID string) bool {
 	return true
 }
 
+// deleteIfVersion removes a table only if it is still the exact catalog
+// version a SQL statement analyzed. Query jobs also serialize on their target
+// table, but direct REST writes do not pass through that queue; the version
+// check prevents a concurrent REST mutation from being silently discarded by
+// a DROP TABLE that started from an older snapshot.
+func (s *tableService) deleteIfVersion(projectID, datasetID, tableID string, expectedVersion int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tables := s.ensureDatasetLocked(projectID, datasetID)
+	t := tables[tableID]
+	if t == nil {
+		return fmt.Errorf("table not found: %s.%s", datasetID, tableID)
+	}
+	if t.Version != expectedVersion {
+		return fmt.Errorf("table %s.%s changed concurrently; retry the statement", datasetID, tableID)
+	}
+	delete(tables, tableID)
+	s.datasetVersions[s.datasetKey(projectID, datasetID)]++
+	return nil
+}
+
 func (s *tableService) patch(input tablePatch) (*tableRecord, bool) {
 	projectID := strings.TrimSpace(input.ProjectID)
 	datasetID := strings.TrimSpace(input.DatasetID)
@@ -379,6 +400,67 @@ func (s *tableService) getData(projectID, datasetID, tableID string) ([]tableFie
 		return nil, nil, false
 	}
 	return cloneTableFields(t.Schema), cloneTableRows(t.Rows), true
+}
+
+// replaceRowsIfVersion atomically commits the final row image produced by a
+// DML statement while preserving the table's declared schema and metadata.
+// The compare-and-swap closes the race with direct REST writes that are not
+// scheduled as jobs. Views and external tables are deliberately immutable via
+// DML: materializing either into an ordinary table would destroy its identity.
+func (s *tableService) replaceRowsIfVersion(projectID, datasetID, tableID string, expectedVersion int, rows [][]string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tables := s.ensureDatasetLocked(projectID, datasetID)
+	t := tables[tableID]
+	if t == nil {
+		return fmt.Errorf("table not found: %s.%s", datasetID, tableID)
+	}
+	if t.Version != expectedVersion {
+		return fmt.Errorf("table %s.%s changed concurrently; retry the statement", datasetID, tableID)
+	}
+	if t.View != nil {
+		return fmt.Errorf("DML target %s.%s is a view", datasetID, tableID)
+	}
+	if t.External != nil {
+		return fmt.Errorf("DML target %s.%s is an external table", datasetID, tableID)
+	}
+	if err := validateStoredRows(t.Schema, rows); err != nil {
+		return err
+	}
+	t.Rows = cloneTableRows(rows)
+	t.UpdatedAt = s.now().UTC()
+	t.Version++
+	s.datasetVersions[s.datasetKey(projectID, datasetID)]++
+	return nil
+}
+
+// replaceTableIfVersion commits CREATE OR REPLACE TABLE over an existing
+// resource. Unlike DML, DDL replaces the table definition itself, so schema,
+// rows, view and external-table identity all change together under one lock.
+func (s *tableService) replaceTableIfVersion(projectID, datasetID, tableID string, expectedVersion int, schema []tableField, rows [][]string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tables := s.ensureDatasetLocked(projectID, datasetID)
+	t := tables[tableID]
+	if t == nil {
+		return fmt.Errorf("table not found: %s.%s", datasetID, tableID)
+	}
+	if t.Version != expectedVersion {
+		return fmt.Errorf("table %s.%s changed concurrently; retry the statement", datasetID, tableID)
+	}
+	if err := validateStoredRows(schema, rows); err != nil {
+		return err
+	}
+	t.Schema = cloneTableFields(schema)
+	t.Rows = cloneTableRows(rows)
+	t.View = nil
+	t.External = nil
+	t.UpdatedAt = s.now().UTC()
+	t.Version++
+	s.datasetVersions[s.datasetKey(projectID, datasetID)]++
+	return nil
 }
 
 func (s *tableService) upsertCopyDestination(dest tableReference, schema []tableField, rows [][]string, createDisposition, writeDisposition string) (int, error) {
