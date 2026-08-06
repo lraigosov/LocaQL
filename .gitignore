@@ -5,6 +5,9 @@ devlog.md
 # IDEs and Editors
 .vscode/
 .idea/
+.venv/
+venv/
+env/
 *.suo
 *.ntvs*
 *.njsproj

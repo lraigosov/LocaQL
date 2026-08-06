@@ -1011,7 +1011,7 @@ func parseExternalDataConfig(raw map[string]any) externalDataConfigParsed {
 	if value, ok := raw["fieldDelimiter"].(string); ok {
 		out.FieldDelimiter = value
 	}
-	if value, ok := raw["skipLeadingRows"].(float64); ok {
+	if value, ok := parseFlexibleInt64FromAny(raw["skipLeadingRows"]); ok && value >= 0 {
 		out.SkipLeadingRows = int(value)
 	}
 	return out
@@ -1065,6 +1065,7 @@ func (s *Server) listJobs(w http.ResponseWriter, r *http.Request, projectID stri
 }
 
 func (s *Server) insertJob(w http.ResponseWriter, r *http.Request, projectID string) {
+	uploadedMedia, hasUploadedMedia := uploadedLoadMediaFromRequest(r)
 	requestID := r.URL.Query().Get("requestId")
 	userEmail := r.URL.Query().Get("userEmail")
 	if userEmail == "" {
@@ -1078,6 +1079,9 @@ func (s *Server) insertJob(w http.ResponseWriter, r *http.Request, projectID str
 	sourceTables := []tableReference(nil)
 	loadSchema := []tableField(nil)
 	loadSourceURIs := []string(nil)
+	loadInlineData := []byte(nil)
+	loadInlineName := ""
+	loadInline := false
 	loadSourceFormat := ""
 	loadFieldDelimiter := ""
 	loadSkipLeadingRows := 0
@@ -1191,6 +1195,15 @@ func (s *Server) insertJob(w http.ResponseWriter, r *http.Request, projectID str
 		writeError(w, http.StatusBadRequest, queryParametersErr.Error(), "invalid")
 		return
 	}
+	if hasUploadedMedia {
+		if jobType != "load" {
+			writeError(w, http.StatusBadRequest, "uploaded media requires configuration.load", "invalid")
+			return
+		}
+		loadInlineData = uploadedMedia.Data
+		loadInlineName = uploadedMedia.Name
+		loadInline = true
+	}
 	if len(splitScriptStatements(queryText)) > 1 {
 		isScript = true
 	}
@@ -1212,6 +1225,9 @@ func (s *Server) insertJob(w http.ResponseWriter, r *http.Request, projectID str
 		SourceTables:             sourceTables,
 		LoadSchema:               loadSchema,
 		LoadSourceURIs:           loadSourceURIs,
+		LoadInlineData:           loadInlineData,
+		LoadInlineName:           loadInlineName,
+		LoadInline:               loadInline,
 		LoadSourceFormat:         loadSourceFormat,
 		LoadFieldDelimiter:       loadFieldDelimiter,
 		LoadSkipLeadingRows:      loadSkipLeadingRows,
@@ -1700,7 +1716,7 @@ func parseLoadConfig(loadCfg map[string]any, projectID string) loadConfigParsed 
 	if value, ok := loadCfg["fieldDelimiter"].(string); ok {
 		out.FieldDelimiter = value
 	}
-	if value, ok := loadCfg["skipLeadingRows"].(float64); ok {
+	if value, ok := parseFlexibleInt64FromAny(loadCfg["skipLeadingRows"]); ok && value >= 0 {
 		out.SkipLeadingRows = int(value)
 	}
 	if value, ok := loadCfg["compression"].(string); ok {
@@ -2268,7 +2284,7 @@ func (s *Server) executeLoadJob(job *jobRecord) (jobStatistics, error) {
 
 	schema := cloneTableFields(job.LoadSchema)
 
-	if len(job.LoadSourceURIs) == 0 {
+	if len(job.LoadSourceURIs) == 0 && !job.LoadInline {
 		if len(schema) == 0 {
 			schema = []tableField{{Name: "col_1", Type: "STRING"}}
 		}
@@ -2286,10 +2302,17 @@ func (s *Server) executeLoadJob(job *jobRecord) (jobStatistics, error) {
 	}
 
 	if len(schema) == 0 {
-		return jobStatistics{Executor: "load", Simulated: false}, fmt.Errorf("schema.fields is required to ingest rows from sourceUris")
+		return jobStatistics{Executor: "load", Simulated: false}, fmt.Errorf("schema.fields is required to ingest uploaded media or rows from sourceUris")
 	}
 
-	rows, totalBytes, err := loadRowsFromSourceURIs(job, schema)
+	var rows [][]string
+	var totalBytes int64
+	var err error
+	if job.LoadInline {
+		rows, totalBytes, err = readRowsFromData(job.LoadSourceFormat, job.LoadInlineName, job.LoadInlineData, job.LoadFieldDelimiter, job.LoadSkipLeadingRows, schema, job.LoadCompression)
+	} else {
+		rows, totalBytes, err = loadRowsFromSourceURIs(job, schema)
+	}
 	if err != nil {
 		return jobStatistics{Executor: "load", Simulated: false}, err
 	}
@@ -2996,37 +3019,67 @@ func normalizeLoadCompression(sourceFormat, compression string) (string, error) 
 // (or fake-GCS via LOCAQL_FAKE_GCS_ROOT). Kept as a single source of truth for
 // which sourceFormat values are actually supported.
 func readRowsFromURIs(sourceFormat string, sourceURIs []string, fieldDelimiter string, skipLeadingRows int, schema []tableField, compression string) ([][]string, int64, error) {
-	normalizedCompression, err := normalizeLoadCompression(sourceFormat, compression)
+	parser, err := loadRowsParser(sourceFormat, fieldDelimiter, skipLeadingRows, schema, compression)
 	if err != nil {
 		return nil, 0, err
 	}
+	return loadRowsAcrossURIs(sourceURIs, parser)
+}
+
+// readRowsFromData parses bytes supplied directly by the BigQuery upload API.
+// It deliberately shares the exact format dispatcher used by sourceUris so
+// load_table_from_file and load_table_from_uri cannot drift semantically.
+func readRowsFromData(sourceFormat, sourceName string, data []byte, fieldDelimiter string, skipLeadingRows int, schema []tableField, compression string) ([][]string, int64, error) {
+	parser, err := loadRowsParser(sourceFormat, fieldDelimiter, skipLeadingRows, schema, compression)
+	if err != nil {
+		return nil, 0, err
+	}
+	if strings.TrimSpace(sourceName) == "" {
+		sourceName = "uploaded-file"
+	}
+	rows, err := parser(sourceName, data)
+	if err != nil {
+		return nil, 0, err
+	}
+	return rows, int64(len(data)), nil
+}
+
+func loadRowsParser(sourceFormat, fieldDelimiter string, skipLeadingRows int, schema []tableField, compression string) (func(string, []byte) ([][]string, error), error) {
+	sourceFormat = strings.ToUpper(strings.TrimSpace(sourceFormat))
+	if sourceFormat == "" {
+		sourceFormat = "CSV"
+	}
+	normalizedCompression, err := normalizeLoadCompression(sourceFormat, compression)
+	if err != nil {
+		return nil, err
+	}
 	switch sourceFormat {
 	case "NEWLINE_DELIMITED_JSON":
-		return loadRowsAcrossURIs(sourceURIs, func(uri string, data []byte) ([][]string, error) {
+		return func(uri string, data []byte) ([][]string, error) {
 			data, err := maybeGunzip(data, normalizedCompression)
 			if err != nil {
 				return nil, fmt.Errorf("sourceUri %q: %w", uri, err)
 			}
 			return parseNDJSONLines(uri, data, schema)
-		})
+		}, nil
 	case "CSV":
-		return loadRowsAcrossURIs(sourceURIs, func(uri string, data []byte) ([][]string, error) {
+		return func(uri string, data []byte) ([][]string, error) {
 			data, err := maybeGunzip(data, normalizedCompression)
 			if err != nil {
 				return nil, fmt.Errorf("sourceUri %q: %w", uri, err)
 			}
 			return parseCSVRows(uri, data, schema, fieldDelimiter, skipLeadingRows)
-		})
+		}, nil
 	case "AVRO":
-		return loadRowsAcrossURIs(sourceURIs, func(uri string, data []byte) ([][]string, error) {
+		return func(uri string, data []byte) ([][]string, error) {
 			return parseAvroRows(uri, data, schema)
-		})
+		}, nil
 	case "PARQUET":
-		return loadRowsAcrossURIs(sourceURIs, func(uri string, data []byte) ([][]string, error) {
+		return func(uri string, data []byte) ([][]string, error) {
 			return parseParquetRows(uri, data, schema)
-		})
+		}, nil
 	default:
-		return nil, 0, fmt.Errorf("sourceFormat %q is not supported; local sourceUris ingestion currently supports NEWLINE_DELIMITED_JSON, CSV, AVRO and PARQUET", sourceFormat)
+		return nil, fmt.Errorf("sourceFormat %q is not supported; local ingestion currently supports NEWLINE_DELIMITED_JSON, CSV, AVRO and PARQUET", sourceFormat)
 	}
 }
 
