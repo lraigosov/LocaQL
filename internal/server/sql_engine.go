@@ -65,12 +65,17 @@ func quoteIdent(id string) string {
 	return "`" + strings.ReplaceAll(id, "`", "``") + "`"
 }
 
-// convertScalarForInsert parses a BigQuery REST-convention scalar string
-// cell into a typed value for a parameterized INSERT. An empty string is
-// treated as NULL for INT64/FLOAT64/BOOL, since none of those types can
-// otherwise hold "" — this does not change STRING behavior, which keeps
-// empty strings as-is.
+// convertScalarForInsert parses one lossless stored scalar cell into a typed
+// value for a parameterized INSERT. The explicit null tag is SQL NULL for
+// every type; an empty STRING remains a real empty string. Empty numeric and
+// boolean cells retain the legacy-null behavior because those types cannot
+// represent an empty string and old CSV-backed rows used that convention.
 func convertScalarForInsert(fieldType, cell string) (any, error) {
+	var isNull bool
+	cell, isNull = loadStoredCell(cell)
+	if isNull {
+		return nil, nil
+	}
 	switch strings.ToUpper(strings.TrimSpace(fieldType)) {
 	case "INT64":
 		if cell == "" {
@@ -106,6 +111,11 @@ func convertScalarForInsert(fieldType, cell string) (any, error) {
 // found unreliable for the same underlying reason) but a real quirk of this
 // query engine's placeholder-type inference inside literal expressions.
 func buildInsertValueExpr(field tableField, cell string) (string, []any, error) {
+	decodedCell, isNull := loadStoredCell(cell)
+	if isNull {
+		return "NULL", nil, nil
+	}
+	cell = decodedCell
 	if field.Mode == "REPEATED" {
 		if cell == "" {
 			return "NULL", nil, nil
@@ -438,7 +448,7 @@ func materializeTable(db *sql.DB, datasetID, tableID string, fields []tableField
 	for _, row := range rows {
 		values := make([]any, len(fields))
 		for i, f := range fields {
-			cell := ""
+			cell := storedNullCell
 			if i < len(row) {
 				cell = row[i]
 			}
@@ -468,7 +478,7 @@ func materializeNestedRows(db *sql.DB, qualified string, fields []tableField, ro
 		exprs := make([]string, len(fields))
 		var params []any
 		for i, f := range fields {
-			cell := ""
+			cell := storedNullCell
 			if i < len(row) {
 				cell = row[i]
 			}
@@ -535,7 +545,7 @@ func cellFromScannedValue(field tableField, v any) (string, error) {
 		return scalarValueToString(v), nil
 	}
 	if v == nil {
-		return "", nil
+		return storedNullCell, nil
 	}
 	normalized, err := normalizeScannedValue(field, v)
 	if err != nil {

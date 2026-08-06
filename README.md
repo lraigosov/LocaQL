@@ -97,7 +97,7 @@ Registry file:
 | External tables | Partial | `tables.insert` accepts `externalDataConfiguration` (`NEWLINE_DELIMITED_JSON`/`CSV`/`AVRO`/`PARQUET`, explicit schema, no autodetect); `sourceUris` are read fresh from disk/fake-GCS on every query/`tabledata.list`/copy/extract access rather than materialized at creation. Patching `externalDataConfiguration`, autodetect, Hive partitioning and compression options are not supported |
 | Views and Materialized Views | Partial | `tables.insert` accepts `view.query`/`materializedView.query`, validated and schema-derived by executing the query through the real query engine at creation; every access re-executes the stored query live (see [Views and Materialized Views](#views-and-materialized-views-real-resources-backed-by-the-query-engine)). No patch-based redefinition; materialized views are not actually cached/refreshed |
 | Nested schemas and column evolution | Partial | `schema.fields` supports real `mode` (`NULLABLE`/`REQUIRED`/`REPEATED`) and nested `fields` (`RECORD`/`STRUCT`), rendered end-to-end with BigQuery's real nested REST shape; `tables.patch` can append `NULLABLE` columns and relax `REQUIRED`→`NULLABLE` (see [Nested Schemas](#nested-schemas-structrecord-and-arrayrepeated)). Real nested load/extract is `NEWLINE_DELIMITED_JSON`-only; `CSV`/`AVRO`/`PARQUET` reject nested fields explicitly |
-| Fake GCS JSON API | Partial | Buckets (insert/list/get) and objects (insert via media or multipart upload, get/download/list/delete) on the real endpoint paths, backed by `LOCAQL_FAKE_GCS_ROOT`; verified against `cloud.google.com/go/storage`. No resumable uploads, IAM, versioning, lifecycle rules, notifications, or signed URLs |
+| Fake GCS JSON API | Partial | Buckets (insert/list/get) and objects (insert via media or multipart upload, get/download/list/delete) on the real endpoint paths, backed by `LOCAQL_FAKE_GCS_ROOT`; upload verified against `cloud.google.com/go/storage`, and full/ranged downloads verified against `google-cloud-storage 3.13.1`. No resumable uploads, IAM, versioning, lifecycle rules, notifications, or signed URLs |
 | Job persistence across restart | Partial | Optional local file persistence |
 | Job concurrency limit | Partial | Controlled with `LOCAQL_JOB_WORKERS` |
 | Storage Write backpressure | Partial | `load/copy` jobs throttled by `LOCAQL_STORAGE_WRITE_WORKERS` |
@@ -325,6 +325,8 @@ The console's **Workspace** tab exposes the same four operations as forms over t
 
 Direct uploads use BigQuery's real upload endpoints, so the official Python client can call `Client.load_table_from_file` without staging the file in GCS. LocaQL supports both protocols selected by that method: `multipart/related` for a known file smaller than 5 MiB, and resumable sessions (`POST` initiation, chunked `PUT`, `308` progress responses and `200` completion) when `size=None` or the client selects resumable upload. The returned resource includes `configuration.load` and nested `statistics.load`, so the SDK returns a real `LoadJob`, `job.result()` polls normally and `output_rows` is populated. This exact flow is covered by the pinned official-client smoke test in `test/clients/python/load_table_from_file.py` and its dedicated CI job.
 
+Top-level scalar nullability is lossless across load, catalog, query execution, `tabledata.list`, extract and Storage Read/Write. A JSON `null` or absent nullable field is stored as SQL `NULL`, while `""`, numeric zero and `false` remain present values. `IS NULL`, `COALESCE` and `COUNT(column)` therefore operate on the real distinction. The internal string-backed catalog uses an escaped NUL-prefixed tag for compatibility with existing snapshots; user strings that equal an internal tag are escaped and round-trip unchanged. NDJSON emits native `null`; nullable Avro fields use `['null', base]` unions; nullable Parquet fields use optional nodes. Missing/explicit-null `REQUIRED` fields fail the load rather than entering the catalog. The pinned official Python smoke verifies that `google-cloud-bigquery` returns `(None, "", 0, False)` and that `COUNT(NULL)=0` while `COUNT("")=1`.
+
 ```python
 import io
 
@@ -360,7 +362,7 @@ Known limitations, declared explicitly rather than silently ignored:
 - Only `NEWLINE_DELIMITED_JSON`, `CSV`, `AVRO` and `PARQUET` are supported; other formats such as `ORC` fail the job explicitly. When `sourceFormat` is omitted, LocaQL now uses BigQuery's real default, `CSV`.
 - `schema.fields` is required when `sourceUris` or direct uploaded media is used; there is no schema autodetect yet.
 - No `maxBadRecords`/per-row error tolerance yet: any malformed row fails the whole job.
-- Avro and Parquet fields are encoded as non-nullable scalars: this codebase has no NULLABLE/REQUIRED mode tracking for any format yet.
+- Avro and Parquet preserve scalar `NULLABLE`/`REQUIRED` modes; nested `RECORD`/`REPEATED` fields remain supported only by NDJSON and are rejected explicitly for CSV/Avro/Parquet.
 - Resumable upload sessions are process-local and expire after one hour of inactivity. Incomplete media is buffered in memory rather than spooled to disk, so this is intended for local integration tests, not unbounded production-size uploads. Completed jobs and sessions release their media buffers immediately.
 
 ```bash
@@ -675,7 +677,7 @@ Deliberately bounded, confirmed with the user before building it:
 
 - **BUFFERED streams are not supported.** `CreateWriteStream` with `type: BUFFERED` returns an explicit `Unimplemented` status; `FlushRows` (which only ever applies to BUFFERED streams) is likewise `Unimplemented`.
 - **A repeated or nested-message proto field is rejected per row** (via `RowErrors` on that specific row, not the whole request) rather than silently flattened or corrupted; a destination table with a `RECORD`/`REPEATED` schema field is rejected even earlier, at stream creation.
-- **`missing_value_interpretations` and mid-stream schema updates are not implemented** — a field absent from a given row is always `NULL`/empty, and the destination schema is read once, not re-checked mid-stream.
+- **`missing_value_interpretations` and mid-stream schema updates are not implemented** — an absent nullable proto field is SQL `NULL`, an absent `REQUIRED` field is a row error, and the destination schema is read once, not re-checked mid-stream.
 
 Verified beyond the in-memory test suite: a disposable throwaway Go client (deleted after use) drove `CreateWriteStream`/`AppendRows` over a **real TCP network connection** against a running `locaql` binary, confirming genuine wire-protocol interoperability, not just the bufconn-based unit tests.
 
@@ -697,13 +699,16 @@ Implemented, matching the real endpoint paths (verified against `cloud.google.co
 | `objects.insert` (media) | `POST /upload/storage/v1/b/{bucket}/o?uploadType=media&name=...` — body is the raw object bytes |
 | `objects.insert` (multipart) | `POST /upload/storage/v1/b/{bucket}/o?uploadType=multipart` — `multipart/related` body (JSON metadata part, then data part) |
 | `objects.get` | `GET /storage/v1/b/{bucket}/o/{object}` |
-| `objects.get` (download) | `GET /storage/v1/b/{bucket}/o/{object}?alt=media` |
+| Official media download | `GET /download/storage/v1/b/{bucket}/o/{url-escaped-object}?alt=media` — supports `Range`, `206`, `Content-Range`, `HEAD` and `X-Goog-Hash` |
+| Legacy media-download alias | `GET /storage/v1/b/{bucket}/o/{object}?alt=media` |
 | `objects.list` | `GET /storage/v1/b/{bucket}/o` (optional `?prefix=`) |
 | `objects.delete` | `DELETE /storage/v1/b/{bucket}/o/{object}` |
 
 Storage is local disk under `LOCAQL_FAKE_GCS_ROOT` (required — without it, every route above returns a `503` naming the missing env var), using the **same** bucket/object path-join convention as the `gs://` mapping used by load/extract/external tables. This means the two mechanisms interoperate: a file uploaded through this JSON API is immediately readable via a `gs://` `sourceUris` load job, and a file already sitting under `LOCAQL_FAKE_GCS_ROOT` is immediately visible through this API.
 
-**Verified against the real client, not just this project's own tests:** running `cloud.google.com/go/storage` with `STORAGE_EMULATOR_HOST` against a live instance of this emulator confirmed `bucket.Create` and `object.NewWriter` (upload) work as-is. That test also surfaced a real, non-obvious fact: the official Go client's `NewWriter` does **not** default to the simple media upload — it sends a `multipart/related` request, which is why multipart is implemented here rather than media alone. `object.NewReader` (download) failed in that same run, but not due to a bug here: the request never reached this server at all, because the official client has a known, currently-open upstream issue where `NewReader` ignores `STORAGE_EMULATOR_HOST`/endpoint overrides and calls real GCS instead ([googleapis/google-cloud-go#1619](https://github.com/googleapis/google-cloud-go/issues/1619), filed P1). Download/get/list/delete are covered directly by this project's own test suite instead, which talks to the HTTP handlers directly and isn't affected by that client-side bug.
+**Verified against real clients, not just this project's own handlers:** running `cloud.google.com/go/storage` with `STORAGE_EMULATOR_HOST` against a live LocaQL instance confirmed `bucket.Create` and `object.NewWriter` (upload) work as-is. That test surfaced that the Go writer sends `multipart/related`, which is why multipart is implemented here rather than media alone. Separately, the pinned `google-cloud-storage 3.13.1` Python smoke test creates a bucket, uploads an object named `folder/nested report.txt`, follows the absolute encoded `mediaLink` through `/download/storage/v1/...`, validates all 16 bytes with MD5, and performs a partial `bytes=4-9` download receiving `206`/`Content-Range`. This runs in CI via `test/clients/python/storage_download.py`.
+
+The Go client's `object.NewReader` still cannot be used for that particular verification because of a known upstream issue: it ignores `STORAGE_EMULATOR_HOST`/endpoint overrides and calls real GCS instead ([googleapis/google-cloud-go#1619](https://github.com/googleapis/google-cloud-go/issues/1619), filed P1). That client-side issue is independent of LocaQL's download implementation; Python official-client and HTTP handler coverage verify the server contract.
 
 Explicitly **not** implemented, matching real fields/paths rather than inventing partial ones: resumable uploads (`uploadType=resumable`), IAM/ACLs, object versioning/generations, lifecycle rules, notifications, signed URLs. A resumable upload attempt fails explicitly (`501`) instead of silently mishandling the request.
 

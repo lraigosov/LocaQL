@@ -1458,7 +1458,6 @@ func (s *Server) writeQueryResults(w http.ResponseWriter, r *http.Request, proje
 		"rows":           rows,
 		"totalRows":      strconv.Itoa(len(values)),
 		"jobComplete":    j.State == jobStateDone,
-		"pageToken":      strconv.Itoa(start),
 		"maxResults":     size,
 		"startIndexUsed": start,
 	}
@@ -1598,7 +1597,7 @@ func renderRESTRows(schema []tableField, rows [][]string) []map[string]any {
 	for _, row := range rows {
 		cells := make([]map[string]any, len(schema))
 		for i, field := range schema {
-			var raw string
+			raw := storedNullCell
 			if i < len(row) {
 				raw = row[i]
 			}
@@ -1618,6 +1617,11 @@ func renderRESTRows(schema []tableField, rows [][]string) []map[string]any {
 // that fails to parse as the expected JSON shape falls back to the raw
 // string rather than failing the whole response.
 func renderCellForREST(field tableField, raw string) any {
+	var isNull bool
+	raw, isNull = loadStoredCell(raw)
+	if isNull {
+		return nil
+	}
 	if raw == "" {
 		return raw
 	}
@@ -1648,6 +1652,9 @@ func renderCellForREST(field tableField, raw string) any {
 // that has already been json.Unmarshal-decoded (used for elements inside a
 // REPEATED array, which have no separate raw string of their own).
 func renderDecodedCellForREST(field tableField, decoded any) any {
+	if decoded == nil {
+		return nil
+	}
 	if isRecordType(field.Type) {
 		obj, _ := decoded.(map[string]any)
 		cells := make([]map[string]any, len(field.Fields))
@@ -1656,7 +1663,7 @@ func renderDecodedCellForREST(field tableField, decoded any) any {
 		}
 		return map[string]any{"f": cells}
 	}
-	return scalarValueToString(decoded)
+	return scalarValueToPlainString(decoded)
 }
 
 func extractTableRef(v any, defaultProjectID string) tableReference {
@@ -2316,6 +2323,9 @@ func (s *Server) executeLoadJob(job *jobRecord) (jobStatistics, error) {
 	if err != nil {
 		return jobStatistics{Executor: "load", Simulated: false}, err
 	}
+	if err := validateStoredRows(schema, rows); err != nil {
+		return jobStatistics{Executor: "load", Simulated: false}, err
+	}
 
 	outputRows, err := s.tables.upsertCopyDestination(
 		tableReference{ProjectID: job.ProjectID, DatasetID: job.TargetDataset, TableID: job.TargetTable},
@@ -2571,7 +2581,7 @@ func encodeNDJSON(schema []tableField, rows [][]string) ([]byte, error) {
 	for _, row := range rows {
 		record := make(map[string]any, len(schema))
 		for i, field := range schema {
-			if i >= len(row) || row[i] == "" {
+			if i >= len(row) || storedCellIsNull(row[i]) {
 				record[field.Name] = nil
 				continue
 			}
@@ -2624,7 +2634,17 @@ func encodeCSV(schema []tableField, rows [][]string, fieldDelimiter string, prin
 		}
 	}
 	for _, row := range rows {
-		if err := writer.Write(row); err != nil {
+		encodedRow := make([]string, len(schema))
+		for i := range encodedRow {
+			if i >= len(row) {
+				continue
+			}
+			value, isNull := loadStoredCell(row[i])
+			if !isNull {
+				encodedRow[i] = value
+			}
+		}
+		if err := writer.Write(encodedRow); err != nil {
 			return nil, fmt.Errorf("failed to write CSV row: %w", err)
 		}
 	}
@@ -2642,6 +2662,11 @@ func encodeCSV(schema []tableField, rows [][]string, fieldDelimiter string, prin
 // sql_engine.go), so they are parsed and embedded as real nested JSON
 // rather than double-encoded as a JSON string.
 func stringToJSONValue(v string, field tableField) (any, error) {
+	var isNull bool
+	v, isNull = loadStoredCell(v)
+	if isNull {
+		return nil, nil
+	}
 	if field.Mode == "REPEATED" || isRecordType(field.Type) {
 		var decoded any
 		if err := json.Unmarshal([]byte(v), &decoded); err != nil {
@@ -2691,7 +2716,7 @@ func parseAvroRows(uri string, data []byte, schema []tableField) ([][]string, er
 		}
 		row := make([]string, len(schema))
 		for i, field := range schema {
-			row[i] = scalarValueToString(record[field.Name])
+			row[i] = scalarValueToString(unwrapAvroUnion(record[field.Name]))
 		}
 		rows = append(rows, row)
 	}
@@ -2702,11 +2727,9 @@ func parseAvroRows(uri string, data []byte, schema []tableField) ([][]string, er
 }
 
 // encodeAvro writes rows as an Avro Object Container File using a record
-// schema derived from schema field names/types. Fields are encoded as
-// non-nullable scalars (no union/null branch): mode tracking (NULLABLE/
-// REQUIRED) exists in the schema now but Avro encode/decode doesn't observe
-// it yet, so Avro follows the same bound as CSV rather than inventing null
-// support only here. RECORD/REPEATED fields are rejected explicitly (see
+// schema derived from schema field names/types. NULLABLE fields use a real
+// ["null", base] union while REQUIRED fields use the base scalar directly.
+// RECORD/REPEATED fields are rejected explicitly (see
 // rejectNestedFields) rather than attempted — real nested Avro schema/codec
 // support is deferred. A row value that fails to parse as its declared type
 // falls back to that type's zero value instead of failing the whole encode.
@@ -2730,10 +2753,10 @@ func encodeAvro(schema []tableField, rows [][]string, codecName string) ([]byte,
 		record := make(map[string]any, len(schema))
 		for i, field := range schema {
 			if i >= len(row) {
-				record[field.Name] = avroZeroValue(field.Type)
+				record[field.Name] = nil
 				continue
 			}
-			record[field.Name] = stringToAvroValue(row[i], field.Type)
+			record[field.Name] = stringToAvroValue(row[i], field)
 		}
 		records = append(records, record)
 	}
@@ -2747,7 +2770,7 @@ func encodeAvro(schema []tableField, rows [][]string, codecName string) ([]byte,
 
 type avroFieldSchema struct {
 	Name string `json:"name"`
-	Type string `json:"type"`
+	Type any    `json:"type"`
 }
 
 type avroRecordSchema struct {
@@ -2759,7 +2782,11 @@ type avroRecordSchema struct {
 func buildAvroSchemaJSON(schema []tableField) (string, error) {
 	fields := make([]avroFieldSchema, 0, len(schema))
 	for _, field := range schema {
-		fields = append(fields, avroFieldSchema{Name: field.Name, Type: avroTypeFor(field.Type)})
+		avroType := any(avroTypeFor(field.Type))
+		if normalizeMode(field.Mode) != "REQUIRED" {
+			avroType = []any{"null", avroType}
+		}
+		fields = append(fields, avroFieldSchema{Name: field.Name, Type: avroType})
 	}
 	encoded, err := json.Marshal(avroRecordSchema{Type: "record", Name: "LocaQLRow", Fields: fields})
 	if err != nil {
@@ -2781,7 +2808,19 @@ func avroTypeFor(bqType string) string {
 	}
 }
 
-func stringToAvroValue(v, fieldType string) any {
+func stringToAvroValue(v string, field tableField) any {
+	raw, isNull := loadStoredCell(v)
+	if isNull {
+		return nil
+	}
+	value := plainStringToAvroValue(raw, field.Type)
+	if normalizeMode(field.Mode) != "REQUIRED" {
+		return goavro.Union(avroTypeFor(field.Type), value)
+	}
+	return value
+}
+
+func plainStringToAvroValue(v, fieldType string) any {
 	switch strings.ToUpper(fieldType) {
 	case "INT64", "INTEGER":
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
@@ -2804,17 +2843,31 @@ func stringToAvroValue(v, fieldType string) any {
 }
 
 func avroZeroValue(fieldType string) any {
-	return stringToAvroValue("", fieldType)
+	return plainStringToAvroValue("", fieldType)
 }
 
-// buildParquetSchema derives a parquet.Schema from schema field names/types.
-// Fields are Required (non-nullable), matching the same NULLABLE/REQUIRED
-// scope bound already documented for Avro: this codebase has no mode
-// tracking for any format yet.
+func unwrapAvroUnion(v any) any {
+	union, ok := v.(map[string]any)
+	if !ok || len(union) != 1 {
+		return v
+	}
+	for _, value := range union {
+		return value
+	}
+	return v
+}
+
+// buildParquetSchema derives a parquet.Schema from schema field names/types;
+// NULLABLE fields are optional Parquet nodes and REQUIRED fields are required.
 func buildParquetSchema(schema []tableField) *parquet.Schema {
 	group := make(parquet.Group, len(schema))
 	for _, field := range schema {
-		group[field.Name] = parquet.Required(parquetNodeFor(field.Type))
+		node := parquetNodeFor(field.Type)
+		if normalizeMode(field.Mode) == "REQUIRED" {
+			group[field.Name] = parquet.Required(node)
+		} else {
+			group[field.Name] = parquet.Optional(node)
+		}
 	}
 	return parquet.NewSchema("LocaQLRow", group)
 }
@@ -2836,8 +2889,12 @@ func parquetNodeFor(bqType string) parquet.Node {
 // parse as its declared type falls back to that type's zero value rather
 // than failing the whole encode, same bound as the other formats' "no
 // per-row error tolerance yet" limitation.
-func stringToParquetValue(v, fieldType string) any {
-	switch strings.ToUpper(fieldType) {
+func stringToParquetValue(v string, field tableField) any {
+	v, isNull := loadStoredCell(v)
+	if isNull {
+		return nil
+	}
+	switch strings.ToUpper(field.Type) {
 	case "INT64", "INTEGER":
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
 			return n
@@ -2905,10 +2962,10 @@ func encodeParquet(schema []tableField, rows [][]string, codec pqcompress.Codec)
 		record := make(map[string]any, len(schema))
 		for i, field := range schema {
 			if i >= len(row) {
-				record[field.Name] = stringToParquetValue("", field.Type)
+				record[field.Name] = nil
 				continue
 			}
-			record[field.Name] = stringToParquetValue(row[i], field.Type)
+			record[field.Name] = stringToParquetValue(row[i], field)
 		}
 		if err := writer.Write(record); err != nil {
 			return nil, fmt.Errorf("failed to encode Parquet row: %w", err)
@@ -3246,6 +3303,16 @@ func parseNDJSONRow(line string, schema []tableField) ([]string, error) {
 // (goavro) produces the Go type matching the Avro schema (int64 for "long",
 // float32 for "float", []byte for "bytes"), so both are handled here.
 func scalarValueToString(v any) string {
+	if v == nil {
+		return storedNullCell
+	}
+	return storeStringCell(scalarValueToPlainString(v))
+}
+
+// scalarValueToPlainString is used for already-decoded nested values whose
+// nullability is represented structurally by JSON nil, not by the top-level
+// stored-cell tag.
+func scalarValueToPlainString(v any) string {
 	switch val := v.(type) {
 	case nil:
 		return ""

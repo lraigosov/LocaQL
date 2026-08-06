@@ -22,11 +22,10 @@ type tableField struct {
 	Fields []tableField
 }
 
-// tableRowValue is one cell of a table row, in schema-field order. It is one
-// of: a scalar string (BigQuery's REST convention — every scalar value,
-// including numbers and booleans, is a string), a RECORD value ([]any,
-// positionally matching field.Fields), a REPEATED value ([]any of "single"
-// values for the field's base type), or nil for SQL NULL.
+// tableRowValue documents the logical cell domain. Rows remain serialized as
+// strings for backward-compatible catalog/job/session snapshots, but
+// cell_storage.go adds an escaped, lossless SQL NULL tag; nested/repeated
+// values remain canonical JSON and preserve their own recursive nulls.
 type tableRowValue = any
 
 type tableReference struct {
