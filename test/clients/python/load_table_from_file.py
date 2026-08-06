@@ -45,6 +45,63 @@ def load_csv(
     return job
 
 
+def validate_nullable_values(client: bigquery.Client) -> dict[str, object]:
+    table_id = "p1.analytics.python_nullable_values"
+    payload = (
+        b'{"id":1,"null_text":null,"empty_text":"",'
+        b'"zero_value":0,"false_value":false}\n'
+    )
+    config = bigquery.LoadJobConfig(
+        schema=[
+            bigquery.SchemaField("id", "INT64", mode="REQUIRED"),
+            bigquery.SchemaField("null_text", "STRING"),
+            bigquery.SchemaField("empty_text", "STRING"),
+            bigquery.SchemaField("zero_value", "INT64"),
+            bigquery.SchemaField("false_value", "BOOL"),
+        ],
+        source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
+        write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+    )
+    job = client.load_table_from_file(
+        io.BytesIO(payload),
+        table_id,
+        job_config=config,
+        size=len(payload),
+    )
+    job.result(timeout=10)
+
+    table = client.get_table(table_id)
+    rows = list(client.list_rows(table))
+    if len(rows) != 1:
+        raise AssertionError(f"expected one nullable row, got {len(rows)}")
+    row = rows[0]
+    actual = (
+        row["null_text"],
+        row["empty_text"],
+        row["zero_value"],
+        row["false_value"],
+    )
+    expected = (None, "", 0, False)
+    if actual != expected:
+        raise AssertionError(f"nullable row mismatch: expected {expected!r}, got {actual!r}")
+
+    query = client.query(
+        "SELECT COUNT(null_text) AS null_count, "
+        "COUNT(empty_text) AS empty_count "
+        "FROM analytics.python_nullable_values"
+    )
+    query_rows = list(query.result(timeout=10))
+    if len(query_rows) != 1 or tuple(query_rows[0]) != (0, 1):
+        raise AssertionError(f"nullable COUNT mismatch: {query_rows!r}")
+
+    return {
+        "empty_text": row["empty_text"],
+        "false_value": row["false_value"],
+        "null_text": row["null_text"],
+        "zero_value": row["zero_value"],
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--endpoint", default="http://127.0.0.1:19050")
@@ -69,6 +126,7 @@ def main() -> None:
         payload,
         size=None,
     )
+    nullable = validate_nullable_values(client)
 
     print(
         json.dumps(
@@ -81,6 +139,7 @@ def main() -> None:
                     "job_id": resumable_job.job_id,
                     "output_rows": resumable_job.output_rows,
                 },
+                "nullable": nullable,
             },
             sort_keys=True,
         )

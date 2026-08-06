@@ -85,6 +85,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/upload/bigquery/v2/projects/", s.bigQueryJobUpload)
 	s.mux.HandleFunc("/storage/v1/b", s.gcsBucketsCollection)
 	s.mux.HandleFunc("/storage/v1/b/", s.gcsBucketScope)
+	s.mux.HandleFunc("/download/storage/v1/b/", s.gcsDownloadScope)
 	s.mux.HandleFunc("/upload/storage/v1/b/", s.gcsObjectUpload)
 }
 
