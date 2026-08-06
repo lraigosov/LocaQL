@@ -8,7 +8,7 @@ This repository currently implements incremental scope from the master plan:
 - Foundation emulator endpoints and capability registry.
 - REST pagination baseline for datasets, tables, jobs, and tabledata.
 - Async jobs engine with cancel, polling, idempotency (TTL), and script parent/child jobs.
-- Simulated query/load/extract/copy executors with synthetic statistics.
+- Real query/load/extract/copy executors; query DDL/DML persists atomically while slot timing remains synthetic.
 - Configurable worker limits and resource-level serialization for conflicting job mutations.
 
 ## Table of Contents
@@ -20,6 +20,7 @@ This repository currently implements incremental scope from the master plan:
 - [Known Divergences from Real BigQuery](#known-divergences-from-real-bigquery)
 - [Runtime Architecture](#runtime-architecture)
 - [Query Engine: Real GoogleSQL via an Embedded SQLite Backend](#query-engine-real-googlesql-via-an-embedded-sqlite-backend)
+- [Persistent DDL and DML](#persistent-ddl-and-dml)
 - [Concurrency and Isolation Notes](#concurrency-and-isolation-notes)
 - [Job State Model](#job-state-model)
 - [Operational Observability: Structured Logging, Request Metrics, and Extended Health](#operational-observability-structured-logging-request-metrics-and-extended-health)
@@ -92,7 +93,7 @@ Registry file:
 | Opaque pagination tokens | Supported | `nextPageToken` is opaque; legacy numeric token input remains accepted |
 | Jobs lifecycle | Supported | `PENDING -> RUNNING -> DONE`, cancel before/during run |
 | requestId idempotency | Partial | Implemented for `jobs.insert` and `projects.queries` with TTL |
-| Job executors (query/load/extract/copy) | Partial | Query jobs execute real GoogleSQL — `WHERE`, projection, `JOIN`, aggregation, `ORDER BY`, `LIMIT` — via an embedded engine (see [Query Engine](#query-engine-real-googlesql-via-an-embedded-sqlite-backend)), reporting real `outputRows`/`processedBytes` (`totalSlotMs` stays synthetic by design); copy jobs create real destination table data; load jobs materialize destination schema and ingest real rows either from `sourceUris` or direct file uploads through the official Python client's `load_table_from_file` (multipart and resumable), using `NEWLINE_DELIMITED_JSON`, `CSV`, `AVRO` or `PARQUET` and optional `GZIP` decompression for CSV/NDJSON; extract jobs read a real source table and write `destinationUris` in the same four formats with optional `compression` (`GZIP` for CSV/NDJSON, `SNAPPY`/`DEFLATE` for Avro, `SNAPPY`/`GZIP` for Parquet), and split into multiple real shard files once `LOCAQL_EXTRACT_SHARD_MAX_BYTES` is set and exceeded (single shard by default). `sourceUris`/`destinationUris` are local paths by default; `gs://` resolves onto a local directory only when `LOCAQL_FAKE_GCS_ROOT` is set (multi-wildcard `destinationUris` and `ORC` are rejected explicitly) |
+| Job executors (query/load/extract/copy) | Partial | Query jobs execute real GoogleSQL — including persistent `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `TRUNCATE TABLE`, `CREATE [OR REPLACE] TABLE [AS SELECT]` and `DROP TABLE` — with target-table serialization, atomic version-checked catalog commits, query parameters and BigQuery-shaped DML statistics. `SELECT`, copy, load and extract retain their existing real execution paths; `totalSlotMs` stays synthetic by design. See [Persistent DDL and DML](#persistent-ddl-and-dml) for the precise transaction/script limits. |
 | Routines and Models | Supported | `routines`/`models` `insert`/`get`/`list`/`patch`/`delete` are metadata-only (no SQL execution or ML training/inference backend exists; nothing is fabricated beyond stored fields) |
 | External tables | Partial | `tables.insert` accepts `externalDataConfiguration` (`NEWLINE_DELIMITED_JSON`/`CSV`/`AVRO`/`PARQUET`, explicit schema, no autodetect); `sourceUris` are read fresh from disk/fake-GCS on every query/`tabledata.list`/copy/extract access rather than materialized at creation. Patching `externalDataConfiguration`, autodetect, Hive partitioning and compression options are not supported |
 | Views and Materialized Views | Partial | `tables.insert` accepts `view.query`/`materializedView.query`, validated and schema-derived by executing the query through the real query engine at creation; every access re-executes the stored query live (see [Views and Materialized Views](#views-and-materialized-views-real-resources-backed-by-the-query-engine)). No patch-based redefinition; materialized views are not actually cached/refreshed |
@@ -158,7 +159,7 @@ Known scope, declared explicitly:
 
 - A `project.dataset.table` reference only resolves when the leading component matches the request's own `projectID` (case-insensitive); the engine has no project-level concept, only one SQL schema per dataset. A genuine cross-project reference fails with "table not found" rather than silently resolving against the wrong project.
 - Nested `STRUCT`/`ARRAY` result columns execute correctly and get a real BigQuery-shaped `RECORD`/`REPEATED` schema entry and REST cell shape (see [Nested Schemas](#nested-schemas-structrecord-and-arrayrepeated)).
-- Only `SELECT` is routed through the real engine. `INSERT`/`UPDATE`/`DELETE`/`CREATE TABLE AS SELECT` issued as a query job's text are not wired to LocaQL's catalog — table mutation still goes exclusively through the existing REST job executors (load/copy/extract) and direct `tables`/`datasets` endpoints.
+- Single-statement base-table DDL/DML is routed through the real engine and committed atomically to the catalog; see [Persistent DDL and DML](#persistent-ddl-and-dml). Multi-statement scripts and base-table DML inside a session transaction remain explicitly bounded.
 - `INFORMATION_SCHEMA.X` queries are still handled by LocaQL's own dedicated builders (see the [Current Scope Matrix](#current-scope-matrix)), since those reflect LocaQL's catalog metadata rather than user table data.
 - `totalSlotMs` and dry-run byte estimates remain synthetic, as already declared — there is no query-plan/cost estimation.
 
@@ -187,11 +188,21 @@ curl -X POST http://localhost:9050/bigquery/v2/projects/p1/queries \
 
 Supported `parameterType.type` values: `STRING`, `INT64`, `FLOAT64`, `BOOL`, `BYTES` (base64, matching BigQuery's own wire convention), `DATE`, `DATETIME`, `TIME`, `TIMESTAMP` — for any of them, `parameterValue` with no `value` key binds a real `NULL`. `ARRAY`/`STRUCT`/`NUMERIC`/`BIGNUMERIC` parameter types are rejected explicitly with a `400` rather than silently mishandled; see [Known Divergences](KNOWN-DIVERGENCES.md) for exactly why `NUMERIC`/`BIGNUMERIC` specifically can't just be added later without rewriting client SQL text.
 
+### Persistent DDL and DML
+
+Query jobs now persist real catalog mutations instead of executing them in a disposable engine and losing the result. Supported single-statement forms are `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `TRUNCATE TABLE`, `CREATE TABLE`, `CREATE TABLE AS SELECT`, `CREATE OR REPLACE TABLE` and `DROP TABLE` (including `IF [NOT] EXISTS`). Named and positional query parameters work in DML through the same binding path as `SELECT`.
+
+Execution is statement-atomic: LocaQL materializes the referenced tables into an isolated GoogleSQL database, runs the statement, validates the final schema/`REQUIRED` cells, then commits the final table image only if the catalog version analyzed by the job is still current. Query jobs targeting the same `project:dataset.table` share the existing resource lock and storage-write backpressure limiter; a concurrent direct REST write causes an explicit retryable conflict instead of a lost update. Polling a pending mutation never executes it early or twice.
+
+Job resources expose `statistics.query.statementType` and `numDmlAffectedRows`; simple INSERT/UPDATE/DELETE also expose their unambiguous `dmlStats` category. Query responses expose `numDmlAffectedRows`. This is verified in CI with pinned `google-cloud-bigquery 3.42.3`, including SDK-visible affected-row counts for INSERT/UPDATE/MERGE/DELETE and persisted CTAS/DROP behavior.
+
+Declared limits: cross-project mutation targets, DML against views/external tables, DML targeting `_SESSION`, and persistent DDL/DML while a session transaction is open fail explicitly. Multi-statement script execution is not yet an atomic persistent transaction. `ALTER TABLE`/procedural SQL are not part of this increment.
+
 ## Concurrency and Isolation Notes
 
 - `jobs.get` and `jobs.list` use read locks while mutating paths use exclusive locks.
 - Conflicting table mutations are serialized by resource key (`project:dataset.table`).
-- `load/copy` jobs can be throttled independently from generic job workers through `LOCAQL_STORAGE_WRITE_WORKERS`.
+- `load`/`copy` and persistent DDL/DML query jobs share the storage-write backpressure limit configured by `LOCAQL_STORAGE_WRITE_WORKERS`.
 - When persistence is enabled, metadata and request-id index are written in one snapshot file commit.
 - Snapshot commit uses a temp file and replace strategy so failed writes do not leave partial catalog content.
 
@@ -625,7 +636,7 @@ Known limitations, declared explicitly:
 
 - Only the `` _SESSION.<table> `` qualified reference form resolves against a session; a bare unqualified temp table name does not.
 - Only the single-statement `CREATE TEMP TABLE <name> AS <select>` form is recognized; a separate `CREATE TEMP TABLE (schema...)` followed by standalone `INSERT` statements is not.
-- A session transaction's atomicity covers only that session's own temp tables — `INSERT`/`UPDATE`/`DELETE` against a real base table inside `BEGIN`/`COMMIT`/`ROLLBACK TRANSACTION` still does not mutate LocaQL's catalog at all, matching the existing, independent [Query Engine](#query-engine-real-googlesql-via-an-embedded-sqlite-backend) limitation that only `SELECT` is routed through the real engine.
+- A session transaction's atomicity covers only that session's own temp tables. Base-table DDL/DML is persistent outside a transaction, but is rejected explicitly while a session transaction is open so `ROLLBACK` can never claim to undo a catalog mutation it did not actually govern.
 
 ## BigQuery Storage API: Real gRPC Read Sessions (Avro) and Write Streams (Protobuf)
 
