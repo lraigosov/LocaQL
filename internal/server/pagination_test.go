@@ -141,3 +141,89 @@ func TestTableDataListPagination(t *testing.T) {
 		t.Fatalf("expected nextPageToken")
 	}
 }
+
+// TestTableDataListFinalPageOmitsPageToken guards against a real infinite-loop
+// bug: the response used to always include a "pageToken" key (echoing the
+// request's own start index) even on the last page. google-cloud-bigquery's
+// list_rows() constructs its RowIterator with next_token="pageToken" for
+// this endpoint specifically (not "nextPageToken", unlike most other list
+// APIs) — it checks for that key's mere presence to decide whether to fetch
+// another page. An unconditional "pageToken" therefore made the official
+// client re-request the same final page forever. Both "pageToken" and
+// "nextPageToken" must be entirely absent once there's nothing left to page
+// through.
+func TestTableDataListFinalPageOmitsPageToken(t *testing.T) {
+	s := newTestServer()
+	req := httptest.NewRequest(http.MethodGet, "/bigquery/v2/projects/p1/datasets/analytics/tables/users/data?maxResults=100", nil)
+	res := httptest.NewRecorder()
+
+	s.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", res.Code, res.Body.String())
+	}
+
+	var body map[string]any
+	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if _, present := body["pageToken"]; present {
+		t.Fatalf("expected no pageToken on the final page, got %v", body["pageToken"])
+	}
+	if _, present := body["nextPageToken"]; present {
+		t.Fatalf("expected no nextPageToken on the final page, got %v", body["nextPageToken"])
+	}
+}
+
+// TestTableDataListRealBigQueryPath guards against a routing regression: real
+// BigQuery's tabledata.list REST endpoint is GET
+// .../datasets/{datasetId}/tables/{tableId}/data (6 path segments under
+// .../projects/{p}/), which is what google-cloud-bigquery's list_rows()
+// actually requests. The made-up .../tabledata/{datasetId}/{tableId}/data
+// shape covered by TestTableDataListPagination above is an internal alias
+// only the bundled UI and its own tests ever call — official clients 404'd
+// against this server before dispatchDatasetSubResource grew a "tables" case
+// for the trailing "/data" segment, even though the table/rows existed and
+// getTable succeeded for that same table.
+func TestTableDataListRealBigQueryPath(t *testing.T) {
+	s := newTestServer()
+	req := httptest.NewRequest(http.MethodGet, "/bigquery/v2/projects/p1/datasets/analytics/tables/users/data?startIndex=1&maxResults=2", nil)
+	res := httptest.NewRecorder()
+
+	s.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", res.Code, res.Body.String())
+	}
+
+	var body struct {
+		Rows          []any  `json:"rows"`
+		NextPageToken string `json:"nextPageToken"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(body.Rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(body.Rows))
+	}
+}
+
+func TestTableDataListRealBigQueryPathRejectsNonGET(t *testing.T) {
+	s := newTestServer()
+	req := httptest.NewRequest(http.MethodPost, "/bigquery/v2/projects/p1/datasets/analytics/tables/users/data", nil)
+	res := httptest.NewRecorder()
+
+	s.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405, got %d: %s", res.Code, res.Body.String())
+	}
+}
+
+func TestTableDataListRealBigQueryPathUnknownTable404s(t *testing.T) {
+	s := newTestServer()
+	req := httptest.NewRequest(http.MethodGet, "/bigquery/v2/projects/p1/datasets/analytics/tables/does-not-exist/data", nil)
+	res := httptest.NewRecorder()
+
+	s.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", res.Code, res.Body.String())
+	}
+}
