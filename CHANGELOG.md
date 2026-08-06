@@ -4,10 +4,16 @@ All notable user-facing changes to LocaQL are documented here, in the style of [
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-08-06
+
+## [0.9.1] - 2026-07-28
+
 ### Fixed
 - `.github/workflows/release.yml` had unresolved git merge conflict markers committed straight into `main` (from reconciling the `v0.9.0` release-tagging PRs), making the workflow file invalid YAML — every push to `main`/`dev` and every release triggered via `auto-tag-release.yml`'s `workflow_call` failed immediately with "workflow file issue". Removed the leftover markers, restored the intended `resolve`-job design, and fixed a `docker/metadata-action` tag pattern that had been silently corrupted to `{{major}}.minor}}` instead of `{{major}}.{{minor}}` in the same conflict.
 - The published `ghcr.io/lraigosov/locaql` image only ever contained the emulator — `locaql-ui` (the console) was never built into it, so `docker run` gave API-only access with no way to reach the UI. Fixed by adding a third binary, `cmd/locaql-supervisor`, as the image's entrypoint: it starts both `locaql` and `locaql-ui` as real subprocesses of the one container (no shell involved — the base image has none), forwards shutdown signals to both, and exits non-zero if either crashes rather than leaving the container looking healthy with half its processes dead. `docker run` now publishes `:9070` (console) alongside `:9050`/`:9060` and gets the full solution in one command.
 ## [Unreleased]
+
+## [0.9.2] - 2026-08-06
 
 ### Fixed
 - `tabledata.list` 404'd for every table when called through the official `google-cloud-bigquery` client's `list_rows()`/`Table.list_rows()` — the request lands at `GET .../datasets/{datasetId}/tables/{tableId}/data` (real BigQuery's actual REST shape), but the router only recognized a made-up `.../tabledata/{datasetId}/{tableId}/data` shape that no official client ever requests (only this project's own tests and bundled UI did). A schema fetched via `tables.get` for the very same table would succeed, making the 404 look like a data problem rather than a routing gap. Fixed by handling the real path shape explicitly; the old shape is kept working as an internal alias.
