@@ -757,6 +757,22 @@ func renderJobResource(j *jobRecord) map[string]any {
 	if j.SessionID != "" {
 		stats["sessionInfo"] = map[string]string{"sessionId": j.SessionID}
 	}
+	// Real BigQuery nests job-type-specific stats (e.g. statistics.load.outputRows,
+	// statistics.load.outputBytes) rather than exposing them flat under
+	// statistics.*: the official client libraries read from that nested shape
+	// (see google-cloud-bigquery's LoadJob.output_rows /
+	// _job_statistics()->statistics[job_type]), so a load job's row/byte counts
+	// were previously invisible to real clients despite being computed
+	// correctly server-side. Added additively — the flat keys above stay for
+	// whatever already depends on them. Only "load" is covered here since it's
+	// the verified case; query/copy/extract likely have the same gap but
+	// weren't part of this bug's repro.
+	if j.JobType == "load" {
+		stats["load"] = map[string]any{
+			"outputRows":  j.Statistics.OutputRows,
+			"outputBytes": j.Statistics.ProcessedBytes,
+		}
+	}
 
 	res := map[string]any{
 		"kind": "bigquery#job",

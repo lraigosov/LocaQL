@@ -188,6 +188,80 @@ func TestGCSAndLoadExtractGSURIsInteroperate(t *testing.T) {
 	}
 }
 
+// TestLoadJobStatisticsNestUnderJobType guards against a regression where a
+// load job's row/byte counts were only ever written to the flat
+// statistics.outputRows/processedBytes keys. Real BigQuery (and the
+// google-cloud-bigquery client's LoadJob.output_rows/output_bytes
+// properties, which read statistics.load.outputRows/outputBytes
+// specifically) expects them nested under a job-type-keyed object instead —
+// without that nesting, a client polling a load job it submitted always saw
+// output_rows as None even though the emulator had computed the real count
+// server-side. This also exercises numRows/numBytes on the resulting table,
+// which were never set at all before (Table.num_rows was always None
+// regardless of whether a load had populated the table).
+func TestLoadJobStatisticsNestUnderJobType(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("LOCAQL_FAKE_GCS_ROOT", root)
+	s := newTestServer()
+
+	uploadReq := httptest.NewRequest(
+		http.MethodPost,
+		"/upload/storage/v1/b/mybucket/o?uploadType=media&name=events2.ndjson",
+		strings.NewReader(`{"event_id":1,"event_name":"page_view"}`+"\n"+`{"event_id":2,"event_name":"click"}`+"\n"),
+	)
+	uploadRes := httptest.NewRecorder()
+	s.Handler().ServeHTTP(uploadRes, uploadReq)
+	if uploadRes.Code != http.StatusOK {
+		t.Fatalf("expected 200 uploading via fake-GCS API, got %d: %s", uploadRes.Code, uploadRes.Body.String())
+	}
+
+	bodyObj := map[string]any{
+		"configuration": map[string]any{
+			"load": map[string]any{
+				"destinationTable": map[string]any{"projectId": "p1", "datasetId": "analytics", "tableId": "events_stats_check"},
+				"schema": map[string]any{"fields": []any{
+					map[string]any{"name": "event_id", "type": "INT64"},
+					map[string]any{"name": "event_name", "type": "STRING"},
+				}},
+				"sourceUris":       []any{"gs://mybucket/events2.ndjson"},
+				"sourceFormat":     "NEWLINE_DELIMITED_JSON",
+				"writeDisposition": "WRITE_TRUNCATE",
+			},
+		},
+	}
+	raw, err := json.Marshal(bodyObj)
+	if err != nil {
+		t.Fatalf("marshal load body: %v", err)
+	}
+	jobOut := runJobAndFetch(t, s, string(raw))
+	stats := jobOut["statistics"].(map[string]any)
+
+	loadStats, ok := stats["load"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected statistics.load object, got statistics=%v", stats)
+	}
+	if loadStats["outputRows"] != float64(2) {
+		t.Fatalf("expected statistics.load.outputRows=2, got %v", loadStats["outputRows"])
+	}
+	if _, ok := loadStats["outputBytes"]; !ok {
+		t.Fatalf("expected statistics.load.outputBytes to be present, got %v", loadStats)
+	}
+
+	tableReq := httptest.NewRequest(http.MethodGet, "/bigquery/v2/projects/p1/datasets/analytics/tables/events_stats_check", nil)
+	tableRes := httptest.NewRecorder()
+	s.Handler().ServeHTTP(tableRes, tableReq)
+	if tableRes.Code != http.StatusOK {
+		t.Fatalf("expected 200 fetching loaded table, got %d: %s", tableRes.Code, tableRes.Body.String())
+	}
+	var tableBody map[string]any
+	if err := json.NewDecoder(tableRes.Body).Decode(&tableBody); err != nil {
+		t.Fatalf("decode table: %v", err)
+	}
+	if tableBody["numRows"] != "2" {
+		t.Fatalf("expected numRows=\"2\", got %v", tableBody["numRows"])
+	}
+}
+
 func TestGCSRequiresFakeGCSRootConfigured(t *testing.T) {
 	s := newTestServer()
 
