@@ -134,6 +134,17 @@ capabilities:
       - unit/server/tables_patch_schema_evolution_allows_relaxing_required_to_nullable
       - unit/server/tables_patch_schema_evolution_rejects_tightening_nullable_to_required
     reason: "tables.patch accepts a schema field (Sesión 76) that evolves the existing schema rather than replacing it blindly: appending new columns (which must be NULLABLE, since existing rows have no value for them) and relaxing an existing column from REQUIRED to NULLABLE are allowed; removing a column, renaming/reordering one, changing its type, or tightening NULLABLE to REQUIRED are all rejected explicitly with a 400 rather than silently applied or ignored — validated in the REST handler (validateSchemaEvolution) before calling the service layer"
+  rest.tables.partitioning_clustering:
+    status: partial
+    fidelity: medium
+    tests:
+      - unit/server/table_partitioning_metadata_round_trip_patch_and_validation
+      - unit/server/time_partitioning_information_schema_and_required_filter
+      - unit/server/range_and_ingestion_time_partition_counts
+      - unit/server/time_partition_expiration_purges_rows_lazily
+      - unit/server/information_schema_unpartitioned_partition_id_is_null
+      - official/python/google_cloud_bigquery_time_range_clustering_and_required_filter
+    reason: "timePartitioning (DAY/HOUR/MONTH/YEAR over a top-level DATE/TIMESTAMP field, or ingestion-time without a field), integer rangePartitioning over a top-level INT64 field, clustering.fields (up to four ordered scalar fields), requirePartitionFilter and time-partition expiration are validated, stored, cloned and rendered through tables.insert/get/list/patch/update. Partition definitions are immutable; time expiration, clustering and requirePartitionFilter are patchable. Every catalog write assigns/preserves ingestion partition IDs, column/range partitions are derived from real stored values, and lazy expiration removes rows in expired dated partitions. INFORMATION_SCHEMA.PARTITIONS reports real partition row counts and NULL for unpartitioned tables; COLUMNS exposes is_partitioning_column/clustering_ordinal_position; TABLE_OPTIONS exposes require_partition_filter/partition_expiration_days. Queries over column/range partitioned tables with requirePartitionFilter=true must contain a WHERE predicate naming the partition column. Pinned google-cloud-bigquery 3.42.3 validates TimePartitioning, RangePartitioning/PartitionRange, clustering_fields, update_table, required-filter failure and partition metadata end to end. Partial because this local engine has no physical pruning/cost reduction or clustering optimizer, filter eligibility is conservative SQL-text detection rather than AST analysis, SQL PARTITION BY/CLUSTER BY DDL is unsupported, and _PARTITIONTIME/_PARTITIONDATE are not executable pseudocolumns; requirePartitionFilter=true on ingestion-time tables is rejected explicitly until those pseudocolumns exist."
   rest.tables.update:
     status: supported
     fidelity: medium

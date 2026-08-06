@@ -50,7 +50,7 @@ This repository currently implements incremental scope from the master plan:
 - WSL distribution: `Ubuntu-24.04`
 - Go 1.25.0+ (bumped from 1.22 for `parquet-go/parquet-go`, then to 1.25.0 for `goccy/googlesqlite`'s real GoogleSQL query engine; `GOTOOLCHAIN=auto`, the Go default, downloads it automatically)
 - For race tests: `build-essential` (provides `gcc` for cgo).
-- **Run LocaQL itself on Linux (including WSL on Windows) — not verified to work natively on Windows or macOS.** The query engine's WASM-based analyzer traps at runtime outside Linux (discovered in Sesión 85; see [Known Divergences](KNOWN-DIVERGENCES.md) Blocking #3): the binary builds fine for every platform, but every query fails. Building/cross-compiling from any OS is unaffected — only running it natively on Windows/macOS is currently broken.
+- **Run LocaQL itself on Linux (including WSL on Windows) — not verified to work natively on Windows or macOS.** The query engine's WASM-based analyzer traps at runtime outside Linux (discovered in Sesión 85; see [Known Divergences](KNOWN-DIVERGENCES.md) Blocking #2): the binary builds fine for every platform, but every query fails. Building/cross-compiling from any OS is unaffected — only running it natively on Windows/macOS is currently broken.
 
 ## Quick Start (WSL)
 
@@ -98,6 +98,7 @@ Registry file:
 | External tables | Partial | `tables.insert` accepts `externalDataConfiguration` (`NEWLINE_DELIMITED_JSON`/`CSV`/`AVRO`/`PARQUET`, explicit schema, no autodetect); `sourceUris` are read fresh from disk/fake-GCS on every query/`tabledata.list`/copy/extract access rather than materialized at creation. Patching `externalDataConfiguration`, autodetect, Hive partitioning and compression options are not supported |
 | Views and Materialized Views | Partial | `tables.insert` accepts `view.query`/`materializedView.query`, validated and schema-derived by executing the query through the real query engine at creation; every access re-executes the stored query live (see [Views and Materialized Views](#views-and-materialized-views-real-resources-backed-by-the-query-engine)). No patch-based redefinition; materialized views are not actually cached/refreshed |
 | Nested schemas and column evolution | Partial | `schema.fields` supports real `mode` (`NULLABLE`/`REQUIRED`/`REPEATED`) and nested `fields` (`RECORD`/`STRUCT`), rendered end-to-end with BigQuery's real nested REST shape; `tables.patch` can append `NULLABLE` columns and relax `REQUIRED`→`NULLABLE` (see [Nested Schemas](#nested-schemas-structrecord-and-arrayrepeated)). Real nested load/extract is `NEWLINE_DELIMITED_JSON`-only; `CSV`/`AVRO`/`PARQUET` reject nested fields explicitly |
+| Partitioning and clustering | Partial | `tables.insert/get/list/patch/update` persist and validate time-unit, ingestion-time and integer-range partitioning, up to four clustering fields, partition expiration and `requirePartitionFilter`; partition rows are observable through `INFORMATION_SCHEMA.PARTITIONS`/`COLUMNS`/`TABLE_OPTIONS` and verified with `google-cloud-bigquery 3.42.3`. No physical scan pruning/cost model, SQL `PARTITION BY` DDL, or executable ingestion pseudocolumns yet; `requirePartitionFilter=true` is therefore rejected for ingestion-time tables rather than creating an unusable table |
 | Fake GCS JSON API | Partial | Buckets (insert/list/get) and objects (insert via media or multipart upload, get/download/list/delete) on the real endpoint paths, backed by `LOCAQL_FAKE_GCS_ROOT`; upload verified against `cloud.google.com/go/storage`, and full/ranged downloads verified against `google-cloud-storage 3.13.1`. No resumable uploads, IAM, versioning, lifecycle rules, notifications, or signed URLs |
 | Job persistence across restart | Partial | Optional local file persistence |
 | Job concurrency limit | Partial | Controlled with `LOCAQL_JOB_WORKERS` |
@@ -470,7 +471,21 @@ Known limitations, declared explicitly:
 
 - `NEWLINE_DELIMITED_JSON` is the only format with real nested load/extract support — JSON is naturally recursive. `CSV`, `AVRO` and `PARQUET` reject a schema containing a `RECORD`/`REPEATED` field explicitly rather than silently flattening or corrupting it. `CSV` never will support this, matching real BigQuery; `AVRO`/`PARQUET` could in principle, but that is deferred.
 - A nested `RECORD` field's own sub-`fields` cannot be evolved via `tables.patch` once the table exists.
-- `timePartitioning`, `rangePartitioning` and `clustering` are unrelated top-level table settings — still not implemented (see [`KNOWN-DIVERGENCES.md`](KNOWN-DIVERGENCES.md)).
+- Partitioning and clustering are top-level table settings implemented independently from nested schema evolution; see [Partitioning and Clustering](#partitioning-and-clustering) for supported semantics and explicit limits.
+
+## Partitioning and Clustering
+
+LocaQL persists and validates BigQuery's REST table settings instead of accepting and discarding them:
+
+- `timePartitioning` supports `DAY`, `HOUR`, `MONTH` and `YEAR`. A column partition must reference a top-level, non-repeated `DATE` or `TIMESTAMP` field (`HOUR` requires `TIMESTAMP`); omitting `field` creates an ingestion-time partitioned table.
+- `rangePartitioning` requires one top-level, non-repeated `INT64` field plus integer `start` (inclusive), `end` (exclusive) and positive `interval` values.
+- `clustering.fields` accepts up to four unique top-level scalar columns and preserves their priority order.
+- `timePartitioning` and `rangePartitioning` are mutually exclusive. Their defining type/field/range is immutable after creation; `tables.patch` can update time partition expiration, clustering fields and `requirePartitionFilter`.
+- Every append/load/Storage Write operation assigns ingestion-time partition IDs. Persistent `UPDATE` preserves existing IDs and `INSERT` assigns the current partition. Time partition expiration is enforced lazily on catalog access and removes only expired dated partitions; `NULL` partition values remain in `__NULL__`.
+- `INFORMATION_SCHEMA.PARTITIONS` returns real per-partition row counts (`YYYYMMDD`, `YYYYMMDDHH`, `YYYYMM`, `YYYY`, integer bucket starts, `__NULL__` and `__UNPARTITIONED__`). Unpartitioned tables correctly expose a `NULL` `partition_id`. `COLUMNS` adds `is_partitioning_column`/`clustering_ordinal_position`; `TABLE_OPTIONS` exposes `require_partition_filter`/`partition_expiration_days`.
+- `requirePartitionFilter=true` is enforced for column and integer-range partitioned tables before query materialization. A query without a `WHERE` predicate naming the partition column fails explicitly.
+
+This is functional metadata and row lifecycle behavior, not a distributed storage optimizer. LocaQL does not claim physical partition pruning, reduced bytes scanned, clustering-based ordering/performance or a BigQuery cost model. Filter eligibility is currently detected conservatively from SQL text rather than an AST. Ingestion-time partition counts are real, but `_PARTITIONTIME`/`_PARTITIONDATE` are not executable query pseudocolumns yet, so requiring a partition filter on an ingestion-time table is rejected explicitly. Partitioned-table creation currently uses the REST API/official clients; GoogleSQL `CREATE TABLE ... PARTITION BY ... CLUSTER BY ...` is not part of the persistent DDL subset.
 
 ## Dataset Lifecycle: Delete Contents and Undelete
 
@@ -593,7 +608,7 @@ curl -X POST http://localhost:9050/bigquery/v2/projects/p1/datasets/analytics/ta
 
 Within a session, `` CREATE TEMP TABLE <name> AS <select> `` creates a session-scoped temporary table, referenced in later queries (in the same or a separate request, as long as they share `session_id`) as `` _SESSION.<name> ``. `BEGIN TRANSACTION` / `COMMIT TRANSACTION` / `ROLLBACK TRANSACTION` give that session's own temp tables real, atomic commit/rollback semantics.
 
-This is deliberately **not** a thin wrapper around the query engine's native session/transaction support: a disposable investigation spike (deleted after use) found that `goccy/googlesqlite`'s own `CREATE TEMP TABLE` registration does not survive past the single call that created it — not even pinned to one connection, not even inside an already-open transaction — and its `ROLLBACK` statement fails unconditionally (`Statement not supported: RollbackStatement`). Both are real, verified upstream limitations, not a LocaQL binding issue (see [Known Divergences](KNOWN-DIVERGENCES.md) Blocking #2). Session temp tables and transactions are therefore implemented entirely in LocaQL's own code: a session's temp tables live in its own catalog, materialized into a fresh engine instance per query exactly like any other table, with `BEGIN`/`COMMIT`/`ROLLBACK` snapshotting and restoring that catalog directly.
+This is deliberately **not** a thin wrapper around the query engine's native session/transaction support: a disposable investigation spike (deleted after use) found that `goccy/googlesqlite`'s own `CREATE TEMP TABLE` registration does not survive past the single call that created it — not even pinned to one connection, not even inside an already-open transaction — and its `ROLLBACK` statement fails unconditionally (`Statement not supported: RollbackStatement`). Both are real, verified upstream limitations, not a LocaQL binding issue (see [Known Divergences](KNOWN-DIVERGENCES.md) Blocking #1). Session temp tables and transactions are therefore implemented entirely in LocaQL's own code: a session's temp tables live in its own catalog, materialized into a fresh engine instance per query exactly like any other table, with `BEGIN`/`COMMIT`/`ROLLBACK` snapshotting and restoring that catalog directly.
 
 ```mermaid
 flowchart LR

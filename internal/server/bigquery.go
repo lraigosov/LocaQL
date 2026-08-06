@@ -395,7 +395,6 @@ func (s *Server) patchDataset(w http.ResponseWriter, r *http.Request, projectID,
 		writeError(w, http.StatusBadRequest, "Invalid request body", "invalid")
 		return
 	}
-
 	patch := datasetPatch{ProjectID: projectID, DatasetID: datasetID}
 
 	if err := applyDatasetPatchFields(&patch, raw); err != "" {
@@ -688,6 +687,51 @@ func (s *Server) insertTable(w http.ResponseWriter, r *http.Request, projectID, 
 		schema = parseTableSchemaFields(raw["schema"])
 	}
 
+	var timePartitioning *timePartitioningConfig
+	if value, exists := raw["timePartitioning"]; exists {
+		var err error
+		timePartitioning, err = parseTimePartitioning(value, schema)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error(), "invalid")
+			return
+		}
+	}
+	var rangePartitioning *rangePartitioningConfig
+	if value, exists := raw["rangePartitioning"]; exists {
+		var err error
+		rangePartitioning, err = parseRangePartitioning(value, schema)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error(), "invalid")
+			return
+		}
+	}
+	var clustering []string
+	if value, exists := raw["clustering"]; exists {
+		var err error
+		clustering, err = parseClustering(value, schema)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error(), "invalid")
+			return
+		}
+	}
+	requirePartitionFilter := false
+	if value, exists := raw["requirePartitionFilter"]; exists {
+		parsed, ok := value.(bool)
+		if !ok {
+			writeError(w, http.StatusBadRequest, "requirePartitionFilter must be a boolean", "invalid")
+			return
+		}
+		requirePartitionFilter = parsed
+	}
+	if (external != nil || view != nil) && (timePartitioning != nil || rangePartitioning != nil || len(clustering) > 0 || requirePartitionFilter) {
+		writeError(w, http.StatusBadRequest, "standard partitioning and clustering are supported only for managed tables", "invalid")
+		return
+	}
+	if err := validatePartitioningCombination(timePartitioning, rangePartitioning, requirePartitionFilter); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error(), "invalid")
+		return
+	}
+
 	// An explicit expirationTime overrides the dataset's defaultTableExpirationMs
 	// (a duration relative to creation), matching real BigQuery precedence.
 	var expirationTime time.Time
@@ -703,16 +747,20 @@ func (s *Server) insertTable(w http.ResponseWriter, r *http.Request, projectID, 
 	}
 
 	item, created := s.tables.insert(tableInsert{
-		ProjectID:      projectID,
-		DatasetID:      datasetID,
-		TableID:        tableID,
-		FriendlyName:   friendlyName,
-		Description:    description,
-		Labels:         labels,
-		Schema:         schema,
-		External:       external,
-		View:           view,
-		ExpirationTime: expirationTime,
+		ProjectID:              projectID,
+		DatasetID:              datasetID,
+		TableID:                tableID,
+		FriendlyName:           friendlyName,
+		Description:            description,
+		Labels:                 labels,
+		Schema:                 schema,
+		External:               external,
+		View:                   view,
+		TimePartitioning:       timePartitioning,
+		RangePartitioning:      rangePartitioning,
+		Clustering:             clustering,
+		RequirePartitionFilter: requirePartitionFilter,
+		ExpirationTime:         expirationTime,
 	})
 	if !created {
 		writeError(w, http.StatusConflict, fmt.Sprintf("Already Exists: Table %s:%s.%s", projectID, datasetID, tableID), "duplicate")
@@ -745,6 +793,11 @@ func (s *Server) patchTable(w http.ResponseWriter, r *http.Request, projectID, d
 	var raw map[string]any
 	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
 		writeError(w, http.StatusBadRequest, "Invalid request body", "invalid")
+		return
+	}
+	current, exists, _ := s.tables.get(projectID, datasetID, tableID)
+	if !exists {
+		writeError(w, http.StatusNotFound, fmt.Sprintf("Not found: Table %s:%s.%s", projectID, datasetID, tableID), "notFound")
 		return
 	}
 
@@ -800,11 +853,6 @@ func (s *Server) patchTable(w http.ResponseWriter, r *http.Request, projectID, d
 	}
 	if _, ok := raw["schema"]; ok {
 		newSchema := parseTableSchemaFields(raw["schema"])
-		current, exists, _ := s.tables.get(projectID, datasetID, tableID)
-		if !exists {
-			writeError(w, http.StatusNotFound, fmt.Sprintf("Not found: Table %s:%s.%s", projectID, datasetID, tableID), "notFound")
-			return
-		}
 		if err := validateSchemaEvolution(current.Schema, newSchema); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error(), "invalid")
 			return
@@ -813,7 +861,74 @@ func (s *Server) patchTable(w http.ResponseWriter, r *http.Request, projectID, d
 		patch.Schema = newSchema
 	}
 
-	if !patch.HasFriendlyName && !patch.HasDescription && !patch.HasLabels && !patch.HasExpirationTime && !patch.HasSchema {
+	effectiveSchema := current.Schema
+	if patch.HasSchema {
+		effectiveSchema = patch.Schema
+	}
+	effectiveTime := cloneTimePartitioning(current.TimePartitioning)
+	effectiveRange := cloneRangePartitioning(current.RangePartitioning)
+	effectiveRequire := current.RequirePartitionFilter
+	if value, ok := raw["timePartitioning"]; ok {
+		parsed, err := parseTimePartitioning(value, effectiveSchema)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error(), "invalid")
+			return
+		}
+		if current.TimePartitioning == nil || !sameTimePartitioningDefinition(current.TimePartitioning, parsed) {
+			writeError(w, http.StatusBadRequest, "time partitioning type and field are immutable after table creation", "invalid")
+			return
+		}
+		patch.HasTimePartitioning = true
+		patch.TimePartitioning = parsed
+		effectiveTime = parsed
+	}
+	if value, ok := raw["rangePartitioning"]; ok {
+		parsed, err := parseRangePartitioning(value, effectiveSchema)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error(), "invalid")
+			return
+		}
+		if current.RangePartitioning == nil || !sameRangePartitioning(current.RangePartitioning, parsed) {
+			writeError(w, http.StatusBadRequest, "range partitioning is immutable after table creation", "invalid")
+			return
+		}
+		patch.HasRangePartitioning = true
+		patch.RangePartitioning = parsed
+		effectiveRange = parsed
+	}
+	if value, ok := raw["clustering"]; ok {
+		parsed, err := parseClustering(value, effectiveSchema)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error(), "invalid")
+			return
+		}
+		patch.HasClustering = true
+		patch.Clustering = parsed
+	}
+	if value, ok := raw["requirePartitionFilter"]; ok {
+		parsed, ok := value.(bool)
+		if !ok {
+			writeError(w, http.StatusBadRequest, "requirePartitionFilter must be a boolean", "invalid")
+			return
+		}
+		patch.HasRequirePartitionFilter = true
+		patch.RequirePartitionFilter = parsed
+		effectiveRequire = parsed
+	}
+	if (current.External != nil || current.View != nil) && (patch.HasTimePartitioning || patch.HasRangePartitioning || patch.HasClustering || patch.HasRequirePartitionFilter) {
+		writeError(w, http.StatusBadRequest, "standard partitioning and clustering are supported only for managed tables", "invalid")
+		return
+	}
+	if err := validatePartitioningCombination(effectiveTime, effectiveRange, effectiveRequire); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error(), "invalid")
+		return
+	}
+	if err := validateRowsForPartitioning(effectiveSchema, current.Rows, effectiveTime, effectiveRange); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error(), "invalid")
+		return
+	}
+
+	if !patch.HasFriendlyName && !patch.HasDescription && !patch.HasLabels && !patch.HasExpirationTime && !patch.HasSchema && !patch.HasTimePartitioning && !patch.HasRangePartitioning && !patch.HasClustering && !patch.HasRequirePartitionFilter {
 		writeError(w, http.StatusBadRequest, "at least one patchable field is required", "required")
 		return
 	}
@@ -837,6 +952,11 @@ func (s *Server) updateTable(w http.ResponseWriter, r *http.Request, projectID, 
 	var raw map[string]any
 	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
 		writeError(w, http.StatusBadRequest, "Invalid request body", "invalid")
+		return
+	}
+	current, exists, _ := s.tables.get(projectID, datasetID, tableID)
+	if !exists {
+		writeError(w, http.StatusNotFound, fmt.Sprintf("Not found: Table %s:%s.%s", projectID, datasetID, tableID), "notFound")
 		return
 	}
 
@@ -902,14 +1022,71 @@ func (s *Server) updateTable(w http.ResponseWriter, r *http.Request, projectID, 
 		expirationTime = et
 	}
 
+	timePartitioning := cloneTimePartitioning(current.TimePartitioning)
+	if value, ok := raw["timePartitioning"]; ok {
+		parsed, err := parseTimePartitioning(value, current.Schema)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error(), "invalid")
+			return
+		}
+		if current.TimePartitioning == nil || !sameTimePartitioningDefinition(current.TimePartitioning, parsed) {
+			writeError(w, http.StatusBadRequest, "time partitioning type and field are immutable after table creation", "invalid")
+			return
+		}
+		timePartitioning = parsed
+	}
+	rangePartitioning := cloneRangePartitioning(current.RangePartitioning)
+	if value, ok := raw["rangePartitioning"]; ok {
+		parsed, err := parseRangePartitioning(value, current.Schema)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error(), "invalid")
+			return
+		}
+		if current.RangePartitioning == nil || !sameRangePartitioning(current.RangePartitioning, parsed) {
+			writeError(w, http.StatusBadRequest, "range partitioning is immutable after table creation", "invalid")
+			return
+		}
+		rangePartitioning = parsed
+	}
+	var clustering []string
+	if value, ok := raw["clustering"]; ok {
+		parsed, err := parseClustering(value, current.Schema)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error(), "invalid")
+			return
+		}
+		clustering = parsed
+	}
+	requirePartitionFilter := false
+	if value, ok := raw["requirePartitionFilter"]; ok {
+		parsed, ok := value.(bool)
+		if !ok {
+			writeError(w, http.StatusBadRequest, "requirePartitionFilter must be a boolean", "invalid")
+			return
+		}
+		requirePartitionFilter = parsed
+	}
+	if (current.External != nil || current.View != nil) && (raw["timePartitioning"] != nil || raw["rangePartitioning"] != nil || raw["clustering"] != nil || requirePartitionFilter) {
+		writeError(w, http.StatusBadRequest, "standard partitioning and clustering are supported only for managed tables", "invalid")
+		return
+	}
+	if err := validatePartitioningCombination(timePartitioning, rangePartitioning, requirePartitionFilter); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error(), "invalid")
+		return
+	}
+
 	item, ok := s.tables.update(tableUpdate{
-		ProjectID:      projectID,
-		DatasetID:      datasetID,
-		TableID:        tableID,
-		FriendlyName:   friendlyName,
-		Description:    description,
-		Labels:         labels,
-		ExpirationTime: expirationTime,
+		ProjectID:              projectID,
+		DatasetID:              datasetID,
+		TableID:                tableID,
+		FriendlyName:           friendlyName,
+		Description:            description,
+		Labels:                 labels,
+		ExpirationTime:         expirationTime,
+		TimePartitioning:       timePartitioning,
+		RangePartitioning:      rangePartitioning,
+		Clustering:             clustering,
+		RequirePartitionFilter: requirePartitionFilter,
 	})
 	if !ok {
 		writeError(w, http.StatusNotFound, fmt.Sprintf("Not found: Table %s:%s.%s", projectID, datasetID, tableID), "notFound")
@@ -964,6 +1141,32 @@ func renderTableResource(t *tableRecord) map[string]any {
 	}
 	if !t.ExpirationTime.IsZero() {
 		resp["expirationTime"] = strconv.FormatInt(t.ExpirationTime.UnixMilli(), 10)
+	}
+	if t.TimePartitioning != nil {
+		partitioning := map[string]any{"type": t.TimePartitioning.Type}
+		if t.TimePartitioning.Field != "" {
+			partitioning["field"] = t.TimePartitioning.Field
+		}
+		if t.TimePartitioning.ExpirationMs > 0 {
+			partitioning["expirationMs"] = strconv.FormatInt(t.TimePartitioning.ExpirationMs, 10)
+		}
+		resp["timePartitioning"] = partitioning
+	}
+	if t.RangePartitioning != nil {
+		resp["rangePartitioning"] = map[string]any{
+			"field": t.RangePartitioning.Field,
+			"range": map[string]string{
+				"start":    strconv.FormatInt(t.RangePartitioning.Start, 10),
+				"end":      strconv.FormatInt(t.RangePartitioning.End, 10),
+				"interval": strconv.FormatInt(t.RangePartitioning.Interval, 10),
+			},
+		}
+	}
+	if len(t.Clustering) > 0 {
+		resp["clustering"] = map[string]any{"fields": cloneStrings(t.Clustering)}
+	}
+	if t.RequirePartitionFilter {
+		resp["requirePartitionFilter"] = true
 	}
 	if t.External != nil {
 		resp["type"] = "EXTERNAL"
@@ -2095,10 +2298,24 @@ func buildInformationSchemaColumns(scope informationSchemaScope) ([]map[string]s
 			return
 		}
 		for i, field := range fields {
-			rows = append(rows, []string{scope.targetProjectID, datasetID, table.TableID, field.Name, strconv.Itoa(i + 1), field.Type})
+			isPartitioning := "NO"
+			if table.TimePartitioning != nil && strings.EqualFold(table.TimePartitioning.Field, field.Name) {
+				isPartitioning = "YES"
+			}
+			if table.RangePartitioning != nil && strings.EqualFold(table.RangePartitioning.Field, field.Name) {
+				isPartitioning = "YES"
+			}
+			clusteringOrdinal := storedNullCell
+			for ordinal, clusteringField := range table.Clustering {
+				if strings.EqualFold(clusteringField, field.Name) {
+					clusteringOrdinal = strconv.Itoa(ordinal + 1)
+					break
+				}
+			}
+			rows = append(rows, []string{scope.targetProjectID, datasetID, table.TableID, field.Name, strconv.Itoa(i + 1), field.Type, isPartitioning, clusteringOrdinal})
 		}
 	})
-	return []map[string]string{{"name": "table_catalog", "type": "STRING"}, {"name": "table_schema", "type": "STRING"}, {"name": "table_name", "type": "STRING"}, {"name": "column_name", "type": "STRING"}, {"name": "ordinal_position", "type": "INT64"}, {"name": "data_type", "type": "STRING"}}, rows
+	return []map[string]string{{"name": "table_catalog", "type": "STRING"}, {"name": "table_schema", "type": "STRING"}, {"name": "table_name", "type": "STRING"}, {"name": "column_name", "type": "STRING"}, {"name": "ordinal_position", "type": "INT64"}, {"name": "data_type", "type": "STRING"}, {"name": "is_partitioning_column", "type": "STRING"}, {"name": "clustering_ordinal_position", "type": "INT64"}}, rows
 }
 
 func buildInformationSchemaJobs(scope informationSchemaScope) ([]map[string]string, [][]string) {
@@ -2152,11 +2369,13 @@ func jobRecordsToInformationSchemaRows(items []*jobRecord) [][]string {
 func buildInformationSchemaPartitions(scope informationSchemaScope) ([]map[string]string, [][]string) {
 	rows := [][]string{}
 	scope.forEachTable(func(datasetID string, table *tableRecord) {
-		_, tableRows, ok, err := scope.server.resolveTableRows(scope.targetProjectID, datasetID, table.TableID)
-		if !ok || err != nil {
+		if table.External != nil || table.View != nil {
 			return
 		}
-		rows = append(rows, []string{scope.targetProjectID, datasetID, table.TableID, "__UNPARTITIONED__", strconv.Itoa(len(tableRows))})
+		counts := partitionCounts(table)
+		for _, partitionID := range sortedPartitionIDs(counts) {
+			rows = append(rows, []string{scope.targetProjectID, datasetID, table.TableID, partitionID, strconv.Itoa(counts[partitionID])})
+		}
 	})
 	return []map[string]string{{"name": "table_catalog", "type": "STRING"}, {"name": "table_schema", "type": "STRING"}, {"name": "table_name", "type": "STRING"}, {"name": "partition_id", "type": "STRING"}, {"name": "total_rows", "type": "INT64"}}, rows
 }
@@ -2217,6 +2436,13 @@ func buildInformationSchemaTableOptions(scope informationSchemaScope) ([]map[str
 		}
 		if strings.TrimSpace(table.Description) != "" {
 			rows = append(rows, []string{scope.targetProjectID, datasetID, table.TableID, "description", "STRING", table.Description})
+		}
+		if table.RequirePartitionFilter {
+			rows = append(rows, []string{scope.targetProjectID, datasetID, table.TableID, "require_partition_filter", "BOOL", "true"})
+		}
+		if table.TimePartitioning != nil && table.TimePartitioning.ExpirationMs > 0 {
+			days := float64(table.TimePartitioning.ExpirationMs) / float64(24*time.Hour/time.Millisecond)
+			rows = append(rows, []string{scope.targetProjectID, datasetID, table.TableID, "partition_expiration_days", "FLOAT64", strconv.FormatFloat(days, 'f', -1, 64)})
 		}
 	})
 	return []map[string]string{{"name": "table_catalog", "type": "STRING"}, {"name": "table_schema", "type": "STRING"}, {"name": "table_name", "type": "STRING"}, {"name": "option_name", "type": "STRING"}, {"name": "option_type", "type": "STRING"}, {"name": "option_value", "type": "STRING"}}, rows
