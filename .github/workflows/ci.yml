@@ -40,6 +40,50 @@ jobs:
           command -v google-chrome-stable || command -v google-chrome || command -v chromium-browser || command -v chromium
       - run: go test -tags e2e -timeout 15m ./cmd/locaql-ui/...
 
+  python-client:
+    name: Official Python clients (BigQuery + Storage)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: test/clients/python/requirements.txt
+      - name: Install the pinned official client in an isolated environment
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install -r test/clients/python/requirements.txt
+      - name: Exercise BigQuery uploads, persistent SQL, and Cloud Storage downloads
+        run: |
+          go build -o /tmp/locaql-python-client ./cmd/locaql
+          mkdir -p "$RUNNER_TEMP/locaql-fake-gcs"
+          LOCAQL_FAKE_GCS_ROOT="$RUNNER_TEMP/locaql-fake-gcs" /tmp/locaql-python-client start \
+            --addr 127.0.0.1:19050 \
+            --storage-grpc-addr 127.0.0.1:19060 \
+            --capabilities "$PWD/capabilities/registry.yaml" &
+          server_pid=$!
+          trap 'kill "$server_pid"' EXIT
+          for attempt in $(seq 1 40); do
+            if curl --fail --silent http://127.0.0.1:19050/_emulator/health >/dev/null; then
+              break
+            fi
+            if [ "$attempt" -eq 40 ]; then
+              echo "LocaQL did not become healthy" >&2
+              exit 1
+            fi
+            sleep 0.25
+          done
+          .venv/bin/python test/clients/python/load_table_from_file.py \
+            --endpoint http://127.0.0.1:19050
+          .venv/bin/python test/clients/python/persistent_ddl_dml.py \
+            --endpoint http://127.0.0.1:19050
+          .venv/bin/python test/clients/python/storage_download.py \
+            --endpoint http://127.0.0.1:19050
+
   native:
     name: Native build/vet/test (${{ matrix.os }})
     strategy:

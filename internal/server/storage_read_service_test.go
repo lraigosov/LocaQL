@@ -66,7 +66,11 @@ func readAllStorageRows(t *testing.T, resp *storagepb.ReadRowsResponse) []map[st
 		if err != nil {
 			t.Fatalf("decode avro row: %v", err)
 		}
-		rows = append(rows, native.(map[string]any))
+		row := native.(map[string]any)
+		for name, value := range row {
+			row[name] = unwrapAvroUnion(value)
+		}
+		rows = append(rows, row)
 		buf = rest
 	}
 	if int64(len(rows)) != resp.GetRowCount() {

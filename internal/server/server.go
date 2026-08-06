@@ -38,6 +38,7 @@ type Server struct {
 	models   *modelService
 	sessions *sessionService
 	metrics  *metricsService
+	uploads  *bigQueryUploadService
 	logger   *slog.Logger
 }
 
@@ -52,6 +53,7 @@ func New(reg capabilities.Registry) *Server {
 		models:   newModelService(),
 		sessions: newSessionService(),
 		metrics:  newMetricsService(time.Now()),
+		uploads:  newBigQueryUploadService(),
 		logger:   newDefaultLogger(),
 	}
 	s.jobs.copyExecutor = s.executeCopyJob
@@ -73,14 +75,17 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/_emulator/capabilities", s.capabilities)
 	s.mux.HandleFunc("/_emulator/metrics", s.metricsEndpoint)
 	s.mux.HandleFunc("/_emulator/diagnostics", s.diagnosticsEndpoint)
+	s.mux.HandleFunc("/_emulator/bigquery/uploads/", s.bigQueryResumableUpload)
 	s.mux.HandleFunc("/_emulator/datasets/undelete", s.undeleteDataset)
 	s.mux.HandleFunc("/_emulator/workspace/validate", s.workspaceValidate)
 	s.mux.HandleFunc("/_emulator/workspace/plan", s.workspacePlan)
 	s.mux.HandleFunc("/_emulator/workspace/diff", s.workspaceDiff)
 	s.mux.HandleFunc("/_emulator/workspace/apply", s.workspaceApply)
 	s.mux.HandleFunc("/bigquery/v2/projects/", s.bigQueryV2)
+	s.mux.HandleFunc("/upload/bigquery/v2/projects/", s.bigQueryJobUpload)
 	s.mux.HandleFunc("/storage/v1/b", s.gcsBucketsCollection)
 	s.mux.HandleFunc("/storage/v1/b/", s.gcsBucketScope)
+	s.mux.HandleFunc("/download/storage/v1/b/", s.gcsDownloadScope)
 	s.mux.HandleFunc("/upload/storage/v1/b/", s.gcsObjectUpload)
 }
 
