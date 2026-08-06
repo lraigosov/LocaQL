@@ -134,6 +134,21 @@ func (s *Server) handleDatasetsScope(w http.ResponseWriter, r *http.Request, pro
 	datasetID := parts[2]
 	switch parts[3] {
 	case "tables":
+		// Real BigQuery's tabledata.list lives at .../tables/{tableId}/data (6
+		// path segments), not under a separate "tabledata" top-level scope —
+		// that shape only exists here as a pre-existing internal alias (see
+		// the "tabledata" case in bigQueryV2) that the official client
+		// libraries never actually request. Handle the real shape explicitly
+		// before falling through to the generic collection/by-ID dispatch,
+		// which stops at 5 segments and would otherwise 404 this.
+		if len(parts) == 6 && parts[5] == "data" {
+			if r.Method != http.MethodGet {
+				writeError(w, http.StatusMethodNotAllowed, "Method not allowed", "methodNotAllowed")
+				return true
+			}
+			s.listTableData(w, r, projectID, datasetID, parts[4])
+			return true
+		}
 		return s.dispatchDatasetSubResource(w, r, projectID, datasetID, parts, s.handleTablesCollection, s.handleTableByID)
 	case "routines":
 		return s.dispatchDatasetSubResource(w, r, projectID, datasetID, parts, s.handleRoutinesCollection, s.handleRoutineByID)
@@ -928,6 +943,16 @@ func renderTableResource(t *tableRecord) map[string]any {
 			"fields": renderTableSchemaFields(t.Schema),
 		},
 	}
+	// numRows/numBytes were never set here at all, so official clients
+	// (Table.num_rows / Table.num_bytes) always read None regardless of
+	// whether a load job had actually populated the table. Reported only for
+	// managed tables — external tables and views don't materialize rows into
+	// t.Rows the way a plain TABLE does, so real BigQuery doesn't report a
+	// meaningful row/byte count for them either.
+	if t.External == nil && t.View == nil {
+		resp["numRows"] = strconv.FormatInt(int64(len(t.Rows)), 10)
+		resp["numBytes"] = strconv.FormatInt(estimateRowsByteSize(t.Rows), 10)
+	}
 	if t.FriendlyName != "" {
 		resp["friendlyName"] = t.FriendlyName
 	}
@@ -1503,15 +1528,27 @@ func (s *Server) listTableData(w http.ResponseWriter, r *http.Request, projectID
 		"etag":           "locaql",
 		"totalRows":      strconv.Itoa(len(rows)),
 		"rows":           out,
-		"pageToken":      strconv.Itoa(start),
 		"datasetId":      datasetID,
 		"tableId":        tableID,
 		"projectId":      projectID,
 		"maxResults":     size,
 		"startIndexUsed": start,
 	}
+	// "pageToken" here (echoing the request's own start, unconditionally) was
+	// a real, previously-undiscovered bug, not just a redundant field: the
+	// official client's RowIterator for tabledata.list is constructed with
+	// next_token="pageToken" (google-cloud-bigquery's table.py), i.e. it
+	// checks for the mere *presence* of a "pageToken" key in the response —
+	// not "nextPageToken" — to decide whether to keep paging. Always
+	// including it, even on the final page, made list_rows() loop forever
+	// re-fetching the same page. "nextPageToken" is kept alongside it only
+	// for whatever already depends on that name (e.g. this endpoint's other
+	// existing test, TestTableDataListPagination) — both are set to the same
+	// value and both are omitted once there's nothing left to page through.
 	if end < len(rows) {
-		resp["nextPageToken"] = encodePageToken(end)
+		token := encodePageToken(end)
+		resp["pageToken"] = token
+		resp["nextPageToken"] = token
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
