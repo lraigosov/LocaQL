@@ -4,6 +4,9 @@ All notable user-facing changes to LocaQL are documented here, in the style of [
 
 ## [Unreleased]
 
+### Added
+- Official Python `Client.load_table_from_file` compatibility through BigQuery's real multipart and resumable upload protocols, including `308` range progress, idempotent chunk retries, empty files, real `LoadJob` polling/statistics, and a pinned SDK smoke test in CI. Direct uploads currently require an explicit schema and incomplete resumable sessions are process-local/in-memory; see `KNOWN-DIVERGENCES.md`.
+
 ## [0.9.2] - 2026-08-06
 
 ## [0.9.1] - 2026-07-28

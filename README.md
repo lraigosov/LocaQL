@@ -92,7 +92,7 @@ Registry file:
 | Opaque pagination tokens | Supported | `nextPageToken` is opaque; legacy numeric token input remains accepted |
 | Jobs lifecycle | Supported | `PENDING -> RUNNING -> DONE`, cancel before/during run |
 | requestId idempotency | Partial | Implemented for `jobs.insert` and `projects.queries` with TTL |
-| Job executors (query/load/extract/copy) | Partial | Query jobs execute real GoogleSQL — `WHERE`, projection, `JOIN`, aggregation, `ORDER BY`, `LIMIT` — via an embedded engine (see [Query Engine](#query-engine-real-googlesql-via-an-embedded-sqlite-backend)), reporting real `outputRows`/`processedBytes` (`totalSlotMs` stays synthetic by design); copy jobs create real destination table data; load jobs materialize destination schema and ingest real rows from `sourceUris` (`NEWLINE_DELIMITED_JSON`, `CSV`, `AVRO` or `PARQUET`, with optional `GZIP` decompression for CSV/NDJSON); extract jobs read a real source table and write `destinationUris` in the same four formats with optional `compression` (`GZIP` for CSV/NDJSON, `SNAPPY`/`DEFLATE` for Avro, `SNAPPY`/`GZIP` for Parquet), and split into multiple real shard files once `LOCAQL_EXTRACT_SHARD_MAX_BYTES` is set and exceeded (single shard by default). `sourceUris`/`destinationUris` are local paths by default; `gs://` resolves onto a local directory only when `LOCAQL_FAKE_GCS_ROOT` is set (multi-wildcard `destinationUris` and `ORC` are rejected explicitly) |
+| Job executors (query/load/extract/copy) | Partial | Query jobs execute real GoogleSQL — `WHERE`, projection, `JOIN`, aggregation, `ORDER BY`, `LIMIT` — via an embedded engine (see [Query Engine](#query-engine-real-googlesql-via-an-embedded-sqlite-backend)), reporting real `outputRows`/`processedBytes` (`totalSlotMs` stays synthetic by design); copy jobs create real destination table data; load jobs materialize destination schema and ingest real rows either from `sourceUris` or direct file uploads through the official Python client's `load_table_from_file` (multipart and resumable), using `NEWLINE_DELIMITED_JSON`, `CSV`, `AVRO` or `PARQUET` and optional `GZIP` decompression for CSV/NDJSON; extract jobs read a real source table and write `destinationUris` in the same four formats with optional `compression` (`GZIP` for CSV/NDJSON, `SNAPPY`/`DEFLATE` for Avro, `SNAPPY`/`GZIP` for Parquet), and split into multiple real shard files once `LOCAQL_EXTRACT_SHARD_MAX_BYTES` is set and exceeded (single shard by default). `sourceUris`/`destinationUris` are local paths by default; `gs://` resolves onto a local directory only when `LOCAQL_FAKE_GCS_ROOT` is set (multi-wildcard `destinationUris` and `ORC` are rejected explicitly) |
 | Routines and Models | Supported | `routines`/`models` `insert`/`get`/`list`/`patch`/`delete` are metadata-only (no SQL execution or ML training/inference backend exists; nothing is fabricated beyond stored fields) |
 | External tables | Partial | `tables.insert` accepts `externalDataConfiguration` (`NEWLINE_DELIMITED_JSON`/`CSV`/`AVRO`/`PARQUET`, explicit schema, no autodetect); `sourceUris` are read fresh from disk/fake-GCS on every query/`tabledata.list`/copy/extract access rather than materialized at creation. Patching `externalDataConfiguration`, autodetect, Hive partitioning and compression options are not supported |
 | Views and Materialized Views | Partial | `tables.insert` accepts `view.query`/`materializedView.query`, validated and schema-derived by executing the query through the real query engine at creation; every access re-executes the stored query live (see [Views and Materialized Views](#views-and-materialized-views-real-resources-backed-by-the-query-engine)). No patch-based redefinition; materialized views are not actually cached/refreshed |
@@ -323,16 +323,45 @@ The console's **Workspace** tab exposes the same four operations as forms over t
 - `AVRO`: records read from an Avro Object Container File and projected onto `schema.fields` by **name**, same as NDJSON. The emulator does not autodetect a BigQuery schema from the file's embedded Avro schema — `schema.fields` is still required.
 - `PARQUET`: rows read via [`parquet-go/parquet-go`](https://github.com/parquet-go/parquet-go) using a Parquet schema built from `schema.fields`, projected by **name** just like Avro/NDJSON. Same no-schema-autodetect limitation applies.
 
+Direct uploads use BigQuery's real upload endpoints, so the official Python client can call `Client.load_table_from_file` without staging the file in GCS. LocaQL supports both protocols selected by that method: `multipart/related` for a known file smaller than 5 MiB, and resumable sessions (`POST` initiation, chunked `PUT`, `308` progress responses and `200` completion) when `size=None` or the client selects resumable upload. The returned resource includes `configuration.load` and nested `statistics.load`, so the SDK returns a real `LoadJob`, `job.result()` polls normally and `output_rows` is populated. This exact flow is covered by the pinned official-client smoke test in `test/clients/python/load_table_from_file.py` and its dedicated CI job.
+
+```python
+import io
+
+from google.auth.credentials import AnonymousCredentials
+from google.cloud import bigquery
+
+client = bigquery.Client(
+    project="p1",
+    credentials=AnonymousCredentials(),
+    client_options={"api_endpoint": "http://localhost:9050"},
+)
+config = bigquery.LoadJobConfig(
+    schema=[bigquery.SchemaField("event_id", "INT64")],
+    source_format=bigquery.SourceFormat.CSV,
+    skip_leading_rows=1,
+)
+payload = b"event_id\n1\n"
+job = client.load_table_from_file(
+    io.BytesIO(payload),
+    "p1.analytics.events",
+    job_config=config,
+    size=len(payload),  # omit / use None to exercise resumable upload
+)
+job.result()
+```
+
 `sourceUris` resolve to local file paths by default (optionally prefixed with `file://`). Setting `LOCAQL_FAKE_GCS_ROOT=/some/dir` before starting the emulator makes `gs://bucket/object` URIs resolve onto `/some/dir/bucket/object` instead — a local-disk convenience mapping, **not** a GCS-compatible API. Without that env var, `gs://` is rejected explicitly.
 
 `configuration.load.compression` (optional, default `NONE`) decompresses the source file before parsing: `GZIP` is accepted for `CSV`/`NEWLINE_DELIMITED_JSON`. Avro and Parquet already carry their own codec inside the file and are decoded transparently regardless of which one was used to write them, so `compression` is not applicable there — setting it to anything other than `NONE` for those two formats fails the job explicitly instead of silently doing nothing.
 
 Known limitations, declared explicitly rather than silently ignored:
 
-- Only `NEWLINE_DELIMITED_JSON`, `CSV`, `AVRO` and `PARQUET` are supported; other formats (`ORC`, the BigQuery default when `sourceFormat` is omitted) fail the job explicitly.
-- `schema.fields` is required when `sourceUris` is set; there is no schema autodetect yet.
+- Only `NEWLINE_DELIMITED_JSON`, `CSV`, `AVRO` and `PARQUET` are supported; other formats such as `ORC` fail the job explicitly. When `sourceFormat` is omitted, LocaQL now uses BigQuery's real default, `CSV`.
+- `schema.fields` is required when `sourceUris` or direct uploaded media is used; there is no schema autodetect yet.
 - No `maxBadRecords`/per-row error tolerance yet: any malformed row fails the whole job.
 - Avro and Parquet fields are encoded as non-nullable scalars: this codebase has no NULLABLE/REQUIRED mode tracking for any format yet.
+- Resumable upload sessions are process-local and expire after one hour of inactivity. Incomplete media is buffered in memory rather than spooled to disk, so this is intended for local integration tests, not unbounded production-size uploads. Completed jobs and sessions release their media buffers immediately.
 
 ```bash
 curl -X POST http://localhost:9050/bigquery/v2/projects/p1/jobs \

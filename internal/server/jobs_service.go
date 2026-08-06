@@ -30,6 +30,9 @@ type jobRecord struct {
 	SourceTables             []tableReference
 	LoadSchema               []tableField
 	LoadSourceURIs           []string
+	LoadInlineData           []byte `json:"-"`
+	LoadInlineName           string `json:"-"`
+	LoadInline               bool   `json:"-"`
 	LoadSourceFormat         string
 	LoadFieldDelimiter       string
 	LoadSkipLeadingRows      int
@@ -107,6 +110,9 @@ type jobInsertOptions struct {
 	SourceTables             []tableReference
 	LoadSchema               []tableField
 	LoadSourceURIs           []string
+	LoadInlineData           []byte
+	LoadInlineName           string
+	LoadInline               bool
 	LoadSourceFormat         string
 	LoadFieldDelimiter       string
 	LoadSkipLeadingRows      int
@@ -258,6 +264,9 @@ func (s *jobService) insert(opts jobInsertOptions) (*jobRecord, bool) {
 		SourceTables:             cloneTableReferences(opts.SourceTables),
 		LoadSchema:               cloneTableFields(opts.LoadSchema),
 		LoadSourceURIs:           cloneStringSlice(opts.LoadSourceURIs),
+		LoadInlineData:           cloneBytes(opts.LoadInlineData),
+		LoadInlineName:           strings.TrimSpace(opts.LoadInlineName),
+		LoadInline:               opts.LoadInline,
 		LoadSourceFormat:         strings.TrimSpace(opts.LoadSourceFormat),
 		LoadFieldDelimiter:       opts.LoadFieldDelimiter,
 		LoadSkipLeadingRows:      opts.LoadSkipLeadingRows,
@@ -331,6 +340,10 @@ func (s *jobService) insertScriptWithChildren(opts jobInsertOptions) (*jobRecord
 // metricsSnapshot; callers must already hold s.mu (all four jobStateDone
 // transition points in run() do).
 func (s *jobService) recordJobOutcomeLocked(jr *jobRecord) {
+	// Uploaded files are transient executor input. Keeping a copy on every
+	// completed job would retain potentially large payloads for the lifetime of
+	// the server even though job rendering and polling never need the bytes.
+	jr.LoadInlineData = nil
 	if jr.ErrorReason == "" {
 		s.completedTotal++
 	} else {
@@ -475,6 +488,7 @@ func (s *jobService) runJobExecutors(projectID, jobID, jobType string) (jobExecu
 		{jobType: "load", location: "configuration.load", execute: s.loadExecutor, prepare: func(snap *jobRecord) {
 			snap.LoadSchema = cloneTableFields(snap.LoadSchema)
 			snap.LoadSourceURIs = cloneStringSlice(snap.LoadSourceURIs)
+			snap.LoadInlineData = cloneBytes(snap.LoadInlineData)
 		}},
 		{jobType: "extract", location: "configuration.extract", execute: s.extractExecutor, prepare: func(snap *jobRecord) {
 			snap.ExtractDestinationURIs = cloneStringSlice(snap.ExtractDestinationURIs)
@@ -549,6 +563,7 @@ func (s *jobService) cancel(projectID, jobID string) (*jobRecord, bool) {
 		jr.ErrorReason = "stopped"
 		jr.ErrorMessage = "job cancelled before execution"
 		jr.EndedAt = time.Now().UTC()
+		jr.LoadInlineData = nil
 	}
 	s.projectVersions[projectID]++
 	_ = s.persistLocked()
@@ -796,6 +811,26 @@ func renderJobResource(j *jobRecord) map[string]any {
 			},
 		}
 	}
+	if j.JobType == "load" {
+		loadConfig := map[string]any{
+			"destinationTable": map[string]string{
+				"projectId": j.ProjectID,
+				"datasetId": j.TargetDataset,
+				"tableId":   j.TargetTable,
+			},
+			"schema":            map[string]any{"fields": renderTableSchemaFields(j.LoadSchema)},
+			"sourceFormat":      j.LoadSourceFormat,
+			"createDisposition": j.CreateDisposition,
+			"writeDisposition":  j.WriteDisposition,
+			"fieldDelimiter":    j.LoadFieldDelimiter,
+			"skipLeadingRows":   j.LoadSkipLeadingRows,
+			"compression":       j.LoadCompression,
+		}
+		if len(j.LoadSourceURIs) > 0 {
+			loadConfig["sourceUris"] = cloneStringSlice(j.LoadSourceURIs)
+		}
+		res["configuration"] = map[string]any{"load": loadConfig}
+	}
 
 	return res
 }
@@ -845,6 +880,15 @@ func cloneStringSlice(values []string) []string {
 	}
 	out := make([]string, len(values))
 	copy(out, values)
+	return out
+}
+
+func cloneBytes(value []byte) []byte {
+	if value == nil {
+		return nil
+	}
+	out := make([]byte, len(value))
+	copy(out, value)
 	return out
 }
 
