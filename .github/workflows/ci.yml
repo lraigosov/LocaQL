@@ -57,7 +57,7 @@ jobs:
         run: |
           python -m venv .venv
           .venv/bin/python -m pip install -r test/clients/python/requirements.txt
-      - name: Exercise BigQuery uploads and Cloud Storage downloads
+      - name: Exercise BigQuery uploads, persistent SQL, and Cloud Storage downloads
         run: |
           go build -o /tmp/locaql-python-client ./cmd/locaql
           mkdir -p "$RUNNER_TEMP/locaql-fake-gcs"
@@ -78,6 +78,8 @@ jobs:
             sleep 0.25
           done
           .venv/bin/python test/clients/python/load_table_from_file.py \
+            --endpoint http://127.0.0.1:19050
+          .venv/bin/python test/clients/python/persistent_ddl_dml.py \
             --endpoint http://127.0.0.1:19050
           .venv/bin/python test/clients/python/storage_download.py \
             --endpoint http://127.0.0.1:19050

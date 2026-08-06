@@ -1421,6 +1421,10 @@ func (s *Server) writeQueryResults(w http.ResponseWriter, r *http.Request, proje
 		writeError(w, http.StatusBadRequest, "Query results only available for query jobs", "invalid")
 		return
 	}
+	if j.State == jobStateDone && j.ErrorReason != "" {
+		writeError(w, http.StatusBadRequest, j.ErrorMessage, j.ErrorReason)
+		return
+	}
 
 	start, size := parsePagination(r, 20, 1000)
 	// A DONE query job's result set was already computed once by
@@ -1436,11 +1440,22 @@ func (s *Server) writeQueryResults(w http.ResponseWriter, r *http.Request, proje
 	if j.State == jobStateDone && j.Statistics.ResultSchema != nil {
 		schema, values = j.Statistics.ResultSchema, j.Statistics.ResultRows
 	} else {
-		var err error
-		schema, values, err = s.simulateQueryResultTable(projectID, j.SessionID, j.QueryText, j.UserEmail, j.ParameterMode, j.QueryParameters)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, err.Error(), "invalid")
-			return
+		// Preserve the existing early-result behavior for side-effect-free
+		// SELECTs, but never execute DDL/DML or session control merely because a
+		// PENDING/RUNNING job was polled. A mutation must run exactly once after
+		// its job acquires the target-table lock.
+		_, mutating, _ := parsePersistentSQLStatement(projectID, j.QueryText)
+		trimmedQuery := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(j.QueryText), ";"))
+		sessionControl := sessionBeginPattern.MatchString(trimmedQuery) || sessionCommitPattern.MatchString(trimmedQuery) || sessionRollbackPattern.MatchString(trimmedQuery) || sessionCreateTempTablePattern.MatchString(trimmedQuery)
+		if mutating || sessionControl {
+			schema, values = []tableField{}, [][]string{}
+		} else {
+			var err error
+			schema, values, err = s.simulateQueryResultTable(projectID, j.SessionID, j.QueryText, j.UserEmail, j.ParameterMode, j.QueryParameters)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, err.Error(), "invalid")
+				return
+			}
 		}
 	}
 	end := clampEnd(start, size, len(values))
@@ -1467,14 +1482,26 @@ func (s *Server) writeQueryResults(w http.ResponseWriter, r *http.Request, proje
 	if j.SessionID != "" {
 		resp["sessionInfo"] = map[string]string{"sessionId": j.SessionID}
 	}
+	if isDMLStatementType(j.Statistics.StatementType) {
+		resp["numDmlAffectedRows"] = strconv.FormatInt(j.Statistics.DMLAffectedRows, 10)
+	}
 
 	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) simulateQueryResultTable(projectID, sessionID, queryText, callingUserEmail string, paramMode string, params []storedQueryParameter) ([]tableField, [][]string, error) {
+	result, err := s.executeQueryStatement(projectID, sessionID, queryText, callingUserEmail, paramMode, params)
+	return result.schema, result.rows, err
+}
+
+// executeQueryStatement is the single execution dispatcher for SELECT,
+// INFORMATION_SCHEMA, session control, and persistent DDL/DML. Keeping the
+// mutation path here ensures jobs.query and jobs.insert share exactly the same
+// semantics and that executeQueryJob can retain statement-specific statistics.
+func (s *Server) executeQueryStatement(projectID, sessionID, queryText, callingUserEmail string, paramMode string, params []storedQueryParameter) (persistentSQLResult, error) {
 	trimmed := strings.TrimSpace(queryText)
 	if trimmed == "" {
-		return []tableField{{Name: "result", Type: "STRING"}}, [][]string{{"query job executed"}}, nil
+		return persistentSQLResult{schema: []tableField{{Name: "result", Type: "STRING"}}, rows: [][]string{{"query job executed"}}, statementType: "SELECT"}, nil
 	}
 	trimmed = strings.TrimSpace(strings.TrimSuffix(trimmed, ";"))
 
@@ -1486,15 +1513,19 @@ func (s *Server) simulateQueryResultTable(projectID, sessionID, queryText, calli
 		var err error
 		sess, handled, schema, rows, err = s.executeSessionControlStatement(projectID, sessionID, trimmed)
 		if handled {
-			return schema, rows, err
+			return persistentSQLResult{schema: schema, rows: rows, statementType: "SCRIPT"}, err
 		}
 	}
 
 	lower := strings.ToLower(trimmed)
 	if schema, rows, ok := s.simulateInformationSchemaQuery(projectID, trimmed, lower, callingUserEmail); ok {
-		return flatSchemaToTableFields(schema), rows, nil
+		return persistentSQLResult{schema: flatSchemaToTableFields(schema), rows: rows, statementType: "SELECT"}, nil
 	}
-	return s.executeRealSQLQueryWithParams(projectID, trimmed, sess, paramMode, params)
+	if result, handled, err := s.executePersistentSQLStatement(projectID, trimmed, sess, paramMode, params); handled {
+		return result, err
+	}
+	schema, rows, err := s.executeRealSQLQueryWithParams(projectID, trimmed, sess, paramMode, params)
+	return persistentSQLResult{schema: schema, rows: rows, statementType: "SELECT"}, err
 }
 
 // flatSchemaToTableFields converts an INFORMATION_SCHEMA builder's flat
@@ -2222,11 +2253,11 @@ func (s *Server) executeQueryJob(job *jobRecord) (jobStatistics, error) {
 	if strings.Contains(strings.ToUpper(job.QueryText), "FORCE_ERROR") {
 		return jobStatistics{Executor: "query", Simulated: false}, fmt.Errorf("simulated forced error from query text")
 	}
-	schema, rows, err := s.simulateQueryResultTable(job.ProjectID, job.SessionID, job.QueryText, job.UserEmail, job.ParameterMode, job.QueryParameters)
+	result, err := s.executeQueryStatement(job.ProjectID, job.SessionID, job.QueryText, job.UserEmail, job.ParameterMode, job.QueryParameters)
 	if err != nil {
 		return jobStatistics{Executor: "query", Simulated: false}, err
 	}
-	return jobStatistics{Executor: "query", Simulated: false, TotalSlotMs: 60, ProcessedBytes: estimateRowsByteSize(rows), OutputRows: int64(len(rows)), ResultSchema: schema, ResultRows: rows}, nil
+	return jobStatistics{Executor: "query", Simulated: false, TotalSlotMs: 60, ProcessedBytes: estimateRowsByteSize(result.rows), OutputRows: int64(len(result.rows)), StatementType: result.statementType, DMLAffectedRows: result.dmlAffectedRows, ResultSchema: result.schema, ResultRows: result.rows}, nil
 }
 
 func estimateRowsByteSize(rows [][]string) int64 {

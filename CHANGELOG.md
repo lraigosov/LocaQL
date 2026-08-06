@@ -5,11 +5,13 @@ All notable user-facing changes to LocaQL are documented here, in the style of [
 ## [Unreleased]
 
 ### Added
+- Persistent single-statement GoogleSQL DDL/DML for query jobs: `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `TRUNCATE TABLE`, `CREATE [OR REPLACE] TABLE [AS SELECT]` and `DROP TABLE`, with target-table serialization, optimistic catalog version checks, statement atomicity, query parameters, BigQuery-shaped DML statistics, and a pinned `google-cloud-bigquery 3.42.3` CI smoke.
 - Official Python `Client.load_table_from_file` compatibility through BigQuery's real multipart and resumable upload protocols, including `308` range progress, idempotent chunk retries, empty files, real `LoadJob` polling/statistics, and a pinned SDK smoke test in CI. Direct uploads currently require an explicit schema and incomplete resumable sessions are process-local/in-memory; see `KNOWN-DIVERGENCES.md`.
 - Official Google Cloud Storage media downloads at `/download/storage/v1/b/{bucket}/o/{object}?alt=media`, including URL-escaped nested names, absolute `mediaLink` resources, `HEAD`, byte ranges (`206`/`Content-Range`) and MD5 response hashes. A pinned `google-cloud-storage 3.13.1` smoke test now covers upload, full download and ranged download in CI; the existing `objects.get?alt=media` route remains compatible.
 - Lossless scalar nullability across load, catalog, query, REST, extract and Storage APIs: `NULL`, empty string, zero and false no longer collapse. Nullable Avro uses unions, nullable Parquet uses optional fields, `REQUIRED` null/absence fails explicitly, and the official Python smoke verifies `(None, "", 0, False)` plus correct `COUNT` semantics.
 
 ### Fixed
+- Polling a pending mutating query no longer executes it before the job acquires its resource lock or causes it to run twice. Whole-reference backticks around same-project `project.dataset.table` are now stripped correctly, and `MERGE` affected-row counts are derived from the before/after row multiset when the embedded driver reports zero despite applying the mutation.
 - Final `getQueryResults` responses no longer include `pageToken`. The official Python query `RowIterator` treated its presence as another page and could loop indefinitely even after receiving the last row; this was discovered by the new nullable E2E.
 
 ## [0.9.2] - 2026-08-06
