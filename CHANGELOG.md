@@ -5,6 +5,7 @@ All notable user-facing changes to LocaQL are documented here, in the style of [
 ## [Unreleased]
 
 ### Added
+- BigQuery table partitioning and clustering through REST and the official Python client: time-unit/ingestion-time and integer-range definitions, ordered clustering fields, mutable partition expiration, lazy expired-row removal, required partition filters for column/range tables, and real `INFORMATION_SCHEMA.PARTITIONS`/`COLUMNS`/`TABLE_OPTIONS` metadata. Physical pruning, SQL `PARTITION BY` DDL and executable ingestion pseudocolumns remain explicit limits.
 - Persistent single-statement GoogleSQL DDL/DML for query jobs: `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `TRUNCATE TABLE`, `CREATE [OR REPLACE] TABLE [AS SELECT]` and `DROP TABLE`, with target-table serialization, optimistic catalog version checks, statement atomicity, query parameters, BigQuery-shaped DML statistics, and a pinned `google-cloud-bigquery 3.42.3` CI smoke.
 - Official Python `Client.load_table_from_file` compatibility through BigQuery's real multipart and resumable upload protocols, including `308` range progress, idempotent chunk retries, empty files, real `LoadJob` polling/statistics, and a pinned SDK smoke test in CI. Direct uploads currently require an explicit schema and incomplete resumable sessions are process-local/in-memory; see `KNOWN-DIVERGENCES.md`.
 - Official Google Cloud Storage media downloads at `/download/storage/v1/b/{bucket}/o/{object}?alt=media`, including URL-escaped nested names, absolute `mediaLink` resources, `HEAD`, byte ranges (`206`/`Content-Range`) and MD5 response hashes. A pinned `google-cloud-storage 3.13.1` smoke test now covers upload, full download and ranged download in CI; the existing `objects.get?alt=media` route remains compatible.
@@ -52,7 +53,7 @@ All notable user-facing changes to LocaQL are documented here, in the style of [
 - The `Dockerfile` hardcoded `GOOS=linux` with no `GOARCH` at all, so it always built for the host's native architecture regardless of what was requested — "multi-arch" support didn't actually work. Fixed to consume Docker's `TARGETOS`/`TARGETARCH` build args properly.
 
 ### Known limitations
-See [KNOWN-DIVERGENCES.md](KNOWN-DIVERGENCES.md) for the full, severity-classified list. Highlights: Storage Write API has no BUFFERED streams/`FlushRows`; Storage Read API is Avro-only with one stream per session, no `SplitReadStream`; a session transaction's atomicity never extends to real base tables; `GET /_emulator/metrics` is plain JSON, not Prometheus text exposition; the query engine only runs correctly on Linux (including WSL) — it traps at analyzer initialization on native Windows/macOS, root-caused but not yet fixable from LocaQL's side (see Blocking #3).
+See [KNOWN-DIVERGENCES.md](KNOWN-DIVERGENCES.md) for the full, severity-classified list. Highlights: Storage Write API has no BUFFERED streams/`FlushRows`; Storage Read API is Avro-only with one stream per session, no `SplitReadStream`; a session transaction's atomicity never extends to real base tables; `GET /_emulator/metrics` is plain JSON, not Prometheus text exposition; the query engine only runs correctly on Linux (including WSL) — it traps at analyzer initialization on native Windows/macOS, root-caused but not yet fixable from LocaQL's side (see Blocking #2).
 
 ## Versioning and deprecation policy
 

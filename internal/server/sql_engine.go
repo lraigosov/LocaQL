@@ -402,6 +402,16 @@ func (s *Server) openMaterializedSQLDatabase(projectID, queryText string, visiti
 	}
 
 	refs := referencedTables(queryText, projectID)
+	requireFilterCheck := make(map[datasetTableRef]bool, len(refs)+len(extraRefs))
+	for _, ref := range refs {
+		requireFilterCheck[ref] = true
+	}
+	if statement, handled, parseErr := parsePersistentSQLStatement(projectID, queryText); handled && parseErr == nil {
+		switch statement.statementType {
+		case "UPDATE", "DELETE", "MERGE":
+			requireFilterCheck[datasetTableRef{datasetID: statement.target.DatasetID, tableID: statement.target.TableID}] = true
+		}
+	}
 	seen := make(map[datasetTableRef]bool, len(refs)+len(extraRefs))
 	combined := make([]datasetTableRef, 0, len(refs)+len(extraRefs))
 	for _, ref := range append(refs, extraRefs...) {
@@ -413,6 +423,12 @@ func (s *Server) openMaterializedSQLDatabase(projectID, queryText string, visiti
 	}
 	createdSchemas := map[string]bool{}
 	for _, ref := range combined {
+		if requireFilterCheck[ref] && !strings.EqualFold(ref.datasetID, sessionDatasetName) {
+			if table, ok, _ := s.tables.get(projectID, ref.datasetID, ref.tableID); ok && table.RequirePartitionFilter && !queryHasPartitionFilter(queryText, table) {
+				db.Close()
+				return nil, fmt.Errorf("cannot query over table %s.%s without a filter on its partitioning column", ref.datasetID, ref.tableID)
+			}
+		}
 		var fields []tableField
 		var rows [][]string
 		found := false
