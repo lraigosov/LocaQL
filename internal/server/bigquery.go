@@ -1727,8 +1727,8 @@ func (s *Server) executeQueryStatement(projectID, sessionID, queryText, callingU
 	if result, handled, err := s.executePersistentSQLStatement(projectID, trimmed, sess, paramMode, params); handled {
 		return result, err
 	}
-	schema, rows, err := s.executeRealSQLQueryWithParams(projectID, trimmed, sess, paramMode, params)
-	return persistentSQLResult{schema: schema, rows: rows, statementType: "SELECT"}, err
+	schema, rows, processedBytes, err := s.executeRealSQLQueryVisitingWithParamsAndStats(projectID, trimmed, map[string]bool{}, sess, paramMode, params)
+	return persistentSQLResult{schema: schema, rows: rows, statementType: "SELECT", processedBytes: processedBytes}, err
 }
 
 // flatSchemaToTableFields converts an INFORMATION_SCHEMA builder's flat
@@ -2498,7 +2498,7 @@ func (s *Server) executeQueryJob(job *jobRecord) (jobStatistics, error) {
 	if err != nil {
 		return jobStatistics{Executor: "query", Simulated: false}, err
 	}
-	return jobStatistics{Executor: "query", Simulated: false, TotalSlotMs: 60, ProcessedBytes: estimateRowsByteSize(result.rows), OutputRows: int64(len(result.rows)), StatementType: result.statementType, DMLAffectedRows: result.dmlAffectedRows, ResultSchema: result.schema, ResultRows: result.rows}, nil
+	return jobStatistics{Executor: "query", Simulated: false, TotalSlotMs: 60, ProcessedBytes: result.processedBytes, OutputRows: int64(len(result.rows)), StatementType: result.statementType, DMLAffectedRows: result.dmlAffectedRows, ResultSchema: result.schema, ResultRows: result.rows}, nil
 }
 
 func estimateRowsByteSize(rows [][]string) int64 {

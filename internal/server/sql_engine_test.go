@@ -147,6 +147,83 @@ func TestRealSQLEngineJoinAcrossTables(t *testing.T) {
 	}
 }
 
+func TestReferencedTablesUsesCompleteAST(t *testing.T) {
+	query := `
+		WITH left_rows AS (
+			SELECT customer_id FROM p1.analytics.engine_customers
+		), right_rows AS (
+			SELECT customer_id FROM ` + "`p1.analytics.engine_purchases`" + `
+		)
+		SELECT 'FROM p1.analytics.not_a_table' AS literal_value
+		FROM left_rows l, right_rows r
+		WHERE l.customer_id = r.customer_id`
+
+	refs, err := referencedTablesFromAST(query, "p1")
+	if err != nil {
+		t.Fatalf("parse table references from AST: %v", err)
+	}
+	want := map[datasetTableRef]bool{
+		{datasetID: "analytics", tableID: "engine_customers"}: true,
+		{datasetID: "analytics", tableID: "engine_purchases"}: true,
+	}
+	if len(refs) != len(want) {
+		t.Fatalf("expected exactly %d physical table references, got %d: %#v", len(want), len(refs), refs)
+	}
+	for _, ref := range refs {
+		if !want[ref] {
+			t.Fatalf("unexpected AST table reference: %#v", ref)
+		}
+	}
+}
+
+func TestRealSQLEngineCommaJoinMaterializesEveryTable(t *testing.T) {
+	s := newTestServer()
+	loadCSVTable(t, s, "analytics", "engine_comma_left",
+		[]map[string]any{{"name": "id", "type": "INT64"}, {"name": "left_value", "type": "STRING"}},
+		"id,left_value\n1,left-one\n2,left-two\n")
+	loadCSVTable(t, s, "analytics", "engine_comma_right",
+		[]map[string]any{{"name": "id", "type": "INT64"}, {"name": "right_value", "type": "STRING"}},
+		"id,right_value\n1,right-one\n3,right-three\n")
+
+	code, out := syncQuery(t, s, `
+		SELECT l.left_value, r.right_value
+		FROM p1.analytics.engine_comma_left AS l, p1.analytics.engine_comma_right AS r
+		WHERE l.id = r.id`)
+	if code != http.StatusOK {
+		t.Fatalf("expected 200 for comma join, got %d: %v", code, out)
+	}
+	rows, _ := out["rows"].([]any)
+	if len(rows) != 1 {
+		t.Fatalf("expected one matching comma-join row, got %d: %v", len(rows), rows)
+	}
+	if got := cellsOf(t, out, 0); got[0] != "left-one" || got[1] != "right-one" {
+		t.Fatalf("expected [left-one right-one], got %v", got)
+	}
+}
+
+func TestQueryProcessedBytesMeasureSourcesNotResult(t *testing.T) {
+	s := newTestServer()
+	loadCSVTable(t, s, "analytics", "engine_scan_bytes",
+		[]map[string]any{{"name": "id", "type": "INT64"}, {"name": "payload", "type": "STRING"}},
+		"id,payload\n1,large-payload-one\n2,large-payload-two\n3,large-payload-three\n")
+
+	result, err := s.executeQueryStatement("p1", "", "SELECT COUNT(*) AS n FROM p1.analytics.engine_scan_bytes", "", "", nil)
+	if err != nil {
+		t.Fatalf("execute aggregate query: %v", err)
+	}
+	table, ok, _ := s.tables.get("p1", "analytics", "engine_scan_bytes")
+	if !ok {
+		t.Fatal("expected source table in catalog")
+	}
+	want := estimateRowsByteSize(table.Rows)
+	if result.processedBytes != want {
+		t.Fatalf("expected %d bytes from all source rows, got %d", want, result.processedBytes)
+	}
+	if result.processedBytes == estimateRowsByteSize(result.rows) {
+		t.Fatalf("processed bytes must not be derived from the aggregate result row: %v", result.rows)
+	}
+}
+
 func TestRealSQLEngineLimit(t *testing.T) {
 	s := newTestServer()
 	loadCSVTable(t, s, "analytics", "engine_limit_rows",

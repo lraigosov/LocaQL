@@ -642,17 +642,10 @@ func formatTimePartitionID(value time.Time, partitionType string) string {
 var whereClausePattern = regexp.MustCompile(`(?is)\bWHERE\b(.*?)(?:\bGROUP\s+BY\b|\bORDER\s+BY\b|\bHAVING\b|\bQUALIFY\b|\bLIMIT\b|$)`)
 
 func queryHasPartitionFilter(queryText string, table *tableRecord) bool {
-	columns := []string{}
-	if table.TimePartitioning != nil {
-		if table.TimePartitioning.Field != "" {
-			columns = append(columns, table.TimePartitioning.Field)
-		} else {
-			columns = append(columns, "_PARTITIONTIME", "_PARTITIONDATE")
-		}
+	if found, err := queryHasPartitionFilterAST(queryText, table); err == nil {
+		return found
 	}
-	if table.RangePartitioning != nil {
-		columns = append(columns, table.RangePartitioning.Field)
-	}
+	columns := partitionFilterColumns(table)
 	for _, match := range whereClausePattern.FindAllStringSubmatch(queryText, -1) {
 		if len(match) < 2 {
 			continue
