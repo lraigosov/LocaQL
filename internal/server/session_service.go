@@ -15,7 +15,7 @@ import (
 // sessionDatasetName is the special dataset name a query uses to reference a
 // session-scoped temporary table, e.g. `_SESSION.my_temp_table` — mirrors
 // real BigQuery's session anonymous dataset name. Only this qualified form
-// is supported (see referencedTables/tableRefPattern in sql_engine.go, which
+// is supported (see the AST table-path extraction in sql_engine.go, which
 // requires a dot-qualified reference); an unqualified bare name is not
 // resolved against the session, a narrower scope than real BigQuery.
 const sessionDatasetName = "_SESSION"

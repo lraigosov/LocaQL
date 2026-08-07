@@ -28,6 +28,7 @@ This repository currently implements incremental scope from the master plan:
 - [Load Jobs: Real Row Ingestion (NDJSON / CSV / Avro / Parquet)](#load-jobs-real-row-ingestion-ndjson--csv--avro--parquet)
 - [Extract Jobs: Real Table Export (NDJSON / CSV / Avro / Parquet)](#extract-jobs-real-table-export-ndjson--csv--avro--parquet)
 - [Nested Schemas: STRUCT/RECORD and ARRAY/REPEATED](#nested-schemas-structrecord-and-arrayrepeated)
+- [Partitioning and Clustering](#partitioning-and-clustering)
 - [Dataset Lifecycle: Delete Contents and Undelete](#dataset-lifecycle-delete-contents-and-undelete)
 - [Table Expiration: defaultTableExpirationMs Enforcement](#table-expiration-defaulttableexpirationms-enforcement)
 - [Routines and Models: Metadata CRUD](#routines-and-models-metadata-crud)
@@ -143,14 +144,14 @@ flowchart LR
 
 `jobs.insert` (async query jobs), `jobs.query` (sync) and `projects.queries` execute query text against a real GoogleSQL engine: [`github.com/goccy/googlesqlite`](https://github.com/goccy/googlesqlite), a pure-Go `database/sql` driver (no cgo) that parses and analyzes GoogleSQL — the dialect BigQuery and Cloud Spanner use — and executes it against an in-memory SQLite backend. This replaced an earlier regex-based simulator that only matched a handful of query shapes and returned fabricated placeholder rows for anything else (see [`KNOWN-DIVERGENCES.md`](KNOWN-DIVERGENCES.md) for that history).
 
-For every query, LocaQL scans the query text for `FROM`/`JOIN` table references, materializes exactly those tables into a fresh in-memory engine instance (one SQL schema per dataset, real rows converted from LocaQL's stored string-per-cell representation into typed values), then runs the query for real. This means `WHERE`, column projection, `JOIN`, aggregate functions with `GROUP BY`, `ORDER BY` and `LIMIT` are genuine GoogleSQL semantics now, not simulated.
+For every valid query, LocaQL parses the complete GoogleSQL AST and walks every table-path node, including CTE bodies, nested subqueries and comma-separated joins. It materializes exactly those physical tables into a fresh in-memory engine instance (one SQL schema per dataset, real rows converted from LocaQL's stored string-per-cell representation into typed values), then runs the query for real. If the parser rejects a statement, a narrow `FROM`/`JOIN` fallback still loads likely sources so the embedded engine remains authoritative for the final syntax error or any syntax it accepts ahead of the parser wrapper. This means `WHERE`, column projection, `JOIN`, aggregate functions with `GROUP BY`, `ORDER BY` and `LIMIT` are genuine GoogleSQL semantics now, not simulated.
 
 Core scalar types execute with real GoogleSQL semantics too: `NUMERIC`/`BIGNUMERIC` are real decimal types in the engine (exact precision and arithmetic — `0.1 + 0.2` is exactly `0.3`, not `FLOAT64`'s binary rounding error), and `DATE`/`DATETIME`/`TIME`/`TIMESTAMP` round-trip unchanged through `tabledata.list` and compare correctly column-to-column through the engine. Constructing a `DATE` from a string (`DATE 'YYYY-MM-DD'` literal syntax or `CAST(string AS DATE)`) used to be off by one day on a host machine configured with a negative UTC offset — root-caused in Sesión 85 to the process's ambient local timezone, not a fixed engine defect, and fixed by forcing `time.Local = time.UTC` at startup (see [`KNOWN-DIVERGENCES.md`](KNOWN-DIVERGENCES.md) for the full story).
 
 ```mermaid
 flowchart LR
-	Query["Query text (jobs.insert / jobs.query / projects.queries)"] --> Scan["Scan FROM/JOIN for dataset.table refs"]
-	Scan --> Materialize["Materialize each referenced table into a fresh in-memory engine"]
+	Query["Query text (jobs.insert / jobs.query / projects.queries)"] --> AST["Parse and walk complete GoogleSQL AST table paths"]
+	AST --> Materialize["Materialize each referenced table into a fresh in-memory engine"]
 	Materialize --> Engine["goccy/googlesqlite: real GoogleSQL parse + execute"]
 	Engine --> Convert["Convert results back to REST string-per-cell rows"]
 	Query -->|"INFORMATION_SCHEMA.X"| InfoSchema["Dedicated catalog builders (unaffected)"]
@@ -162,7 +163,7 @@ Known scope, declared explicitly:
 - Nested `STRUCT`/`ARRAY` result columns execute correctly and get a real BigQuery-shaped `RECORD`/`REPEATED` schema entry and REST cell shape (see [Nested Schemas](#nested-schemas-structrecord-and-arrayrepeated)).
 - Single-statement base-table DDL/DML is routed through the real engine and committed atomically to the catalog; see [Persistent DDL and DML](#persistent-ddl-and-dml). Multi-statement scripts and base-table DML inside a session transaction remain explicitly bounded.
 - `INFORMATION_SCHEMA.X` queries are still handled by LocaQL's own dedicated builders (see the [Current Scope Matrix](#current-scope-matrix)), since those reflect LocaQL's catalog metadata rather than user table data.
-- `totalSlotMs` and dry-run byte estimates remain synthetic, as already declared — there is no query-plan/cost estimation.
+- Completed query jobs report logical `totalBytesProcessed` from the catalog/session source rows actually materialized, rather than from the result rows. `totalSlotMs` and dry-run estimates remain synthetic, and there is no column/partition pruning or query-plan cost model yet.
 
 ```bash
 curl -X POST http://localhost:9050/bigquery/v2/projects/p1/queries \
@@ -485,7 +486,7 @@ LocaQL persists and validates BigQuery's REST table settings instead of acceptin
 - `INFORMATION_SCHEMA.PARTITIONS` returns real per-partition row counts (`YYYYMMDD`, `YYYYMMDDHH`, `YYYYMM`, `YYYY`, integer bucket starts, `__NULL__` and `__UNPARTITIONED__`). Unpartitioned tables correctly expose a `NULL` `partition_id`. `COLUMNS` adds `is_partitioning_column`/`clustering_ordinal_position`; `TABLE_OPTIONS` exposes `require_partition_filter`/`partition_expiration_days`.
 - `requirePartitionFilter=true` is enforced for column, integer-range and ingestion-time partitioned tables before query materialization. A query without a `WHERE` predicate naming the partition column or `_PARTITIONTIME`/`_PARTITIONDATE` fails explicitly.
 
-The pseudocolumn implementation uses engine-only columns during isolated query execution and removes them before REST results or catalog commits; public schemas never contain the internal names. The REST TIMESTAMP wire value is emitted as Unix epoch microseconds, so official clients receive timezone-aware datetime objects. This remains functional query/lifecycle behavior, not a distributed storage optimizer: LocaQL does not claim physical partition pruning, reduced bytes scanned, clustering-based ordering/performance or a BigQuery cost model. Filter eligibility and direct-pseudocolumn projection detection are currently conservative SQL-text analysis rather than a full AST; complex nested wildcard/projection forms remain part of the AST migration. Partitioned-table creation currently uses the REST API/official clients; GoogleSQL `CREATE TABLE ... PARTITION BY ... CLUSTER BY ...` is not part of the persistent DDL subset.
+The pseudocolumn implementation uses engine-only columns during isolated query execution and removes them before REST results or catalog commits; public schemas never contain the internal names. The REST TIMESTAMP wire value is emitted as Unix epoch microseconds, so official clients receive timezone-aware datetime objects. This remains functional query/lifecycle behavior, not a distributed storage optimizer: LocaQL does not claim physical partition pruning, reduced bytes scanned, clustering-based ordering/performance or a BigQuery cost model. Physical table discovery now uses the complete GoogleSQL AST, but partition-filter eligibility and direct-pseudocolumn projection detection remain conservative SQL-text analysis; complex nested wildcard/projection forms still require AST-based semantic analysis. Partitioned-table creation currently uses the REST API/official clients; GoogleSQL `CREATE TABLE ... PARTITION BY ... CLUSTER BY ...` is not part of the persistent DDL subset.
 
 ## Dataset Lifecycle: Delete Contents and Undelete
 

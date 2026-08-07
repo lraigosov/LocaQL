@@ -29,6 +29,7 @@ type persistentSQLResult struct {
 	rows            [][]string
 	statementType   string
 	dmlAffectedRows int64
+	processedBytes  int64
 }
 
 const persistentTargetExpression = "`?([A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+){1,2})`?"
@@ -196,7 +197,7 @@ func (s *Server) executePersistentSQLStatement(projectID, queryText string, sess
 	}
 
 	ref := datasetTableRef{datasetID: stmt.target.DatasetID, tableID: stmt.target.TableID}
-	db, err := s.openMaterializedSQLDatabase(projectID, queryText, map[string]bool{}, sess, []datasetTableRef{ref})
+	db, processedBytes, err := s.openMaterializedSQLDatabase(projectID, queryText, map[string]bool{}, sess, []datasetTableRef{ref})
 	if err != nil {
 		return persistentSQLResult{}, true, err
 	}
@@ -250,7 +251,7 @@ func (s *Server) executePersistentSQLStatement(projectID, queryText string, sess
 			return persistentSQLResult{}, true, fmt.Errorf("table %s.%s was created concurrently; retry the statement", stmt.target.DatasetID, stmt.target.TableID)
 		}
 	}
-	return persistentSQLResult{schema: []tableField{}, rows: [][]string{}, statementType: stmt.statementType, dmlAffectedRows: affectedRows}, true, nil
+	return persistentSQLResult{schema: []tableField{}, rows: [][]string{}, statementType: stmt.statementType, dmlAffectedRows: affectedRows, processedBytes: processedBytes}, true, nil
 }
 
 func readEngineTable(db *sql.DB, datasetID, tableID string, timePartitioning *timePartitioningConfig, now time.Time) ([]tableField, [][]string, []string, error) {
