@@ -4,6 +4,14 @@ All notable user-facing changes to LocaQL are documented here, in the style of [
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-08-07
+
+### Added
+- Query table discovery now walks the complete GoogleSQL AST, covering CTE bodies, nested subqueries, quoted paths and comma-separated joins without treating table-like text in literals/comments as sources. Completed query jobs derive `totalBytesProcessed` from logical source rows instead of output rows; read-only equality predicates can now prune a proven time/ingestion partition or integer-range bucket before materialization. Ambiguous predicates and DDL/DML retain full scans; physical column cost and dry-run estimation remain explicit limits.
+
+### Fixed
+- The default branch contained the literal placeholder `$fundingContent` in `.github/FUNDING.yml`, so GitHub's "Sponsor this project" section could not resolve the configured account. The funding declaration now uses the canonical `github: lraigosov` form and will reach `main` through the normal promotion flow.
+
 ## [0.10.0] - 2026-08-07
 
 ### Added

@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	googlesql "github.com/goccy/go-googlesql"
 	_ "github.com/goccy/googlesqlite"
 )
 
@@ -231,45 +232,140 @@ func exprForDecodedValue(field tableField, decoded any) (string, []any, error) {
 	return "CAST(? AS " + sqliteColumnType(tableField{Type: field.Type}) + ")", []any{v}, nil
 }
 
-// tableRefPattern finds dotted table references following FROM/JOIN/USING, with
-// 2 parts (dataset.table) or 3 (project.dataset.table), optionally wrapped
-// in a single pair of backticks around the whole reference.
-var tableRefPattern = regexp.MustCompile("(?i)\\b(?:FROM|JOIN|USING)\\s+`?([A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+){1,2})`?")
+// legacyTableRefPattern is only a compatibility fallback when go-googlesql
+// cannot parse a statement. Valid GoogleSQL uses the AST traversal below, so
+// comma joins, nested subqueries and CTE bodies are discovered without
+// matching table-like text inside comments, literals or USING column lists.
+var legacyTableRefPattern = regexp.MustCompile("(?i)\\b(?:FROM|JOIN)\\s+`?([A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+){1,2})`?")
 
 type datasetTableRef struct {
 	datasetID string
 	tableID   string
 }
 
-// referencedTables extracts every dataset.table pair a query text mentions
-// after FROM/JOIN. A 3-part reference is only kept when its leading
-// component matches projectID (case-insensitive); other projects are not
-// materialized, so a genuine cross-project reference fails naturally with
-// "table not found" from the real engine rather than silently resolving
-// against the wrong project.
+// referencedTables extracts every real table path from the parsed statement's
+// complete AST. A 3-part reference is only kept when its leading component
+// matches projectID (case-insensitive); other projects are not materialized,
+// so a genuine cross-project reference fails naturally with "table not found"
+// from the real engine rather than silently resolving against the wrong
+// project. A parser failure retains the legacy regex behavior so the embedded
+// engine, rather than table discovery, remains authoritative for the final SQL
+// error and for syntax accepted by googlesqlite ahead of this parser wrapper.
 func referencedTables(queryText, projectID string) []datasetTableRef {
+	refs, err := referencedTablesFromAST(queryText, projectID)
+	if err == nil {
+		return refs
+	}
+	return referencedTablesLegacy(queryText, projectID)
+}
+
+func referencedTablesFromAST(queryText, projectID string) ([]datasetTableRef, error) {
+	statement, err := parseGoogleSQLStatement(queryText)
+	if err != nil {
+		return nil, err
+	}
+
 	seen := map[datasetTableRef]bool{}
 	var refs []datasetTableRef
-	for _, m := range tableRefPattern.FindAllStringSubmatch(queryText, -1) {
-		parts := strings.Split(m[1], ".")
-		var ref datasetTableRef
-		switch len(parts) {
-		case 2:
-			ref = datasetTableRef{datasetID: parts[0], tableID: parts[1]}
-		case 3:
-			if !strings.EqualFold(parts[0], projectID) {
-				continue
+	err = walkGoogleSQLAST(statement, func(node googlesql.ASTNode) error {
+		if tablePath, ok := node.(*googlesql.ASTTablePathExpression); ok {
+			path, pathErr := tablePath.PathExpr()
+			if pathErr != nil {
+				return pathErr
 			}
-			ref = datasetTableRef{datasetID: parts[1], tableID: parts[2]}
-		default:
-			continue
+			if path != nil {
+				parts, vectorErr := path.ToIdentifierVector()
+				if vectorErr != nil {
+					return vectorErr
+				}
+				appendDatasetTableRef(parts, projectID, seen, &refs)
+			}
 		}
-		if !seen[ref] {
-			seen[ref] = true
-			refs = append(refs, ref)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return refs, nil
+}
+
+func parseGoogleSQLStatement(queryText string) (googlesql.ASTStatementNode, error) {
+	// The database/sql driver initializes this same global runtime lazily on
+	// its first connection. AST discovery runs before that connection exists,
+	// so initialize it here as well; Init is explicitly sync.Once-backed and
+	// safe to call repeatedly and concurrently.
+	if err := googlesql.Init(); err != nil {
+		return nil, err
+	}
+	opts, err := googlesql.NewParserOptions()
+	if err != nil {
+		return nil, err
+	}
+	parsed, err := googlesql.ParseStatement(queryText, opts)
+	if err != nil {
+		return nil, err
+	}
+	return parsed.Statement()
+}
+
+func walkGoogleSQLAST(root googlesql.ASTNode, visit func(googlesql.ASTNode) error) error {
+	var walk func(googlesql.ASTNode) error
+	walk = func(node googlesql.ASTNode) error {
+		if err := visit(node); err != nil {
+			return err
 		}
+		children, childErr := node.NumChildren()
+		if childErr != nil {
+			return childErr
+		}
+		for i := int32(0); i < children; i++ {
+			child, err := node.Child(i)
+			if err != nil {
+				return err
+			}
+			if child != nil {
+				if err := walk(child); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	return walk(root)
+}
+
+func referencedTablesLegacy(queryText, projectID string) []datasetTableRef {
+	seen := map[datasetTableRef]bool{}
+	var refs []datasetTableRef
+	for _, m := range legacyTableRefPattern.FindAllStringSubmatch(queryText, -1) {
+		appendDatasetTableRef(strings.Split(m[1], "."), projectID, seen, &refs)
 	}
 	return refs
+}
+
+func appendDatasetTableRef(parts []string, projectID string, seen map[datasetTableRef]bool, refs *[]datasetTableRef) {
+	// BigQuery's canonical quoted spelling (`project.dataset.table`) is
+	// represented by this parser version as one identifier containing dots,
+	// while the unquoted spelling is represented as three identifiers.
+	if len(parts) == 1 && strings.Contains(parts[0], ".") {
+		parts = strings.Split(parts[0], ".")
+	}
+	var ref datasetTableRef
+	switch len(parts) {
+	case 2:
+		ref = datasetTableRef{datasetID: parts[0], tableID: parts[1]}
+	case 3:
+		if !strings.EqualFold(parts[0], projectID) {
+			return
+		}
+		ref = datasetTableRef{datasetID: parts[1], tableID: parts[2]}
+	default:
+		return
+	}
+	if !seen[ref] {
+		seen[ref] = true
+		*refs = append(*refs, ref)
+	}
 }
 
 // stripProjectPrefix rewrites project.dataset.table references (bare or
@@ -372,38 +468,51 @@ func (s *Server) executeRealSQLQueryVisiting(projectID, queryText string, visiti
 // temp-table resolution) has no client-supplied parameters and goes through
 // executeRealSQLQueryVisiting/executeRealSQLQuery with none.
 func (s *Server) executeRealSQLQueryVisitingWithParams(projectID, queryText string, visiting map[string]bool, sess *sessionRecord, paramMode string, params []storedQueryParameter) ([]tableField, [][]string, error) {
-	db, err := s.openMaterializedSQLDatabase(projectID, queryText, visiting, sess, nil)
+	schema, rows, _, err := s.executeRealSQLQueryVisitingWithParamsAndStats(projectID, queryText, visiting, sess, paramMode, params)
+	return schema, rows, err
+}
+
+// executeRealSQLQueryVisitingWithParamsAndStats additionally reports the
+// logical bytes read from catalog/session source rows. This is deliberately
+// separate from output row bytes: SELECT COUNT(*) over a large table scans the
+// table even though its result is tiny. Proven equality predicates can prune
+// logical partitions; physical column pruning and billing parity remain out of
+// scope for this metric.
+func (s *Server) executeRealSQLQueryVisitingWithParamsAndStats(projectID, queryText string, visiting map[string]bool, sess *sessionRecord, paramMode string, params []storedQueryParameter) ([]tableField, [][]string, int64, error) {
+	db, processedBytes, err := s.openMaterializedSQLDatabase(projectID, queryText, visiting, sess, nil, true)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, 0, err
 	}
 	defer db.Close()
 
 	args, err := buildQueryArgs(paramMode, params)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, 0, err
 	}
 	engineQuery := rewriteIngestionPseudocolumns(stripProjectPrefix(queryText, projectID))
 	rows, err := db.Query(engineQuery, args...)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, 0, err
 	}
 	defer rows.Close()
 	schema, resultRows, err := scanRealSQLRows(rows)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, 0, err
 	}
-	return hideWildcardIngestionPseudocolumns(queryText, schema, resultRows)
+	schema, resultRows, err = hideWildcardIngestionPseudocolumns(queryText, schema, resultRows)
+	return schema, resultRows, processedBytes, err
 }
 
 // openMaterializedSQLDatabase builds the isolated GoogleSQL database used by
 // both read-only queries and persistent DDL/DML. extraRefs is primarily the
 // mutation target: INSERT/UPDATE/MERGE targets do not necessarily occur after
 // FROM/JOIN, while a CREATE TABLE target needs its dataset schema created even
-// though the table does not exist yet.
-func (s *Server) openMaterializedSQLDatabase(projectID, queryText string, visiting map[string]bool, sess *sessionRecord, extraRefs []datasetTableRef) (*sql.DB, error) {
+// though the table does not exist yet. allowPartitionPruning must remain false
+// for persistent mutations so their materialized source cannot be narrowed.
+func (s *Server) openMaterializedSQLDatabase(projectID, queryText string, visiting map[string]bool, sess *sessionRecord, extraRefs []datasetTableRef, allowPartitionPruning bool) (*sql.DB, int64, error) {
 	db, err := sql.Open("googlesqlite", ":memory:")
 	if err != nil {
-		return nil, fmt.Errorf("open real SQL engine: %w", err)
+		return nil, 0, fmt.Errorf("open real SQL engine: %w", err)
 	}
 
 	refs := referencedTables(queryText, projectID)
@@ -427,6 +536,7 @@ func (s *Server) openMaterializedSQLDatabase(projectID, queryText string, visiti
 		combined = append(combined, ref)
 	}
 	createdSchemas := map[string]bool{}
+	var processedBytes int64
 	for _, ref := range combined {
 		var catalogTable *tableRecord
 		if requireFilterCheck[ref] && !strings.EqualFold(ref.datasetID, sessionDatasetName) {
@@ -434,7 +544,7 @@ func (s *Server) openMaterializedSQLDatabase(projectID, queryText string, visiti
 				catalogTable = table
 				if table.RequirePartitionFilter && !queryHasPartitionFilter(queryText, table) {
 					db.Close()
-					return nil, fmt.Errorf("cannot query over table %s.%s without a filter on its partitioning column", ref.datasetID, ref.tableID)
+					return nil, 0, fmt.Errorf("cannot query over table %s.%s without a filter on its partitioning column", ref.datasetID, ref.tableID)
 				}
 			}
 		}
@@ -456,27 +566,38 @@ func (s *Server) openMaterializedSQLDatabase(projectID, queryText string, visiti
 			fields, rows, ok, err = s.resolveTableRowsVisiting(projectID, ref.datasetID, ref.tableID, visiting)
 			if err != nil {
 				db.Close()
-				return nil, err
+				return nil, 0, err
 			}
 			found = ok
 		}
 		if !createdSchemas[ref.datasetID] {
 			if _, err := db.Exec("CREATE SCHEMA " + quoteIdent(ref.datasetID)); err != nil {
 				db.Close()
-				return nil, fmt.Errorf("materialize dataset %s: %w", ref.datasetID, err)
+				return nil, 0, fmt.Errorf("materialize dataset %s: %w", ref.datasetID, err)
 			}
 			createdSchemas[ref.datasetID] = true
 		}
 		if !found {
 			continue
 		}
+		if allowPartitionPruning && catalogTable != nil && len(refs) == 1 {
+			if prunedRows, prunedPartitions, pruned := prunePartitionedRows(queryText, projectID, ref, catalogTable, rows); pruned {
+				rows = prunedRows
+				if catalogTable.TimePartitioning != nil && catalogTable.TimePartitioning.Field == "" {
+					materializedTable := *catalogTable
+					materializedTable.IngestionPartitions = prunedPartitions
+					catalogTable = &materializedTable
+				}
+			}
+		}
+		processedBytes += estimateRowsByteSize(rows)
 		fields, rows = materializeIngestionPseudocolumns(catalogTable, fields, rows)
 		if err := materializeTable(db, ref.datasetID, ref.tableID, fields, rows); err != nil {
 			db.Close()
-			return nil, fmt.Errorf("materialize table %s.%s: %w", ref.datasetID, ref.tableID, err)
+			return nil, 0, fmt.Errorf("materialize table %s.%s: %w", ref.datasetID, ref.tableID, err)
 		}
 	}
-	return db, nil
+	return db, processedBytes, nil
 }
 
 // rewriteIngestionPseudocolumns replaces public pseudocolumn identifiers only
