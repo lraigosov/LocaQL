@@ -4,6 +4,8 @@ All notable user-facing changes to LocaQL are documented here, in the style of [
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-08-07
+
 ### Added
 - BigQuery table partitioning and clustering through REST and the official Python client: time-unit/ingestion-time and integer-range definitions, ordered clustering fields, mutable partition expiration, lazy expired-row removal, required partition filters for every partitioning mode, real `INFORMATION_SCHEMA.PARTITIONS`/`COLUMNS`/`TABLE_OPTIONS` metadata, and executable read-only `_PARTITIONTIME`/`_PARTITIONDATE` pseudocolumns hidden from `SELECT *` and preserved across persistent DML. Physical pruning, SQL `PARTITION BY` DDL and the clustering optimizer remain explicit limits.
 - Persistent single-statement GoogleSQL DDL/DML for query jobs: `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `TRUNCATE TABLE`, `CREATE [OR REPLACE] TABLE [AS SELECT]` and `DROP TABLE`, with target-table serialization, optimistic catalog version checks, statement atomicity, query parameters, BigQuery-shaped DML statistics, and a pinned `google-cloud-bigquery 3.42.3` CI smoke.
