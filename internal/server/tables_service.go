@@ -438,7 +438,7 @@ func (s *tableService) getData(projectID, datasetID, tableID string) ([]tableFie
 // The compare-and-swap closes the race with direct REST writes that are not
 // scheduled as jobs. Views and external tables are deliberately immutable via
 // DML: materializing either into an ordinary table would destroy its identity.
-func (s *tableService) replaceRowsIfVersion(projectID, datasetID, tableID string, expectedVersion int, rows [][]string) error {
+func (s *tableService) replaceRowsIfVersion(projectID, datasetID, tableID string, expectedVersion int, rows [][]string, ingestionPartitions []string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -463,7 +463,16 @@ func (s *tableService) replaceRowsIfVersion(projectID, datasetID, tableID string
 		return err
 	}
 	currentPartition := ingestionPartitionID(t.TimePartitioning, s.now().UTC())
-	t.IngestionPartitions = reconcileIngestionPartitions(t.Rows, rows, t.IngestionPartitions, currentPartition)
+	if currentPartition != "" && len(ingestionPartitions) == len(rows) {
+		t.IngestionPartitions = cloneStrings(ingestionPartitions)
+		for i := range t.IngestionPartitions {
+			if t.IngestionPartitions[i] == "" {
+				t.IngestionPartitions[i] = currentPartition
+			}
+		}
+	} else {
+		t.IngestionPartitions = reconcileIngestionPartitions(t.Rows, rows, t.IngestionPartitions, currentPartition)
+	}
 	t.Rows = cloneTableRows(rows)
 	t.UpdatedAt = s.now().UTC()
 	t.Version++

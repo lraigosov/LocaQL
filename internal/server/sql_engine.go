@@ -382,12 +382,17 @@ func (s *Server) executeRealSQLQueryVisitingWithParams(projectID, queryText stri
 	if err != nil {
 		return nil, nil, err
 	}
-	rows, err := db.Query(stripProjectPrefix(queryText, projectID), args...)
+	engineQuery := rewriteIngestionPseudocolumns(stripProjectPrefix(queryText, projectID))
+	rows, err := db.Query(engineQuery, args...)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer rows.Close()
-	return scanRealSQLRows(rows)
+	schema, resultRows, err := scanRealSQLRows(rows)
+	if err != nil {
+		return nil, nil, err
+	}
+	return hideWildcardIngestionPseudocolumns(queryText, schema, resultRows)
 }
 
 // openMaterializedSQLDatabase builds the isolated GoogleSQL database used by
@@ -423,10 +428,19 @@ func (s *Server) openMaterializedSQLDatabase(projectID, queryText string, visiti
 	}
 	createdSchemas := map[string]bool{}
 	for _, ref := range combined {
+		var catalogTable *tableRecord
 		if requireFilterCheck[ref] && !strings.EqualFold(ref.datasetID, sessionDatasetName) {
-			if table, ok, _ := s.tables.get(projectID, ref.datasetID, ref.tableID); ok && table.RequirePartitionFilter && !queryHasPartitionFilter(queryText, table) {
-				db.Close()
-				return nil, fmt.Errorf("cannot query over table %s.%s without a filter on its partitioning column", ref.datasetID, ref.tableID)
+			if table, ok, _ := s.tables.get(projectID, ref.datasetID, ref.tableID); ok {
+				catalogTable = table
+				if table.RequirePartitionFilter && !queryHasPartitionFilter(queryText, table) {
+					db.Close()
+					return nil, fmt.Errorf("cannot query over table %s.%s without a filter on its partitioning column", ref.datasetID, ref.tableID)
+				}
+			}
+		}
+		if catalogTable == nil && !strings.EqualFold(ref.datasetID, sessionDatasetName) {
+			if table, ok, _ := s.tables.get(projectID, ref.datasetID, ref.tableID); ok {
+				catalogTable = table
 			}
 		}
 		var fields []tableField
@@ -456,12 +470,253 @@ func (s *Server) openMaterializedSQLDatabase(projectID, queryText string, visiti
 		if !found {
 			continue
 		}
+		fields, rows = materializeIngestionPseudocolumns(catalogTable, fields, rows)
 		if err := materializeTable(db, ref.datasetID, ref.tableID, fields, rows); err != nil {
 			db.Close()
 			return nil, fmt.Errorf("materialize table %s.%s: %w", ref.datasetID, ref.tableID, err)
 		}
 	}
 	return db, nil
+}
+
+// rewriteIngestionPseudocolumns replaces public pseudocolumn identifiers only
+// in executable SQL tokens. String literals and comments are copied verbatim,
+// so a value such as '_PARTITIONDATE' does not accidentally become different
+// data. Backtick-quoted standalone pseudocolumn identifiers are supported too.
+func rewriteIngestionPseudocolumns(queryText string) string {
+	var out strings.Builder
+	out.Grow(len(queryText))
+	for i := 0; i < len(queryText); {
+		if i+1 < len(queryText) && queryText[i] == '-' && queryText[i+1] == '-' {
+			end := strings.IndexByte(queryText[i+2:], '\n')
+			if end < 0 {
+				out.WriteString(queryText[i:])
+				break
+			}
+			end += i + 3
+			out.WriteString(queryText[i:end])
+			i = end
+			continue
+		}
+		if i+1 < len(queryText) && queryText[i] == '/' && queryText[i+1] == '*' {
+			end := strings.Index(queryText[i+2:], "*/")
+			if end < 0 {
+				out.WriteString(queryText[i:])
+				break
+			}
+			end += i + 4
+			out.WriteString(queryText[i:end])
+			i = end
+			continue
+		}
+		if queryText[i] == '\'' || queryText[i] == '"' {
+			quote := queryText[i]
+			start := i
+			i++
+			for i < len(queryText) {
+				if queryText[i] == quote {
+					if i+1 < len(queryText) && queryText[i+1] == quote {
+						i += 2
+						continue
+					}
+					i++
+					break
+				}
+				i++
+			}
+			out.WriteString(queryText[start:i])
+			continue
+		}
+		if queryText[i] == '`' {
+			end := strings.IndexByte(queryText[i+1:], '`')
+			if end < 0 {
+				out.WriteString(queryText[i:])
+				break
+			}
+			end += i + 1
+			identifier := queryText[i+1 : end]
+			switch strings.ToUpper(identifier) {
+			case "_PARTITIONTIME":
+				out.WriteString(quoteIdent(ingestionPartitionTimeColumn))
+			case "_PARTITIONDATE":
+				out.WriteString(quoteIdent(ingestionPartitionDateColumn))
+			default:
+				out.WriteString(queryText[i : end+1])
+			}
+			i = end + 1
+			continue
+		}
+		if isSQLIdentifierByte(queryText[i]) {
+			start := i
+			for i < len(queryText) && isSQLIdentifierByte(queryText[i]) {
+				i++
+			}
+			token := queryText[start:i]
+			switch strings.ToUpper(token) {
+			case "_PARTITIONTIME":
+				out.WriteString(ingestionPartitionTimeColumn)
+			case "_PARTITIONDATE":
+				out.WriteString(ingestionPartitionDateColumn)
+			default:
+				out.WriteString(token)
+			}
+			continue
+		}
+		out.WriteByte(queryText[i])
+		i++
+	}
+	return out.String()
+}
+
+func isSQLIdentifierByte(b byte) bool {
+	return b == '_' || b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9'
+}
+
+// hideWildcardIngestionPseudocolumns enforces BigQuery's pseudocolumn
+// wildcard rule. The embedded engine sees physical internal columns and would
+// otherwise include them in SELECT *; direct SELECT _PARTITIONDATE/TIME
+// projections are retained and renamed to their public schema names.
+func hideWildcardIngestionPseudocolumns(queryText string, schema []tableField, rows [][]string) ([]tableField, [][]string, error) {
+	keepTime, keepDate := directPseudocolumnProjectionCounts(queryText)
+	keptIndexes := make([]int, 0, len(schema))
+	keptSchema := make([]tableField, 0, len(schema))
+	for i, field := range schema {
+		name := strings.ToLower(field.Name)
+		switch name {
+		case ingestionPartitionTimeColumn:
+			if keepTime <= 0 {
+				continue
+			}
+			keepTime--
+			field.Name = "_PARTITIONTIME"
+		case ingestionPartitionDateColumn:
+			if keepDate <= 0 {
+				continue
+			}
+			keepDate--
+			field.Name = "_PARTITIONDATE"
+		}
+		keptIndexes = append(keptIndexes, i)
+		keptSchema = append(keptSchema, field)
+	}
+	if len(keptIndexes) == len(schema) {
+		return keptSchema, rows, nil
+	}
+	keptRows := make([][]string, len(rows))
+	for rowIndex, row := range rows {
+		keptRows[rowIndex] = make([]string, 0, len(keptIndexes))
+		for _, columnIndex := range keptIndexes {
+			if columnIndex < len(row) {
+				keptRows[rowIndex] = append(keptRows[rowIndex], row[columnIndex])
+			} else {
+				keptRows[rowIndex] = append(keptRows[rowIndex], storedNullCell)
+			}
+		}
+	}
+	return keptSchema, keptRows, nil
+}
+
+var directPartitionTimeProjection = regexp.MustCompile(`(?i)^(?:` + "`?[A-Za-z_][A-Za-z0-9_]*`?\\." + `)?` + "`?_PARTITIONTIME`?" + `$`)
+var directPartitionDateProjection = regexp.MustCompile(`(?i)^(?:` + "`?[A-Za-z_][A-Za-z0-9_]*`?\\." + `)?` + "`?_PARTITIONDATE`?" + `$`)
+
+func directPseudocolumnProjectionCounts(queryText string) (timeCount, dateCount int) {
+	upper := strings.ToUpper(queryText)
+	selectAt := strings.Index(upper, "SELECT")
+	if selectAt < 0 {
+		return 0, 0
+	}
+	projectionStart := selectAt + len("SELECT")
+	fromAt := findTopLevelSQLKeyword(queryText, projectionStart, "FROM")
+	if fromAt < 0 {
+		fromAt = len(queryText)
+	}
+	projection := strings.TrimSpace(queryText[projectionStart:fromAt])
+	projection = strings.TrimSpace(strings.TrimPrefix(strings.ToUpper(projection), "DISTINCT"))
+	for _, item := range splitTopLevelSQLList(projection) {
+		item = strings.TrimSpace(item)
+		switch {
+		case directPartitionTimeProjection.MatchString(item):
+			timeCount++
+		case directPartitionDateProjection.MatchString(item):
+			dateCount++
+		}
+	}
+	return timeCount, dateCount
+}
+
+func findTopLevelSQLKeyword(sqlText string, start int, keyword string) int {
+	depth := 0
+	for i := start; i < len(sqlText); {
+		switch sqlText[i] {
+		case '\'', '"', '`':
+			quote := sqlText[i]
+			i++
+			for i < len(sqlText) {
+				if sqlText[i] == quote {
+					i++
+					if i < len(sqlText) && sqlText[i] == quote {
+						i++
+						continue
+					}
+					break
+				}
+				i++
+			}
+		case '(':
+			depth++
+			i++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+			i++
+		default:
+			if depth == 0 && isSQLIdentifierByte(sqlText[i]) {
+				tokenStart := i
+				for i < len(sqlText) && isSQLIdentifierByte(sqlText[i]) {
+					i++
+				}
+				if strings.EqualFold(sqlText[tokenStart:i], keyword) {
+					return tokenStart
+				}
+				continue
+			}
+			i++
+		}
+	}
+	return -1
+}
+
+func splitTopLevelSQLList(value string) []string {
+	var result []string
+	start, depth := 0, 0
+	for i := 0; i < len(value); i++ {
+		switch value[i] {
+		case '\'', '"', '`':
+			quote := value[i]
+			for i++; i < len(value); i++ {
+				if value[i] == quote {
+					if i+1 < len(value) && value[i+1] == quote {
+						i++
+						continue
+					}
+					break
+				}
+			}
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		case ',':
+			if depth == 0 {
+				result = append(result, value[start:i])
+				start = i + 1
+			}
+		}
+	}
+	return append(result, value[start:])
 }
 
 func materializeTable(db *sql.DB, datasetID, tableID string, fields []tableField, rows [][]string) error {

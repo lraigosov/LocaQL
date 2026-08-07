@@ -5,7 +5,7 @@ on:
     tags:
       - 'v*'
   # Lets auto-tag-release.yml invoke this deterministically after merging a
-  # release PR: a tag pushed with the default GITHUB_TOKEN does NOT trigger
+  # dev -> main PR: a tag pushed with the default GITHUB_TOKEN does NOT trigger
   # other workflow runs (a documented GitHub Actions anti-recursion rule), so
   # relying on `push: tags` alone would silently never fire in that path.
   workflow_call:
@@ -114,12 +114,19 @@ jobs:
             name="${platform_dir%/}"
             tar czf "../locaql-${TAG}-${name}.tar.gz" -C "$name" .
           done
-      - name: Create GitHub Release with binaries and SBOM attached
+      - name: Create or refresh GitHub Release with binaries and SBOM attached
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "${TAG}" \
-            --title "${TAG}" \
-            --generate-notes \
-            locaql-${TAG}-*.tar.gz \
-            dist/sbom.json
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" \
+              --clobber \
+              locaql-${TAG}-*.tar.gz \
+              dist/sbom.json
+          else
+            gh release create "${TAG}" \
+              --title "${TAG}" \
+              --generate-notes \
+              locaql-${TAG}-*.tar.gz \
+              dist/sbom.json
+          fi
