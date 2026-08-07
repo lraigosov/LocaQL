@@ -260,6 +260,36 @@ func referencedTables(queryText, projectID string) []datasetTableRef {
 }
 
 func referencedTablesFromAST(queryText, projectID string) ([]datasetTableRef, error) {
+	statement, err := parseGoogleSQLStatement(queryText)
+	if err != nil {
+		return nil, err
+	}
+
+	seen := map[datasetTableRef]bool{}
+	var refs []datasetTableRef
+	err = walkGoogleSQLAST(statement, func(node googlesql.ASTNode) error {
+		if tablePath, ok := node.(*googlesql.ASTTablePathExpression); ok {
+			path, pathErr := tablePath.PathExpr()
+			if pathErr != nil {
+				return pathErr
+			}
+			if path != nil {
+				parts, vectorErr := path.ToIdentifierVector()
+				if vectorErr != nil {
+					return vectorErr
+				}
+				appendDatasetTableRef(parts, projectID, seen, &refs)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return refs, nil
+}
+
+func parseGoogleSQLStatement(queryText string) (googlesql.ASTStatementNode, error) {
 	// The database/sql driver initializes this same global runtime lazily on
 	// its first connection. AST discovery runs before that connection exists,
 	// so initialize it here as well; Init is explicitly sync.Once-backed and
@@ -275,27 +305,14 @@ func referencedTablesFromAST(queryText, projectID string) ([]datasetTableRef, er
 	if err != nil {
 		return nil, err
 	}
-	statement, err := parsed.Statement()
-	if err != nil {
-		return nil, err
-	}
+	return parsed.Statement()
+}
 
-	seen := map[datasetTableRef]bool{}
-	var refs []datasetTableRef
-	var visit func(googlesql.ASTNode) error
-	visit = func(node googlesql.ASTNode) error {
-		if tablePath, ok := node.(*googlesql.ASTTablePathExpression); ok {
-			path, pathErr := tablePath.PathExpr()
-			if pathErr != nil {
-				return pathErr
-			}
-			if path != nil {
-				parts, vectorErr := path.ToIdentifierVector()
-				if vectorErr != nil {
-					return vectorErr
-				}
-				appendDatasetTableRef(parts, projectID, seen, &refs)
-			}
+func walkGoogleSQLAST(root googlesql.ASTNode, visit func(googlesql.ASTNode) error) error {
+	var walk func(googlesql.ASTNode) error
+	walk = func(node googlesql.ASTNode) error {
+		if err := visit(node); err != nil {
+			return err
 		}
 		children, childErr := node.NumChildren()
 		if childErr != nil {
@@ -307,17 +324,14 @@ func referencedTablesFromAST(queryText, projectID string) ([]datasetTableRef, er
 				return err
 			}
 			if child != nil {
-				if err := visit(child); err != nil {
+				if err := walk(child); err != nil {
 					return err
 				}
 			}
 		}
 		return nil
 	}
-	if err := visit(statement); err != nil {
-		return nil, err
-	}
-	return refs, nil
+	return walk(root)
 }
 
 func referencedTablesLegacy(queryText, projectID string) []datasetTableRef {
@@ -461,10 +475,11 @@ func (s *Server) executeRealSQLQueryVisitingWithParams(projectID, queryText stri
 // executeRealSQLQueryVisitingWithParamsAndStats additionally reports the
 // logical bytes read from catalog/session source rows. This is deliberately
 // separate from output row bytes: SELECT COUNT(*) over a large table scans the
-// table even though its result is tiny. Physical column/partition pruning is a
-// later optimization and can reduce this value once implemented safely.
+// table even though its result is tiny. Proven equality predicates can prune
+// logical partitions; physical column pruning and billing parity remain out of
+// scope for this metric.
 func (s *Server) executeRealSQLQueryVisitingWithParamsAndStats(projectID, queryText string, visiting map[string]bool, sess *sessionRecord, paramMode string, params []storedQueryParameter) ([]tableField, [][]string, int64, error) {
-	db, processedBytes, err := s.openMaterializedSQLDatabase(projectID, queryText, visiting, sess, nil)
+	db, processedBytes, err := s.openMaterializedSQLDatabase(projectID, queryText, visiting, sess, nil, true)
 	if err != nil {
 		return nil, nil, 0, err
 	}
@@ -492,8 +507,9 @@ func (s *Server) executeRealSQLQueryVisitingWithParamsAndStats(projectID, queryT
 // both read-only queries and persistent DDL/DML. extraRefs is primarily the
 // mutation target: INSERT/UPDATE/MERGE targets do not necessarily occur after
 // FROM/JOIN, while a CREATE TABLE target needs its dataset schema created even
-// though the table does not exist yet.
-func (s *Server) openMaterializedSQLDatabase(projectID, queryText string, visiting map[string]bool, sess *sessionRecord, extraRefs []datasetTableRef) (*sql.DB, int64, error) {
+// though the table does not exist yet. allowPartitionPruning must remain false
+// for persistent mutations so their materialized source cannot be narrowed.
+func (s *Server) openMaterializedSQLDatabase(projectID, queryText string, visiting map[string]bool, sess *sessionRecord, extraRefs []datasetTableRef, allowPartitionPruning bool) (*sql.DB, int64, error) {
 	db, err := sql.Open("googlesqlite", ":memory:")
 	if err != nil {
 		return nil, 0, fmt.Errorf("open real SQL engine: %w", err)
@@ -563,6 +579,16 @@ func (s *Server) openMaterializedSQLDatabase(projectID, queryText string, visiti
 		}
 		if !found {
 			continue
+		}
+		if allowPartitionPruning && catalogTable != nil && len(refs) == 1 {
+			if prunedRows, prunedPartitions, pruned := prunePartitionedRows(queryText, projectID, ref, catalogTable, rows); pruned {
+				rows = prunedRows
+				if catalogTable.TimePartitioning != nil && catalogTable.TimePartitioning.Field == "" {
+					materializedTable := *catalogTable
+					materializedTable.IngestionPartitions = prunedPartitions
+					catalogTable = &materializedTable
+				}
+			}
 		}
 		processedBytes += estimateRowsByteSize(rows)
 		fields, rows = materializeIngestionPseudocolumns(catalogTable, fields, rows)

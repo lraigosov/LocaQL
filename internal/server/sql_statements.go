@@ -197,7 +197,7 @@ func (s *Server) executePersistentSQLStatement(projectID, queryText string, sess
 	}
 
 	ref := datasetTableRef{datasetID: stmt.target.DatasetID, tableID: stmt.target.TableID}
-	db, processedBytes, err := s.openMaterializedSQLDatabase(projectID, queryText, map[string]bool{}, sess, []datasetTableRef{ref})
+	db, processedBytes, err := s.openMaterializedSQLDatabase(projectID, queryText, map[string]bool{}, sess, []datasetTableRef{ref}, false)
 	if err != nil {
 		return persistentSQLResult{}, true, err
 	}
