@@ -1,0 +1,17 @@
+# Normalize line endings to LF in the repository regardless of a
+# contributor's local core.autocrlf setting or editor. Without this file,
+# CHANGELOG.md was committed with CRLF at least once (via a GitHub web
+# merge-conflict resolution), which broke auto-tag-release.yml's exact-match
+# grep against "## [Unreleased]" on a Linux runner.
+* text=auto eol=lf
+
+*.go text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+Makefile text eol=lf
+*.sh text eol=lf
+
+*.png binary
+*.jpg binary
+*.ico binary
