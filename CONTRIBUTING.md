@@ -47,7 +47,7 @@ wsl -d Ubuntu-24.04 -- bash -lc 'cd /mnt/f/GitHub/LocaQL && go build ./... && go
 
 ## Branching Model and DevOps Cycle
 
-LocaQL uses a lightweight GitFlow-style model: an integration branch (`dev`) and a release branch (`main`), with short-lived branches feeding into whichever one matches the change's impact.
+LocaQL uses a lightweight linear promotion model: short-lived work branches merge into the integration branch (`dev`), then `dev` is promoted into the production branch (`main`). Release automation follows that same path and does not create `release/*` branches.
 
 | Branch prefix | Use it for | Branches from | Merges into |
 | --- | --- | --- | --- |
@@ -68,6 +68,7 @@ flowchart LR
 Rules:
 
 - Regular contributions target `dev`. `main` only receives merges from `dev` (releases) or from a `hotfix/*` branch (urgent fixes), never a direct feature branch.
+- Opening or updating a same-repository work PR to `dev` prepares the next version in `CHANGELOG.md` on that work branch; wait for the bot commit before approving and merging it. Then merge `dev -> main` to create the version tag and publish the release automatically.
 - A `hotfix/*` branch is cut from `main`, fixes the issue, merges back into `main`, and is then back-merged (or cherry-picked) into `dev` so the two branches don't diverge.
 - Both `main` and `dev` are protected: direct pushes and force-pushes are rejected for everyone except the repository owner (see [Branch Protection](#branch-protection-who-can-approve-and-merge) below).
 

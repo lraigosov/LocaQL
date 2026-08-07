@@ -124,6 +124,12 @@ func parseTimePartitioning(v any, schema []tableField) (*timePartitioningConfig,
 			return nil, fmt.Errorf("HOUR partitioning requires a TIMESTAMP field")
 		}
 		config.Field = field.Name
+	} else {
+		for _, reserved := range []string{"_PARTITIONTIME", "_PARTITIONDATE", ingestionPartitionTimeColumn, ingestionPartitionDateColumn} {
+			if field, _, found := findTopLevelField(schema, reserved); found {
+				return nil, fmt.Errorf("field %q is reserved for ingestion-time partition pseudocolumns", field.Name)
+			}
+		}
 	}
 	return config, nil
 }
@@ -238,10 +244,98 @@ func validatePartitioningCombination(timeConfig *timePartitioningConfig, rangeCo
 	if requireFilter && timeConfig == nil && rangeConfig == nil {
 		return fmt.Errorf("requirePartitionFilter can only be true for a partitioned table")
 	}
-	if requireFilter && timeConfig != nil && timeConfig.Field == "" {
-		return fmt.Errorf("requirePartitionFilter for ingestion-time partitioning is not supported until _PARTITIONTIME/_PARTITIONDATE query pseudocolumns are implemented")
-	}
 	return nil
+}
+
+const (
+	ingestionPartitionTimeColumn = "__locaql_partition_time"
+	ingestionPartitionDateColumn = "__locaql_partition_date"
+)
+
+// materializeIngestionPseudocolumns appends engine-only TIMESTAMP and DATE
+// columns to an ingestion-time partitioned table. They never become part of
+// the catalog schema: query execution rewrites the public pseudocolumn names
+// to these collision-resistant identifiers and strips them back out of '*'
+// results and DML table images.
+func materializeIngestionPseudocolumns(table *tableRecord, fields []tableField, rows [][]string) ([]tableField, [][]string) {
+	if table == nil || table.TimePartitioning == nil || table.TimePartitioning.Field != "" || table.View != nil || table.External != nil {
+		return fields, rows
+	}
+	materializedFields := append(cloneTableFields(fields),
+		tableField{Name: ingestionPartitionTimeColumn, Type: "TIMESTAMP"},
+		tableField{Name: ingestionPartitionDateColumn, Type: "DATE"},
+	)
+	materializedRows := make([][]string, len(rows))
+	fallback := ingestionPartitionID(table.TimePartitioning, table.CreatedAt)
+	for i, row := range rows {
+		partitionID := fallback
+		if i < len(table.IngestionPartitions) && table.IngestionPartitions[i] != "" {
+			partitionID = table.IngestionPartitions[i]
+		}
+		partitionStart, ok := parseTimePartitionID(partitionID, table.TimePartitioning.Type)
+		partitionTime, partitionDate := storedNullCell, storedNullCell
+		if ok {
+			partitionTime = storeStringCell(partitionStart.UTC().Format(time.RFC3339Nano))
+			partitionDate = storeStringCell(partitionStart.UTC().Format("2006-01-02"))
+		}
+		materializedRows[i] = append(append([]string(nil), row...), partitionTime, partitionDate)
+	}
+	return materializedFields, materializedRows
+}
+
+// partitionIDsFromEngineRows removes the two engine-only pseudocolumns from
+// a DML table image and returns the exact ingestion partition carried by each
+// surviving row. A NULL internal value identifies a newly inserted row and is
+// assigned to the partition current at commit time.
+func partitionIDsFromEngineRows(schema []tableField, rows [][]string, config *timePartitioningConfig, now time.Time) ([]tableField, [][]string, []string) {
+	timeIndex, dateIndex := -1, -1
+	for i, field := range schema {
+		switch strings.ToLower(field.Name) {
+		case ingestionPartitionTimeColumn:
+			timeIndex = i
+		case ingestionPartitionDateColumn:
+			dateIndex = i
+		}
+	}
+	if timeIndex < 0 && dateIndex < 0 {
+		return schema, rows, nil
+	}
+	keptSchema := make([]tableField, 0, len(schema)-2)
+	for i, field := range schema {
+		if i != timeIndex && i != dateIndex {
+			keptSchema = append(keptSchema, field)
+		}
+	}
+	current := ingestionPartitionID(config, now.UTC())
+	keptRows := make([][]string, len(rows))
+	partitions := make([]string, len(rows))
+	for rowIndex, row := range rows {
+		kept := make([]string, 0, len(keptSchema))
+		for columnIndex, cell := range row {
+			if columnIndex != timeIndex && columnIndex != dateIndex {
+				kept = append(kept, cell)
+			}
+		}
+		keptRows[rowIndex] = kept
+		partitions[rowIndex] = current
+		parsedPartition := false
+		if timeIndex >= 0 && timeIndex < len(row) {
+			if decoded, isNull := loadStoredCell(row[timeIndex]); !isNull {
+				if parsed, err := parsePartitionTimestamp(strings.Trim(decoded, `"`)); err == nil {
+					partitions[rowIndex] = formatTimePartitionID(parsed.UTC(), config.Type)
+					parsedPartition = true
+				}
+			}
+		}
+		if !parsedPartition && dateIndex >= 0 && dateIndex < len(row) {
+			if decoded, isNull := loadStoredCell(row[dateIndex]); !isNull {
+				if parsed, err := time.Parse("2006-01-02", strings.Trim(decoded, `"`)); err == nil {
+					partitions[rowIndex] = formatTimePartitionID(parsed.UTC(), config.Type)
+				}
+			}
+		}
+	}
+	return keptSchema, keptRows, partitions
 }
 
 func ingestionPartitionID(config *timePartitioningConfig, at time.Time) string {
@@ -515,6 +609,8 @@ func parsePartitionTimestamp(value string) (time.Time, error) {
 		"2006-01-02 15:04:05 MST",
 		"2006-01-02 15:04:05.999999999-07:00",
 		"2006-01-02 15:04:05-07:00",
+		"2006-01-02 15:04:05.999999999-07",
+		"2006-01-02 15:04:05-07",
 		"2006-01-02 15:04:05.999999999",
 		"2006-01-02 15:04:05",
 	}

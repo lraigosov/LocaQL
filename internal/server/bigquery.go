@@ -1879,6 +1879,21 @@ func renderCellForREST(field tableField, raw string) any {
 		}
 		return renderDecodedCellForREST(field, decoded)
 	}
+	return renderScalarCellForREST(field, raw)
+}
+
+// renderScalarCellForREST applies BigQuery's wire representation for scalar
+// values whose REST encoding differs from the human-readable catalog format.
+// In particular, TIMESTAMP cells are integer microseconds since Unix epoch;
+// official clients use that representation to construct timezone-aware
+// datetime values. Malformed legacy values remain visible unchanged instead
+// of making an entire page unreadable.
+func renderScalarCellForREST(field tableField, raw string) any {
+	if strings.EqualFold(field.Type, "TIMESTAMP") {
+		if parsed, err := parsePartitionTimestamp(strings.Trim(raw, `"`)); err == nil {
+			return strconv.FormatInt(parsed.UTC().UnixMicro(), 10)
+		}
+	}
 	return raw
 }
 
@@ -1897,7 +1912,7 @@ func renderDecodedCellForREST(field tableField, decoded any) any {
 		}
 		return map[string]any{"f": cells}
 	}
-	return scalarValueToPlainString(decoded)
+	return renderScalarCellForREST(field, scalarValueToPlainString(decoded))
 }
 
 func extractTableRef(v any, defaultProjectID string) tableReference {

@@ -84,7 +84,7 @@ func TestTablePartitioningMetadataRoundTripPatchAndValidation(t *testing.T) {
 		`{"tableReference":{"tableId":"invalid_time_type"},"schema":{"fields":[{"name":"name","type":"STRING"}]},"timePartitioning":{"field":"name"}}`,
 		`{"tableReference":{"tableId":"invalid_cluster"},"schema":{"fields":[{"name":"id","type":"INT64"}]},"clustering":{"fields":["missing"]}}`,
 		`{"tableReference":{"tableId":"invalid_filter"},"schema":{"fields":[{"name":"id","type":"INT64"}]},"requirePartitionFilter":true}`,
-		`{"tableReference":{"tableId":"invalid_ingestion_filter"},"schema":{"fields":[{"name":"id","type":"INT64"}]},"timePartitioning":{"type":"DAY"},"requirePartitionFilter":true}`,
+		`{"tableReference":{"tableId":"invalid_reserved_pseudo"},"schema":{"fields":[{"name":"_PARTITIONDATE","type":"DATE"}]},"timePartitioning":{"type":"DAY"}}`,
 	}
 	for _, invalidBody := range invalidCases {
 		req := httptest.NewRequest(http.MethodPost, "/bigquery/v2/projects/p1/datasets/analytics/tables", strings.NewReader(invalidBody))
@@ -122,6 +122,7 @@ func TestTimePartitionExpirationPurgesRowsLazily(t *testing.T) {
 
 func TestTimePartitioningInformationSchemaAndRequiredFilter(t *testing.T) {
 	s := newTestServer()
+	s.tables.now = func() time.Time { return time.Date(2026, 8, 6, 12, 0, 0, 0, time.UTC) }
 	createPartitionedTable(t, s, "daily_events", `{
   "tableReference":{"tableId":"daily_events"},
   "schema":{"fields":[{"name":"event_date","type":"DATE"},{"name":"user_id","type":"STRING"}]},
@@ -188,6 +189,115 @@ func TestTimePartitioningInformationSchemaAndRequiredFilter(t *testing.T) {
 	}
 	if options["require_partition_filter"] != "true" || options["partition_expiration_days"] != "2" {
 		t.Fatalf("unexpected table options: %v", options)
+	}
+}
+
+func TestIngestionTimePseudocolumnsWildcardRequiredFilterAndDML(t *testing.T) {
+	s := newTestServer()
+	clock := time.Date(2026, 8, 5, 10, 0, 0, 0, time.UTC)
+	s.tables.now = func() time.Time { return clock }
+	createPartitionedTable(t, s, "ingestion_pseudo", `{
+  "tableReference":{"tableId":"ingestion_pseudo"},
+  "schema":{"fields":[{"name":"id","type":"INT64"}]},
+  "timePartitioning":{"type":"DAY"},
+  "requirePartitionFilter":true
+}`)
+	dest := tableReference{ProjectID: "p1", DatasetID: "analytics", TableID: "ingestion_pseudo"}
+	record, _, _ := s.tables.get("p1", "analytics", "ingestion_pseudo")
+	if _, err := s.tables.upsertCopyDestination(dest, record.Schema, [][]string{{"1"}}, "CREATE_NEVER", "WRITE_APPEND"); err != nil {
+		t.Fatalf("append first ingestion partition: %v", err)
+	}
+	clock = clock.Add(24 * time.Hour)
+	if _, err := s.tables.upsertCopyDestination(dest, record.Schema, [][]string{{"1"}, {"2"}}, "CREATE_NEVER", "WRITE_APPEND"); err != nil {
+		t.Fatalf("append second ingestion partition: %v", err)
+	}
+
+	if _, _, err := s.executeRealSQLQuery("p1", "SELECT * FROM analytics.ingestion_pseudo", nil); err == nil || !strings.Contains(strings.ToLower(err.Error()), "partition") {
+		t.Fatalf("expected requirePartitionFilter error without pseudocolumn filter, got %v", err)
+	}
+	schema, rows, err := s.executeRealSQLQuery("p1", "SELECT * FROM analytics.ingestion_pseudo WHERE _PARTITIONDATE = DATE '2026-08-05'", nil)
+	if err != nil {
+		t.Fatalf("query ingestion wildcard: %v", err)
+	}
+	if len(schema) != 1 || schema[0].Name != "id" || len(rows) != 1 || rows[0][0] != "1" {
+		t.Fatalf("SELECT * must hide pseudocolumns and filter one partition, schema=%v rows=%v", schema, rows)
+	}
+	schema, rows, err = s.executeRealSQLQuery("p1", "SELECT _PARTITIONDATE, _PARTITIONTIME, id FROM analytics.ingestion_pseudo WHERE _PARTITIONDATE >= DATE '2026-08-05' ORDER BY _PARTITIONDATE, id", nil)
+	if err != nil {
+		t.Fatalf("project ingestion pseudocolumns: %v", err)
+	}
+	if len(schema) != 3 || schema[0].Name != "_PARTITIONDATE" || schema[0].Type != "DATE" || schema[1].Name != "_PARTITIONTIME" || schema[1].Type != "TIMESTAMP" || len(rows) != 3 {
+		t.Fatalf("unexpected pseudocolumn projection schema=%v rows=%v", schema, rows)
+	}
+	if rows[0][0] != "2026-08-05" || rows[1][0] != "2026-08-06" || rows[2][0] != "2026-08-06" {
+		t.Fatalf("unexpected pseudocolumn values: %v", rows)
+	}
+
+	if _, err := s.executeQueryStatement("p1", "", "DELETE FROM analytics.ingestion_pseudo WHERE _PARTITIONDATE = DATE '2026-08-05'", "", "", nil); err != nil {
+		t.Fatalf("delete by ingestion partition: %v", err)
+	}
+	clock = clock.Add(24 * time.Hour)
+	if _, err := s.executeQueryStatement("p1", "", "INSERT INTO analytics.ingestion_pseudo VALUES (3)", "", "", nil); err != nil {
+		t.Fatalf("implicit-column insert into ingestion table: %v", err)
+	}
+	if _, err := s.executeQueryStatement("p1", "", "UPDATE analytics.ingestion_pseudo SET id = 20 WHERE _PARTITIONDATE = DATE '2026-08-06' AND id = 2", "", "", nil); err != nil {
+		t.Fatalf("update by ingestion partition: %v", err)
+	}
+	if _, err := s.executeQueryStatement("p1", "", "UPDATE analytics.ingestion_pseudo SET _PARTITIONDATE = DATE '2026-08-07' WHERE _PARTITIONDATE = DATE '2026-08-06' AND id = 1", "", "", nil); err == nil || !strings.Contains(err.Error(), "read-only") {
+		t.Fatalf("expected read-only pseudocolumn error, got %v", err)
+	}
+	record, _, _ = s.tables.get("p1", "analytics", "ingestion_pseudo")
+	counts := partitionCounts(record)
+	if counts["20260805"] != 0 || counts["20260806"] != 2 || counts["20260807"] != 1 {
+		t.Fatalf("DML must preserve surviving partitions and assign INSERT to current partition: %v", counts)
+	}
+}
+
+func TestHourlyIngestionPseudocolumnPreservesPartitionAcrossDML(t *testing.T) {
+	s := newTestServer()
+	clock := time.Date(2026, 8, 5, 10, 35, 0, 0, time.UTC)
+	s.tables.now = func() time.Time { return clock }
+	createPartitionedTable(t, s, "hourly_ingestion", `{
+  "tableReference":{"tableId":"hourly_ingestion"},
+  "schema":{"fields":[{"name":"id","type":"INT64"}]},
+  "timePartitioning":{"type":"HOUR"},
+  "requirePartitionFilter":true
+}`)
+	dest := tableReference{ProjectID: "p1", DatasetID: "analytics", TableID: "hourly_ingestion"}
+	record, _, _ := s.tables.get("p1", "analytics", "hourly_ingestion")
+	if _, err := s.tables.upsertCopyDestination(dest, record.Schema, [][]string{{"1"}}, "CREATE_NEVER", "WRITE_APPEND"); err != nil {
+		t.Fatalf("append first hourly partition: %v", err)
+	}
+	clock = clock.Add(time.Hour)
+	if _, err := s.tables.upsertCopyDestination(dest, record.Schema, [][]string{{"2"}}, "CREATE_NEVER", "WRITE_APPEND"); err != nil {
+		t.Fatalf("append second hourly partition: %v", err)
+	}
+
+	schema, rows, err := s.executeRealSQLQuery("p1", "SELECT _PARTITIONTIME, id FROM analytics.hourly_ingestion WHERE _PARTITIONTIME >= TIMESTAMP '2026-08-05 10:00:00+00' ORDER BY _PARTITIONTIME", nil)
+	if err != nil {
+		t.Fatalf("query hourly pseudocolumn: %v", err)
+	}
+	if len(schema) != 2 || schema[0].Name != "_PARTITIONTIME" || len(rows) != 2 {
+		t.Fatalf("unexpected hourly pseudocolumn result schema=%v rows=%v", schema, rows)
+	}
+	if _, err := s.executeQueryStatement("p1", "", "UPDATE analytics.hourly_ingestion SET id = id + 10 WHERE _PARTITIONTIME = TIMESTAMP '2026-08-05 10:00:00+00'", "", "", nil); err != nil {
+		t.Fatalf("update hourly partition: %v", err)
+	}
+	record, _, _ = s.tables.get("p1", "analytics", "hourly_ingestion")
+	counts := partitionCounts(record)
+	if counts["2026080510"] != 1 || counts["2026080511"] != 1 {
+		t.Fatalf("hourly DML must preserve exact partition IDs: %v", counts)
+	}
+}
+
+func TestPseudocolumnRewriteLeavesLiteralsAndCommentsUnchanged(t *testing.T) {
+	query := "SELECT '_PARTITIONDATE', _PARTITIONDATE -- _PARTITIONTIME\nFROM analytics.events WHERE note = \"_PARTITIONTIME\""
+	rewritten := rewriteIngestionPseudocolumns(query)
+	if !strings.Contains(rewritten, "'_PARTITIONDATE'") || !strings.Contains(rewritten, "-- _PARTITIONTIME") || !strings.Contains(rewritten, `"_PARTITIONTIME"`) {
+		t.Fatalf("rewrite changed a literal or comment: %s", rewritten)
+	}
+	if !strings.Contains(rewritten, ingestionPartitionDateColumn) {
+		t.Fatalf("rewrite did not replace executable pseudocolumn: %s", rewritten)
 	}
 }
 
