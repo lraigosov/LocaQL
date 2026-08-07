@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 )
 
 // persistentSQLStatement is the small amount of statement metadata LocaQL
@@ -204,13 +205,25 @@ func (s *Server) executePersistentSQLStatement(projectID, queryText string, sess
 	if err != nil {
 		return persistentSQLResult{}, true, err
 	}
-	result, err := db.Exec(stripProjectPrefix(strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(queryText), ";")), projectID), args...)
+	engineStatement := stripProjectPrefix(strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(queryText), ";")), projectID)
+	if stmt.dml && existing.TimePartitioning != nil && existing.TimePartitioning.Field == "" {
+		if err := validateIngestionPseudocolumnWrites(engineStatement); err != nil {
+			return persistentSQLResult{}, true, err
+		}
+		engineStatement = addImplicitInsertColumns(engineStatement, existing.Schema)
+	}
+	engineStatement = rewriteIngestionPseudocolumns(engineStatement)
+	result, err := db.Exec(engineStatement, args...)
 	if err != nil {
 		return persistentSQLResult{}, true, err
 	}
 	affectedRows := rowsAffected(result)
 
-	finalSchema, finalRows, err := readEngineTable(db, stmt.target.DatasetID, stmt.target.TableID)
+	var existingTimePartitioning *timePartitioningConfig
+	if existing != nil {
+		existingTimePartitioning = existing.TimePartitioning
+	}
+	finalSchema, finalRows, finalPartitions, err := readEngineTable(db, stmt.target.DatasetID, stmt.target.TableID, existingTimePartitioning, s.tables.now().UTC())
 	if err != nil {
 		return persistentSQLResult{}, true, fmt.Errorf("read final table %s.%s: %w", stmt.target.DatasetID, stmt.target.TableID, err)
 	}
@@ -222,7 +235,7 @@ func (s *Server) executePersistentSQLStatement(projectID, queryText string, sess
 		if len(finalSchema) != len(existing.Schema) {
 			return persistentSQLResult{}, true, fmt.Errorf("DML unexpectedly changed schema for %s.%s", stmt.target.DatasetID, stmt.target.TableID)
 		}
-		if err := s.tables.replaceRowsIfVersion(projectID, stmt.target.DatasetID, stmt.target.TableID, version, finalRows); err != nil {
+		if err := s.tables.replaceRowsIfVersion(projectID, stmt.target.DatasetID, stmt.target.TableID, version, finalRows, finalPartitions); err != nil {
 			return persistentSQLResult{}, true, err
 		}
 	} else if exists {
@@ -240,13 +253,48 @@ func (s *Server) executePersistentSQLStatement(projectID, queryText string, sess
 	return persistentSQLResult{schema: []tableField{}, rows: [][]string{}, statementType: stmt.statementType, dmlAffectedRows: affectedRows}, true, nil
 }
 
-func readEngineTable(db *sql.DB, datasetID, tableID string) ([]tableField, [][]string, error) {
+func readEngineTable(db *sql.DB, datasetID, tableID string, timePartitioning *timePartitioningConfig, now time.Time) ([]tableField, [][]string, []string, error) {
 	rows, err := db.Query("SELECT * FROM " + quoteIdent(datasetID) + "." + quoteIdent(tableID))
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	defer rows.Close()
-	return scanRealSQLRows(rows)
+	schema, values, err := scanRealSQLRows(rows)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	schema, values, partitions := partitionIDsFromEngineRows(schema, values, timePartitioning, now)
+	return schema, values, partitions, nil
+}
+
+var ingestionPseudocolumnWritePattern = regexp.MustCompile(`(?is)(?:\bSET\b|,)\s*(?:` + "`?[A-Za-z_][A-Za-z0-9_]*`?\\." + `)?` + "`?_PARTITION(?:TIME|DATE)`?" + `\s*=`)
+var ingestionPseudocolumnInsertPattern = regexp.MustCompile(`(?is)\bINSERT\s*(?:INTO\s+[^\s(]+\s*)?\([^)]*` + "`?_PARTITION(?:TIME|DATE)`?" + `\)`)
+
+func validateIngestionPseudocolumnWrites(queryText string) error {
+	if ingestionPseudocolumnWritePattern.MatchString(queryText) || ingestionPseudocolumnInsertPattern.MatchString(queryText) {
+		return fmt.Errorf("_PARTITIONTIME and _PARTITIONDATE are read-only pseudocolumns")
+	}
+	return nil
+}
+
+// addImplicitInsertColumns keeps INSERT ... VALUES/SELECT compatible with an
+// engine table that carries two extra internal columns. BigQuery's public
+// schema excludes pseudocolumns, so an omitted target column list refers only
+// to the user-declared fields.
+func addImplicitInsertColumns(queryText string, schema []tableField) string {
+	match := insertTargetPattern.FindStringSubmatchIndex(queryText)
+	if match == nil || len(match) < 4 || match[3] <= match[2] {
+		return queryText
+	}
+	boundary := match[3]
+	if strings.HasPrefix(strings.TrimSpace(queryText[boundary:]), "(") {
+		return queryText
+	}
+	columns := make([]string, len(schema))
+	for i, field := range schema {
+		columns[i] = quoteIdent(field.Name)
+	}
+	return queryText[:boundary] + " (" + strings.Join(columns, ", ") + ")" + queryText[boundary:]
 }
 
 func rowsAffected(result sql.Result) int64 {

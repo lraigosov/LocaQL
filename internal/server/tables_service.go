@@ -35,20 +35,25 @@ type tableReference struct {
 }
 
 type tableRecord struct {
-	ProjectID      string
-	DatasetID      string
-	TableID        string
-	FriendlyName   string
-	Description    string
-	Labels         map[string]string
-	Schema         []tableField
-	Rows           [][]string
-	External       *externalTableConfig
-	View           *viewConfig
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
-	Version        int
-	ExpirationTime time.Time // zero value means "never expires"
+	ProjectID              string
+	DatasetID              string
+	TableID                string
+	FriendlyName           string
+	Description            string
+	Labels                 map[string]string
+	Schema                 []tableField
+	Rows                   [][]string
+	IngestionPartitions    []string
+	External               *externalTableConfig
+	View                   *viewConfig
+	TimePartitioning       *timePartitioningConfig
+	RangePartitioning      *rangePartitioningConfig
+	Clustering             []string
+	RequirePartitionFilter bool
+	CreatedAt              time.Time
+	UpdatedAt              time.Time
+	Version                int
+	ExpirationTime         time.Time // zero value means "never expires"
 }
 
 // viewConfig marks a table as a VIEW or MATERIALIZED_VIEW: its data is never
@@ -92,46 +97,62 @@ func cloneExternalConfig(c *externalTableConfig) *externalTableConfig {
 }
 
 type tableInsert struct {
-	ProjectID      string
-	DatasetID      string
-	TableID        string
-	FriendlyName   string
-	Description    string
-	Labels         map[string]string
-	Schema         []tableField
-	Rows           [][]string
-	External       *externalTableConfig
-	View           *viewConfig
-	ExpirationTime time.Time
+	ProjectID              string
+	DatasetID              string
+	TableID                string
+	FriendlyName           string
+	Description            string
+	Labels                 map[string]string
+	Schema                 []tableField
+	Rows                   [][]string
+	External               *externalTableConfig
+	View                   *viewConfig
+	TimePartitioning       *timePartitioningConfig
+	RangePartitioning      *rangePartitioningConfig
+	Clustering             []string
+	RequirePartitionFilter bool
+	ExpirationTime         time.Time
 }
 
 type tablePatch struct {
-	ProjectID         string
-	DatasetID         string
-	TableID           string
-	FriendlyName      string
-	Description       string
-	Labels            map[string]string
-	ExpirationTime    time.Time
-	Schema            []tableField
-	HasFriendlyName   bool
-	HasDescription    bool
-	HasLabels         bool
-	HasExpirationTime bool
-	HasSchema         bool
+	ProjectID                 string
+	DatasetID                 string
+	TableID                   string
+	FriendlyName              string
+	Description               string
+	Labels                    map[string]string
+	ExpirationTime            time.Time
+	Schema                    []tableField
+	TimePartitioning          *timePartitioningConfig
+	RangePartitioning         *rangePartitioningConfig
+	Clustering                []string
+	RequirePartitionFilter    bool
+	HasFriendlyName           bool
+	HasDescription            bool
+	HasLabels                 bool
+	HasExpirationTime         bool
+	HasSchema                 bool
+	HasTimePartitioning       bool
+	HasRangePartitioning      bool
+	HasClustering             bool
+	HasRequirePartitionFilter bool
 }
 
 // tableUpdate mirrors real BigQuery PUT semantics: every field is fully
 // replaced by whatever the request carries, including clearing a field left
 // out of the body (no partial-patch Has* flags here, unlike tablePatch).
 type tableUpdate struct {
-	ProjectID      string
-	DatasetID      string
-	TableID        string
-	FriendlyName   string
-	Description    string
-	Labels         map[string]string
-	ExpirationTime time.Time
+	ProjectID              string
+	DatasetID              string
+	TableID                string
+	FriendlyName           string
+	Description            string
+	Labels                 map[string]string
+	ExpirationTime         time.Time
+	TimePartitioning       *timePartitioningConfig
+	RangePartitioning      *rangePartitioningConfig
+	Clustering             []string
+	RequirePartitionFilter bool
 }
 
 type tableService struct {
@@ -170,6 +191,10 @@ func (s *tableService) purgeExpiredLocked(tables map[string]*tableRecord) bool {
 		if !t.ExpirationTime.IsZero() && !t.ExpirationTime.After(now) {
 			delete(tables, id)
 			purged = true
+			continue
+		}
+		if purgeExpiredPartitions(t, now) {
+			purged = true
 		}
 	}
 	return purged
@@ -200,8 +225,7 @@ func (s *tableService) list(projectID, datasetID string, start, size int) ([]*ta
 
 	out := make([]*tableRecord, 0, end-start)
 	for _, id := range ids[start:end] {
-		cp := *tables[id]
-		out = append(out, &cp)
+		out = append(out, cloneTableRecord(tables[id]))
 	}
 
 	next := -1
@@ -224,12 +248,7 @@ func (s *tableService) get(projectID, datasetID, tableID string) (*tableRecord, 
 	if t == nil {
 		return nil, false, 0
 	}
-	cp := *t
-	cp.Labels = cloneLabels(cp.Labels)
-	cp.Schema = cloneTableFields(cp.Schema)
-	cp.Rows = cloneTableRows(cp.Rows)
-	cp.External = cloneExternalConfig(cp.External)
-	return &cp, true, t.Version
+	return cloneTableRecord(t), true, t.Version
 }
 
 func (s *tableService) insert(input tableInsert) (*tableRecord, bool) {
@@ -249,31 +268,35 @@ func (s *tableService) insert(input tableInsert) (*tableRecord, bool) {
 	}
 	now := s.now().UTC()
 	t := &tableRecord{
-		ProjectID:      projectID,
-		DatasetID:      datasetID,
-		TableID:        tableID,
-		FriendlyName:   strings.TrimSpace(input.FriendlyName),
-		Description:    strings.TrimSpace(input.Description),
-		Labels:         cloneLabels(input.Labels),
-		Schema:         cloneTableFields(input.Schema),
-		Rows:           cloneTableRows(input.Rows),
-		External:       cloneExternalConfig(input.External),
-		View:           cloneViewConfig(input.View),
-		CreatedAt:      now,
-		UpdatedAt:      now,
-		Version:        1,
-		ExpirationTime: input.ExpirationTime,
+		ProjectID:              projectID,
+		DatasetID:              datasetID,
+		TableID:                tableID,
+		FriendlyName:           strings.TrimSpace(input.FriendlyName),
+		Description:            strings.TrimSpace(input.Description),
+		Labels:                 cloneLabels(input.Labels),
+		Schema:                 cloneTableFields(input.Schema),
+		Rows:                   cloneTableRows(input.Rows),
+		External:               cloneExternalConfig(input.External),
+		View:                   cloneViewConfig(input.View),
+		TimePartitioning:       cloneTimePartitioning(input.TimePartitioning),
+		RangePartitioning:      cloneRangePartitioning(input.RangePartitioning),
+		Clustering:             cloneStrings(input.Clustering),
+		RequirePartitionFilter: input.RequirePartitionFilter,
+		CreatedAt:              now,
+		UpdatedAt:              now,
+		Version:                1,
+		ExpirationTime:         input.ExpirationTime,
 	}
 	if len(t.Schema) == 0 && len(t.Rows) > 0 {
 		t.Schema = inferSchemaFromRows(t.Rows)
 	}
+	if err := validateRowsForPartitioning(t.Schema, t.Rows, t.TimePartitioning, t.RangePartitioning); err != nil {
+		return nil, false
+	}
+	t.IngestionPartitions = newIngestionPartitions(t.TimePartitioning, len(t.Rows), now)
 	tables[tableID] = t
 	s.datasetVersions[s.datasetKey(projectID, datasetID)]++
-	cp := *t
-	cp.Labels = cloneLabels(cp.Labels)
-	cp.Schema = cloneTableFields(cp.Schema)
-	cp.Rows = cloneTableRows(cp.Rows)
-	return &cp, true
+	return cloneTableRecord(t), true
 }
 
 func (s *tableService) delete(projectID, datasetID, tableID string) bool {
@@ -343,16 +366,24 @@ func (s *tableService) patch(input tablePatch) (*tableRecord, bool) {
 	if input.HasSchema {
 		t.Schema = cloneTableFields(input.Schema)
 	}
+	if input.HasTimePartitioning {
+		t.TimePartitioning = cloneTimePartitioning(input.TimePartitioning)
+	}
+	if input.HasRangePartitioning {
+		t.RangePartitioning = cloneRangePartitioning(input.RangePartitioning)
+	}
+	if input.HasClustering {
+		t.Clustering = cloneStrings(input.Clustering)
+	}
+	if input.HasRequirePartitionFilter {
+		t.RequirePartitionFilter = input.RequirePartitionFilter
+	}
 
 	t.UpdatedAt = s.now().UTC()
 	t.Version++
 	s.datasetVersions[s.datasetKey(projectID, datasetID)]++
 
-	cp := *t
-	cp.Labels = cloneLabels(cp.Labels)
-	cp.Schema = cloneTableFields(cp.Schema)
-	cp.Rows = cloneTableRows(cp.Rows)
-	return &cp, true
+	return cloneTableRecord(t), true
 }
 
 func (s *tableService) update(input tableUpdate) (*tableRecord, bool) {
@@ -376,15 +407,15 @@ func (s *tableService) update(input tableUpdate) (*tableRecord, bool) {
 	t.Description = strings.TrimSpace(input.Description)
 	t.Labels = cloneLabels(input.Labels)
 	t.ExpirationTime = input.ExpirationTime
+	t.TimePartitioning = cloneTimePartitioning(input.TimePartitioning)
+	t.RangePartitioning = cloneRangePartitioning(input.RangePartitioning)
+	t.Clustering = cloneStrings(input.Clustering)
+	t.RequirePartitionFilter = input.RequirePartitionFilter
 	t.UpdatedAt = s.now().UTC()
 	t.Version++
 	s.datasetVersions[s.datasetKey(projectID, datasetID)]++
 
-	cp := *t
-	cp.Labels = cloneLabels(cp.Labels)
-	cp.Schema = cloneTableFields(cp.Schema)
-	cp.Rows = cloneTableRows(cp.Rows)
-	return &cp, true
+	return cloneTableRecord(t), true
 }
 
 func (s *tableService) getData(projectID, datasetID, tableID string) ([]tableField, [][]string, bool) {
@@ -407,7 +438,7 @@ func (s *tableService) getData(projectID, datasetID, tableID string) ([]tableFie
 // The compare-and-swap closes the race with direct REST writes that are not
 // scheduled as jobs. Views and external tables are deliberately immutable via
 // DML: materializing either into an ordinary table would destroy its identity.
-func (s *tableService) replaceRowsIfVersion(projectID, datasetID, tableID string, expectedVersion int, rows [][]string) error {
+func (s *tableService) replaceRowsIfVersion(projectID, datasetID, tableID string, expectedVersion int, rows [][]string, ingestionPartitions []string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -427,6 +458,20 @@ func (s *tableService) replaceRowsIfVersion(projectID, datasetID, tableID string
 	}
 	if err := validateStoredRows(t.Schema, rows); err != nil {
 		return err
+	}
+	if err := validateRowsForPartitioning(t.Schema, rows, t.TimePartitioning, t.RangePartitioning); err != nil {
+		return err
+	}
+	currentPartition := ingestionPartitionID(t.TimePartitioning, s.now().UTC())
+	if currentPartition != "" && len(ingestionPartitions) == len(rows) {
+		t.IngestionPartitions = cloneStrings(ingestionPartitions)
+		for i := range t.IngestionPartitions {
+			if t.IngestionPartitions[i] == "" {
+				t.IngestionPartitions[i] = currentPartition
+			}
+		}
+	} else {
+		t.IngestionPartitions = reconcileIngestionPartitions(t.Rows, rows, t.IngestionPartitions, currentPartition)
 	}
 	t.Rows = cloneTableRows(rows)
 	t.UpdatedAt = s.now().UTC()
@@ -457,6 +502,11 @@ func (s *tableService) replaceTableIfVersion(projectID, datasetID, tableID strin
 	t.Rows = cloneTableRows(rows)
 	t.View = nil
 	t.External = nil
+	t.TimePartitioning = nil
+	t.RangePartitioning = nil
+	t.Clustering = nil
+	t.RequirePartitionFilter = false
+	t.IngestionPartitions = nil
 	t.UpdatedAt = s.now().UTC()
 	t.Version++
 	s.datasetVersions[s.datasetKey(projectID, datasetID)]++
@@ -479,7 +529,8 @@ func (s *tableService) upsertCopyDestination(dest tableReference, schema []table
 
 	tables := s.ensureDatasetLocked(projectID, datasetID)
 	existing := tables[tableID]
-	if existing == nil {
+	created := existing == nil
+	if created {
 		if createDisposition == "CREATE_NEVER" {
 			return 0, fmt.Errorf("destination table not found with CREATE_NEVER")
 		}
@@ -492,7 +543,6 @@ func (s *tableService) upsertCopyDestination(dest tableReference, schema []table
 			UpdatedAt: now,
 			Version:   1,
 		}
-		tables[tableID] = existing
 	} else {
 		if writeDisposition == "WRITE_EMPTY" && len(existing.Rows) > 0 {
 			return 0, fmt.Errorf("destination table is not empty")
@@ -503,17 +553,32 @@ func (s *tableService) upsertCopyDestination(dest tableReference, schema []table
 		return 0, fmt.Errorf("source and destination schemas do not match for WRITE_APPEND")
 	}
 
+	newSchema := cloneTableFields(schema)
+	newRows := cloneTableRows(rows)
+	newPartitions := newIngestionPartitions(existing.TimePartitioning, len(newRows), s.now().UTC())
 	if writeDisposition == "WRITE_APPEND" {
-		existing.Rows = append(cloneTableRows(existing.Rows), cloneTableRows(rows)...)
-		if len(existing.Schema) == 0 {
-			existing.Schema = cloneTableFields(schema)
+		newRows = append(cloneTableRows(existing.Rows), newRows...)
+		if len(existing.Schema) > 0 {
+			newSchema = cloneTableFields(existing.Schema)
 		}
+		newPartitions = append(cloneStrings(existing.IngestionPartitions), newPartitions...)
 	} else {
-		existing.Schema = cloneTableFields(schema)
-		existing.Rows = cloneTableRows(rows)
+		newPartitions = newIngestionPartitions(existing.TimePartitioning, len(newRows), s.now().UTC())
 	}
-	if len(existing.Schema) == 0 && len(existing.Rows) > 0 {
-		existing.Schema = inferSchemaFromRows(existing.Rows)
+	if len(newSchema) == 0 && len(newRows) > 0 {
+		newSchema = inferSchemaFromRows(newRows)
+	}
+	if err := validateStoredRows(newSchema, newRows); err != nil {
+		return 0, err
+	}
+	if err := validateRowsForPartitioning(newSchema, newRows, existing.TimePartitioning, existing.RangePartitioning); err != nil {
+		return 0, err
+	}
+	existing.Schema = newSchema
+	existing.Rows = newRows
+	existing.IngestionPartitions = newPartitions
+	if created {
+		tables[tableID] = existing
 	}
 	existing.UpdatedAt = s.now().UTC()
 	existing.Version++
