@@ -1600,8 +1600,8 @@ func TestJobsSyncQuerySupportsInformationSchemaPartitions(t *testing.T) {
 	}
 	firstRow := rows[0].(map[string]any)["f"].([]any)
 	partitionID := firstRow[3].(map[string]any)["v"]
-	if partitionID != "__UNPARTITIONED__" {
-		t.Fatalf("expected __UNPARTITIONED__ partition id, got %v", partitionID)
+	if partitionID != nil {
+		t.Fatalf("expected NULL partition_id for an unpartitioned table, got %v", partitionID)
 	}
 }
 

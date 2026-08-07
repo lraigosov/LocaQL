@@ -1,12 +1,9 @@
-name: Auto-tag Release PR
+name: Auto-tag dev Promotion
 
-# Fires when a `release/vX.Y.Z` PR (opened by prepare-release.yml) merges
-# into main, tags that exact merge commit, and invokes release.yml directly
-# via workflow_call — not by relying on the tag push itself to trigger it,
-# since a tag pushed with the default GITHUB_TOKEN does not start other
-# workflow runs (GitHub's built-in anti-recursion rule for GITHUB_TOKEN
-# events). A tag pushed manually by a real user still triggers release.yml
-# the original way, via its `push: tags: v*` trigger — both paths coexist.
+# A merged dev -> main PR is the release boundary. prepare-release.yml has
+# already dated CHANGELOG.md on dev, so this workflow reads that version,
+# tags the exact merge commit, and invokes release.yml directly. A tag pushed
+# with GITHUB_TOKEN does not emit another workflow event, hence workflow_call.
 on:
   pull_request:
     types: [closed]
@@ -18,25 +15,82 @@ permissions:
 
 jobs:
   tag:
-    name: Create and push the release tag
-    if: github.event.pull_request.merged == true && startsWith(github.event.pull_request.head.ref, 'release/')
+    name: Validate promotion and create release tag
+    if: >-
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.head.ref == 'dev' &&
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.version.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: main
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
           fetch-depth: 0
-      - id: version
+
+      - name: Resolve and validate the prepared version
+        id: version
+        shell: bash
         run: |
-          branch="${{ github.event.pull_request.head.ref }}"
-          echo "tag=${branch#release/}" >> "$GITHUB_OUTPUT"
-      - run: |
+          set -euo pipefail
+
+          unreleased_count=$(grep -c '^## \[Unreleased\]$' CHANGELOG.md || true)
+          if [ "$unreleased_count" -ne 1 ]; then
+            echo "CHANGELOG.md must contain exactly one ## [Unreleased] section; found $unreleased_count." >&2
+            exit 1
+          fi
+
+          section=$(awk '/^## \[Unreleased\]$/{found=1; next} /^## \[/{if (found) exit} found {print}' CHANGELOG.md)
+          if [ -n "$(printf '%s' "$section" | tr -d '[:space:]')" ]; then
+            echo "The dev -> main PR was merged before prepare-release.yml emptied [Unreleased]." >&2
+            echo "No tag was created. Return the changes to dev, prepare the release, and promote again." >&2
+            exit 1
+          fi
+
+          version=$(sed -nE 's/^## \[([0-9]+\.[0-9]+\.[0-9]+)\] - [0-9]{4}-[0-9]{2}-[0-9]{2}$/\1/p' CHANGELOG.md | head -1)
+          if [ -z "$version" ]; then
+            echo "No dated SemVer section was found immediately after [Unreleased]." >&2
+            exit 1
+          fi
+
+          tag="v${version}"
+          merge_sha=$(git rev-parse HEAD)
+          if git show-ref --verify --quiet "refs/tags/${tag}"; then
+            tag_sha=$(git rev-list -n 1 "$tag")
+            if [ "$tag_sha" != "$merge_sha" ]; then
+              echo "Tag ${tag} already exists on ${tag_sha}, not promotion commit ${merge_sha}." >&2
+              exit 1
+            fi
+            echo "Tag ${tag} already points to this promotion commit; continuing idempotently."
+            exists=true
+          else
+            latest_tag=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -1)
+            latest_version="${latest_tag#v}"
+            if [ -n "$latest_version" ]; then
+              highest=$(printf '%s\n%s\n' "$latest_version" "$version" | sort -V | tail -1)
+              if [ "$highest" != "$version" ] || [ "$latest_version" = "$version" ]; then
+                echo "Prepared version v${version} is not newer than latest tag v${latest_version}." >&2
+                exit 1
+              fi
+            fi
+            exists=false
+          fi
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "exists=$exists" >> "$GITHUB_OUTPUT"
+
+      - name: Create and push the release tag
+        if: steps.version.outputs.exists != 'true'
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag "${{ steps.version.outputs.tag }}"
-          git push origin "${{ steps.version.outputs.tag }}"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag "$TAG" HEAD
+          git push origin "refs/tags/${TAG}"
 
   release:
     needs: tag

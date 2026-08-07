@@ -2,7 +2,9 @@ package server
 
 import (
 	"net/http"
+	"strconv"
 	"testing"
+	"time"
 )
 
 func TestNumericPreservesExactDecimalPrecisionThroughLoadQueryExtract(t *testing.T) {
@@ -87,8 +89,9 @@ func TestDateDatetimeTimeTimestampRoundTripThroughTabledataUnchanged(t *testing.
 	if f[2].(map[string]any)["v"] != "10:30:00" {
 		t.Fatalf("expected TIME unchanged via tabledata.list, got %v", f[2])
 	}
-	if f[3].(map[string]any)["v"] != "2026-07-25T10:30:00Z" {
-		t.Fatalf("expected TIMESTAMP unchanged via tabledata.list, got %v", f[3])
+	wantTimestamp := strconv.FormatInt(time.Date(2026, 7, 25, 10, 30, 0, 0, time.UTC).UnixMicro(), 10)
+	if f[3].(map[string]any)["v"] != wantTimestamp {
+		t.Fatalf("expected TIMESTAMP as REST epoch microseconds %s, got %v", wantTimestamp, f[3])
 	}
 }
 
