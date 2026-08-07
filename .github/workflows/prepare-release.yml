@@ -1,113 +1,135 @@
-name: Prepare Release
+name: Prepare Release in dev PR
 
-# Runs on every push to main. Fully automatic: detects whether CHANGELOG.md's
-# [Unreleased] section has anything in it, works out the right SemVer bump
-# from which subsections are present (### Removed or a BREAKING marker ->
-# major, ### Added -> minor, anything else -> patch), dates the section, and
-# opens (or refreshes) a release/vX.Y.Z -> main PR. No manual version input,
-# no manual trigger. The only human step left is reviewing and merging that
-# PR — main's branch protection requires that regardless of who proposes the
-# change. Merging it is what auto-tag-release.yml reacts to.
+# A regular promotion is feature/* -> dev -> main. When a same-repository work
+# branch opens or updates its PR to dev, this workflow turns the single
+# [Unreleased] section into the next dated SemVer section and commits that
+# bookkeeping back to the same work branch. dev stays protected, and the later
+# dev -> main PR contains both product changes and final release notes. A push
+# made with GITHUB_TOKEN does not emit another pull_request event, preventing a
+# preparation loop without requiring a release/* branch.
 on:
-  push:
-    branches: [main]
+  pull_request:
+    types: [opened, reopened, synchronize]
+    branches: [dev]
 
 permissions:
   contents: write
-  pull-requests: write
+  pull-requests: read
 
 concurrency:
-  group: prepare-release
+  group: prepare-release-pr-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
   prepare:
-    name: Detect version, date CHANGELOG, open release PR
+    name: Detect version and date CHANGELOG in work branch
+    if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: main
+          ref: ${{ github.event.pull_request.head.ref }}
           fetch-depth: 0
 
-      # A push that IS a release-PR merge lands with an already-emptied
-      # [Unreleased] (this same job dated it in the commit that just merged),
-      # so this step correctly finds nothing and every later step is skipped
-      # via `if: steps.check.outputs.bump != 'none'`. That's what prevents
-      # this workflow from looping on its own merges.
-      - name: Detect release bump from [Unreleased] content
-        id: check
+      - name: Detect release bump and guard the release state
+        id: release
+        shell: bash
         run: |
-          section=$(awk '/^## \[Unreleased\]/{flag=1; next} /^## \[/{flag=0} flag {print}' CHANGELOG.md)
-          if echo "$section" | grep -qE '^### Removed|BREAKING'; then
-            bump=major
-          elif echo "$section" | grep -qE '^### Added'; then
-            bump=minor
-          elif [ -n "$(echo "$section" | tr -d '[:space:]')" ]; then
-            bump=patch
-          else
-            bump=none
-          fi
-          echo "Detected bump: $bump"
-          echo "bump=$bump" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
 
-      - name: Compute next version
-        if: steps.check.outputs.bump != 'none'
-        id: version
-        run: |
-          latest=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -1)
-          latest="${latest#v}"
-          latest="${latest:-0.0.0}"
-          IFS='.' read -r major minor patch <<< "$latest"
-          case "${{ steps.check.outputs.bump }}" in
-            major) next="$((major + 1)).0.0" ;;
-            minor) next="${major}.$((minor + 1)).0" ;;
-            patch) next="${major}.${minor}.$((patch + 1))" ;;
+          unreleased_count=$(grep -c '^## \[Unreleased\]$' CHANGELOG.md || true)
+          if [ "$unreleased_count" -ne 1 ]; then
+            echo "CHANGELOG.md must contain exactly one ## [Unreleased] section; found $unreleased_count." >&2
+            exit 1
+          fi
+
+          section=$(awk '/^## \[Unreleased\]$/{found=1; next} /^## \[/{if (found) exit} found {print}' CHANGELOG.md)
+          if [ -z "$(printf '%s' "$section" | tr -d '[:space:]')" ]; then
+            echo "No unreleased changes to prepare."
+            echo "bump=none" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          latest_tag=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -1)
+          latest_version="${latest_tag#v}"
+          latest_version="${latest_version:-0.0.0}"
+          first_version=$(sed -nE 's/^## \[([0-9]+\.[0-9]+\.[0-9]+)\] - .*/\1/p' CHANGELOG.md | head -1)
+
+          # There may only be one promotion in flight. Without this guard, a
+          # second feature merge before dev reaches main could create the same
+          # version twice because the first prepared version is not tagged yet.
+          if [ -n "$first_version" ] && [ "$first_version" != "$latest_version" ] && ! git show-ref --verify --quiet "refs/tags/v${first_version}"; then
+            echo "CHANGELOG.md already contains pending release v${first_version}, while the latest tag is v${latest_version}." >&2
+            echo "Promote dev to main before adding another release batch." >&2
+            exit 1
+          fi
+
+          if printf '%s\n' "$section" | grep -qE '^### Removed|BREAKING'; then
+            bump=major
+          elif printf '%s\n' "$section" | grep -qE '^### Added'; then
+            bump=minor
+          else
+            bump=patch
+          fi
+
+          IFS='.' read -r major minor patch <<< "$latest_version"
+          case "$bump" in
+            major) version="$((major + 1)).0.0" ;;
+            minor) version="${major}.$((minor + 1)).0" ;;
+            patch) version="${major}.${minor}.$((patch + 1))" ;;
           esac
-          echo "Latest tag: v${latest} -> next: v${next}"
-          echo "version=$next" >> "$GITHUB_OUTPUT"
+
+          echo "Latest tag: v${latest_version}; detected bump: ${bump}; preparing: v${version}."
+          echo "bump=$bump" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Date the Unreleased section
-        if: steps.check.outputs.bump != 'none'
-        id: date
+        if: steps.release.outputs.bump != 'none'
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        shell: bash
         run: |
+          set -euo pipefail
           today=$(date -u +%Y-%m-%d)
-          echo "date=$today" >> "$GITHUB_OUTPUT"
-          sed -i "s/^## \[Unreleased\]/## [Unreleased]\n\n## [${{ steps.version.outputs.version }}] - ${today}/" CHANGELOG.md
+          awk -v version="$VERSION" -v today="$today" '
+            /^## \[Unreleased\]$/ && !prepared {
+              print
+              print ""
+              print "## [" version "] - " today
+              prepared=1
+              next
+            }
+            { print }
+          ' CHANGELOG.md > CHANGELOG.md.next
+          mv CHANGELOG.md.next CHANGELOG.md
 
-      # Auto-generated bookkeeping PR: if an older one is still open (e.g.
-      # the bump level changed after more commits landed since it was
-      # opened), replace it outright rather than reconciling branch state.
-      - name: Close any stale open release PR
-        if: steps.check.outputs.bump != 'none'
+      - name: Commit the prepared release to the work branch
+        if: steps.release.outputs.bump != 'none'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.release.outputs.version }}
+          HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+        shell: bash
         run: |
-          stale=$(gh pr list --state open --json number,headRefName \
-            --jq '.[] | select(.headRefName | startswith("release/")) | .number')
-          for n in $stale; do
-            gh pr close "$n" --delete-branch
-          done
-
-      - name: Create release branch and commit
-        if: steps.check.outputs.bump != 'none'
-        run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git checkout -B "release/v${{ steps.version.outputs.version }}"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add CHANGELOG.md
-          git commit -m "chore: release v${{ steps.version.outputs.version }}"
-          git push --force origin "release/v${{ steps.version.outputs.version }}"
+          git commit -m "chore: prepare release v${VERSION}"
+          # A concurrent human push makes this fail safely as non-fast-forward;
+          # that newer synchronize event starts a fresh preparation run.
+          git push origin "HEAD:${HEAD_BRANCH}"
 
-      - name: Open pull request to main
-        if: steps.check.outputs.bump != 'none'
+      - name: Write release summary
+        if: steps.release.outputs.bump != 'none'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.release.outputs.version }}
+          BUMP: ${{ steps.release.outputs.bump }}
+        shell: bash
         run: |
-          gh pr create \
-            --base main \
-            --head "release/v${{ steps.version.outputs.version }}" \
-            --title "chore: release v${{ steps.version.outputs.version }}" \
-            --body "Auto-detected bump: **${{ steps.check.outputs.bump }}** (from which \`### \` subsections are under \`[Unreleased]\`). Dates \`CHANGELOG.md\`'s \`[Unreleased]\` section into \`[${{ steps.version.outputs.version }}] - ${{ steps.date.outputs.date }}\` and opens a fresh empty \`[Unreleased]\` section above it for future work.
-
-          Merging this PR automatically creates and pushes the \`v${{ steps.version.outputs.version }}\` tag and runs the release pipeline (build/vet/test/race, multi-arch GHCR image, cross-compiled binaries + SBOM attached to a GitHub Release) — see \`.github/workflows/auto-tag-release.yml\`. Reviewing and merging this PR is the only manual step in the whole release process."
+          {
+            echo "## Release prepared"
+            echo
+            echo "- Version: \`v${VERSION}\`"
+            echo "- SemVer bump: \`${BUMP}\`"
+            echo "- Next step: review and merge this PR into \`dev\`, then open \`dev -> main\`."
+          } >> "$GITHUB_STEP_SUMMARY"
