@@ -85,6 +85,7 @@ type externalTableConfig struct {
 	SourceFormat    string
 	FieldDelimiter  string
 	SkipLeadingRows int
+	Autodetect      bool
 }
 
 func cloneExternalConfig(c *externalTableConfig) *externalTableConfig {
@@ -234,6 +235,21 @@ func (s *tableService) list(projectID, datasetID string, start, size int) ([]*ta
 	}
 
 	return out, next, version
+}
+
+// listAll returns every table in a dataset without pagination, for internal
+// callers that need the full set (wildcard table expansion) rather than a
+// REST page.
+func (s *tableService) listAll(projectID, datasetID string) []*tableRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tables := s.ensureDatasetLocked(projectID, datasetID)
+	out := make([]*tableRecord, 0, len(tables))
+	for _, t := range tables {
+		out = append(out, cloneTableRecord(t))
+	}
+	return out
 }
 
 func (s *tableService) get(projectID, datasetID, tableID string) (*tableRecord, bool, int) {

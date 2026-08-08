@@ -11,7 +11,7 @@ DIST        := dist
 PLATFORMS   := linux/amd64 linux/arm64 windows/amd64 darwin/amd64 darwin/arm64
 BINARIES    := locaql locaql-ui
 
-.PHONY: build build-all docker-build docker-run clean test vet sbom
+.PHONY: build build-all docker-build docker-run clean test vet sbom vuln
 
 # build compiles both binaries for the host platform into ./dist, matching
 # GOOS/GOARCH already set in the environment (cross-compiling from WSL for
@@ -71,3 +71,17 @@ sbom:
 	@mkdir -p $(DIST)
 	@command -v cyclonedx-gomod >/dev/null || go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@latest
 	cyclonedx-gomod app -json -output $(DIST)/sbom.json -main cmd/locaql -licenses .
+
+# vuln scans every imported package for known CVEs against the official Go
+# vulnerability database — distinct from `sbom`/license-scan, which check
+# licensing, not vulnerabilities. Uses -scan package rather than the default
+# -scan symbol (which would additionally filter to only vulnerabilities this
+# project's call graph actually reaches): the default panics on this
+# project's transitive dependency on go-json-experiment/json, a confirmed
+# upstream bug in golang.org/x/tools/go/ssa's generic-signature handling
+# (golang/go#75584 and related issues), not something in this project's own
+# code. See .github/workflows/ci.yml's vulnerability-scan job for the same
+# check in CI.
+vuln:
+	@command -v govulncheck >/dev/null || go install golang.org/x/vuln/cmd/govulncheck@latest
+	govulncheck -scan package ./...

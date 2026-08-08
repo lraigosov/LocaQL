@@ -503,6 +503,42 @@ func (s *Server) executeRealSQLQueryVisitingWithParamsAndStats(projectID, queryT
 	return schema, resultRows, processedBytes, err
 }
 
+// expandWildcardTableRefs replaces a wildcard table reference
+// (`dataset.prefix*`, real BigQuery's `_TABLE_SUFFIX` syntax) with the
+// concrete real tables in that dataset whose name starts with prefix, so
+// each one gets materialized individually through the normal per-ref path
+// below. This is not this project's own union logic: the embedded engine
+// (goccy/googlesqlite, see its internal/wildcard_table.go) already resolves
+// a `*`-suffixed table name natively into a `UNION ALL` with a computed
+// `_TABLE_SUFFIX` column, but only once every matching real table already
+// exists in its own catalog for that dataset — LocaQL's job is only to
+// decide, correctly, which real tables that is. Non-wildcard refs pass
+// through unchanged. Views and external tables are never matched: real
+// BigQuery wildcard tables only span native tables. A wildcard matching zero
+// tables is not an error here — the embedded engine reports its own clear
+// error ("failed to find matched tables by wildcard") when the query
+// actually runs against an empty schema, which is more informative than
+// this project fabricating an earlier one from a catalog listing.
+func (s *Server) expandWildcardTableRefs(projectID string, refs []datasetTableRef) []datasetTableRef {
+	out := make([]datasetTableRef, 0, len(refs))
+	for _, ref := range refs {
+		prefix, isWildcard := strings.CutSuffix(ref.tableID, "*")
+		if !isWildcard {
+			out = append(out, ref)
+			continue
+		}
+		for _, t := range s.tables.listAll(projectID, ref.datasetID) {
+			if t.View != nil || t.External != nil {
+				continue
+			}
+			if strings.HasPrefix(t.TableID, prefix) {
+				out = append(out, datasetTableRef{datasetID: ref.datasetID, tableID: t.TableID})
+			}
+		}
+	}
+	return out
+}
+
 // openMaterializedSQLDatabase builds the isolated GoogleSQL database used by
 // both read-only queries and persistent DDL/DML. extraRefs is primarily the
 // mutation target: INSERT/UPDATE/MERGE targets do not necessarily occur after
@@ -515,7 +551,7 @@ func (s *Server) openMaterializedSQLDatabase(projectID, queryText string, visiti
 		return nil, 0, fmt.Errorf("open real SQL engine: %w", err)
 	}
 
-	refs := referencedTables(queryText, projectID)
+	refs := s.expandWildcardTableRefs(projectID, referencedTables(queryText, projectID))
 	requireFilterCheck := make(map[datasetTableRef]bool, len(refs)+len(extraRefs))
 	for _, ref := range refs {
 		requireFilterCheck[ref] = true

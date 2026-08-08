@@ -140,6 +140,32 @@ jobs:
       - run: go build -o /dev/null ./cmd/locaql
       - run: go build -o /dev/null ./cmd/locaql-ui
 
+  vulnerability-scan:
+    name: Dependency vulnerability scan (govulncheck)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go install golang.org/x/vuln/cmd/govulncheck@latest
+      # -scan package, not the default -scan symbol: the default builds a full
+      # SSA call graph to filter down to only reachable vulnerabilities, and
+      # that SSA build panics ("want variadic parameter of unnamed slice or
+      # string type") on this project's transitive dependency on
+      # go-json-experiment/json — a confirmed, long-standing upstream
+      # incompatibility between golang.org/x/tools/go/ssa's generic-signature
+      # handling and that package's use of jsontext.Value (golang/go#75584,
+      # golang/go#73871, golang/go#74846; still open across govulncheck
+      # releases as of this writing), not something specific to this
+      # project's own code. -scan package still checks every imported
+      # package's version against the vulnerability database — it just can't
+      # filter to "and this project actually calls the vulnerable function",
+      # so it is strictly more conservative (may report a vulnerability this
+      # project never reaches), never less safe.
+      - name: Fail on a known CVE in an imported package (see comment above for why -scan package, not the default)
+        run: govulncheck -scan package ./...
+
   license-scan:
     name: Dependency license scan and SBOM
     runs-on: ubuntu-latest

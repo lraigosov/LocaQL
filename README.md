@@ -1,6 +1,9 @@
 # LocaQL
 
 [![CI](https://github.com/lraigosov/LocaQL/actions/workflows/ci.yml/badge.svg)](https://github.com/lraigosov/LocaQL/actions/workflows/ci.yml)
+[![Go Report Card](https://goreportcard.com/badge/github.com/lraigosov/LocaQL)](https://goreportcard.com/report/github.com/lraigosov/LocaQL)
+[![Latest release](https://img.shields.io/github/v/release/lraigosov/LocaQL)](https://github.com/lraigosov/LocaQL/releases)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 LocaQL is a local BigQuery-compatible development platform.
 
@@ -11,8 +14,42 @@ This repository currently implements incremental scope from the master plan:
 - Real query/load/extract/copy executors; query DDL/DML persists atomically while slot timing remains synthetic.
 - Configurable worker limits and resource-level serialization for conflicting job mutations.
 
+## LocaQL vs. `goccy/bigquery-emulator`
+
+[`goccy/bigquery-emulator`](https://github.com/goccy/bigquery-emulator) is the more established BigQuery emulator (active since 2022, broader external adoption) and both projects sit on the same underlying GoogleSQL engine lineage (`goccy/googlesqlite`), so query-language coverage is largely comparable between them. The honest, source-verified difference — not just docs, since goccy's own `docs/feature-support.md` self-declares a stale `Last reviewed` date — looks like this:
+
+**Where LocaQL is currently ahead** (verified against goccy's source, not just its docs):
+
+| Area | LocaQL | `goccy/bigquery-emulator` |
+| --- | --- | --- |
+| Copy jobs | Real, materializes destination rows | Not implemented |
+| Dataset undelete | Real (tombstone-based) | Not implemented |
+| `INFORMATION_SCHEMA` | `SCHEMATA`/`TABLES`/`COLUMNS`/`TABLE_OPTIONS`/`JOBS*`/`PARTITIONS`/`ROUTINES`/`PARAMETERS`/`MODELS`/`VIEWS` | `SCHEMATA`/`TABLES`/`TABLE_OPTIONS`/`COLUMNS` only |
+| Sessions / multi-statement transactions over REST | Real (scoped to `_SESSION.<table>`) | Not implemented |
+| Load/extract formats | NDJSON, CSV, Avro and Parquet, both directions | No Avro (load or extract); no Parquet on extract |
+| Schema autodetect | NDJSON, CSV, Avro and Parquet (load jobs and external tables) | CSV only, per its own docs |
+| Partitioning fidelity | Real pseudocolumns (`_PARTITIONTIME`/`_PARTITIONDATE`), `requirePartitionFilter`, and logical partition pruning | Partition/clustering metadata accepted but not emulated, per its own docs |
+| Local web console, diagnostics, workspace CLI/REST/UI | Yes, all three | None of these exist |
+| Fake Google Cloud Storage | Built in, one process | Requires a separate GCS emulator |
+| Divergences from real BigQuery | Published and classified by severity ([`KNOWN-DIVERGENCES.md`](KNOWN-DIVERGENCES.md)) | Feature matrix only, no severity/workaround classification |
+
+**Roughly at parity today:**
+
+- **External tables** — both support them for real (goccy added this after its docs were last reviewed, source-verified here). LocaQL re-reads the source live on every query and accepts local file paths directly; goccy snapshots at table-creation time (by its own admission, diverging from real BigQuery's live-read semantics) and only supports `gs://` sources. Neither is a strict upgrade over the other.
+- **Table snapshots/clones/time travel, IAM, BigQuery ML** — neither project implements these; both treat most of this as explicit non-goals for a local emulator.
+
+**Where `goccy/bigquery-emulator` is still ahead:**
+
+- **Multi-client conformance**: its CI runs official clients for Python, Ruby, PHP, Node.js, Java and `bq`; LocaQL's official-client CI coverage is Python only today.
+- **Community and time-in-production**: active since 2022, with far more external issues, forks and real-world regressions found by third parties.
+- **BigQuery Storage API breadth**: Arrow framing and multi-stream `SplitReadStream` support, versus LocaQL's Avro-only, single-stream implementation.
+- **Native runtime portability**: LocaQL's query engine only reliably runs on Linux/WSL today (see [Requirements](#requirements)).
+
+This comparison is maintained honestly in both directions — see [`KNOWN-DIVERGENCES.md`](KNOWN-DIVERGENCES.md) for what LocaQL itself doesn't do yet, classified by how much it actually matters for local development.
+
 ## Table of Contents
 
+- [LocaQL vs. goccy/bigquery-emulator](#locaql-vs-goccybigquery-emulator)
 - [Requirements](#requirements)
 - [Quick Start (WSL)](#quick-start-wsl)
 - [Capability Registry](#capability-registry)
@@ -21,6 +58,7 @@ This repository currently implements incremental scope from the master plan:
 - [Runtime Architecture](#runtime-architecture)
 - [Query Engine: Real GoogleSQL via an Embedded SQLite Backend](#query-engine-real-googlesql-via-an-embedded-sqlite-backend)
 - [Persistent DDL and DML](#persistent-ddl-and-dml)
+- [Streaming Inserts (tabledata.insertAll)](#streaming-inserts-tabledatainsertall)
 - [Concurrency and Isolation Notes](#concurrency-and-isolation-notes)
 - [Job State Model](#job-state-model)
 - [Operational Observability: Structured Logging, Request Metrics, and Extended Health](#operational-observability-structured-logging-request-metrics-and-extended-health)
@@ -28,11 +66,13 @@ This repository currently implements incremental scope from the master plan:
 - [Load Jobs: Real Row Ingestion (NDJSON / CSV / Avro / Parquet)](#load-jobs-real-row-ingestion-ndjson--csv--avro--parquet)
 - [Extract Jobs: Real Table Export (NDJSON / CSV / Avro / Parquet)](#extract-jobs-real-table-export-ndjson--csv--avro--parquet)
 - [Nested Schemas: STRUCT/RECORD and ARRAY/REPEATED](#nested-schemas-structrecord-and-arrayrepeated)
+- [Wildcard Tables (table_* and _TABLE_SUFFIX)](#wildcard-tables-table_-and-_table_suffix)
 - [Partitioning and Clustering](#partitioning-and-clustering)
 - [Dataset Lifecycle: Delete Contents and Undelete](#dataset-lifecycle-delete-contents-and-undelete)
 - [Table Expiration: defaultTableExpirationMs Enforcement](#table-expiration-defaulttableexpirationms-enforcement)
 - [Routines and Models: Metadata CRUD](#routines-and-models-metadata-crud)
 - [External Tables: Query Local Files Without Loading](#external-tables-query-local-files-without-loading)
+- [Schema Autodetect (NDJSON / CSV / Avro / Parquet)](#schema-autodetect-ndjson--csv--avro--parquet)
 - [Views and Materialized Views: Real Resources Backed by the Query Engine](#views-and-materialized-views-real-resources-backed-by-the-query-engine)
 - [Sessions and Multi-Statement Transactions](#sessions-and-multi-statement-transactions)
 - [BigQuery Storage API: Real gRPC Read Sessions (Avro) and Write Streams (Protobuf)](#bigquery-storage-api-real-grpc-read-sessions-avro-and-write-streams-protobuf)
@@ -44,12 +84,13 @@ This repository currently implements incremental scope from the master plan:
 - [Building and Releasing](#building-and-releasing)
 - [Continuous Integration](#continuous-integration)
 - [Contributing](#contributing)
+- [Security](#security)
 - [License](#license)
 
 ## Requirements
 
 - WSL distribution: `Ubuntu-24.04`
-- Go 1.25.0+ (bumped from 1.22 for `parquet-go/parquet-go`, then to 1.25.0 for `goccy/googlesqlite`'s real GoogleSQL query engine; `GOTOOLCHAIN=auto`, the Go default, downloads it automatically)
+- Go 1.25.12+ (bumped from 1.22 for `parquet-go/parquet-go`, then to 1.25.0 for `goccy/googlesqlite`'s real GoogleSQL query engine, then to 1.25.12 to pick up upstream stdlib security fixes surfaced by adding `govulncheck` to CI — see [Security](#security); `GOTOOLCHAIN=auto`, the Go default, downloads it automatically)
 - For race tests: `build-essential` (provides `gcc` for cgo).
 - **Run LocaQL itself on Linux (including WSL on Windows) — not verified to work natively on Windows or macOS.** The query engine's WASM-based analyzer traps at runtime outside Linux (discovered in Sesión 85; see [Known Divergences](KNOWN-DIVERGENCES.md) Blocking #2): the binary builds fine for every platform, but every query fails. Building/cross-compiling from any OS is unaffected — only running it natively on Windows/macOS is currently broken.
 
@@ -96,7 +137,7 @@ Registry file:
 | requestId idempotency | Partial | Implemented for `jobs.insert` and `projects.queries` with TTL |
 | Job executors (query/load/extract/copy) | Partial | Query jobs execute real GoogleSQL — including persistent `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `TRUNCATE TABLE`, `CREATE [OR REPLACE] TABLE [AS SELECT]` and `DROP TABLE` — with target-table serialization, atomic version-checked catalog commits, query parameters and BigQuery-shaped DML statistics. `SELECT`, copy, load and extract retain their existing real execution paths; `totalSlotMs` stays synthetic by design. See [Persistent DDL and DML](#persistent-ddl-and-dml) for the precise transaction/script limits. |
 | Routines and Models | Supported | `routines`/`models` `insert`/`get`/`list`/`patch`/`delete` are metadata-only (no SQL execution or ML training/inference backend exists; nothing is fabricated beyond stored fields) |
-| External tables | Partial | `tables.insert` accepts `externalDataConfiguration` (`NEWLINE_DELIMITED_JSON`/`CSV`/`AVRO`/`PARQUET`, explicit schema, no autodetect); `sourceUris` are read fresh from disk/fake-GCS on every query/`tabledata.list`/copy/extract access rather than materialized at creation. Patching `externalDataConfiguration`, autodetect, Hive partitioning and compression options are not supported |
+| External tables | Partial | `tables.insert` accepts `externalDataConfiguration` (`NEWLINE_DELIMITED_JSON`/`CSV`/`AVRO`/`PARQUET`, explicit schema or `autodetect: true`); `sourceUris` are read fresh from disk/fake-GCS on every query/`tabledata.list`/copy/extract access rather than materialized at creation. Patching `externalDataConfiguration`, Hive partitioning and compression options are not supported |
 | Views and Materialized Views | Partial | `tables.insert` accepts `view.query`/`materializedView.query`, validated and schema-derived by executing the query through the real query engine at creation; every access re-executes the stored query live (see [Views and Materialized Views](#views-and-materialized-views-real-resources-backed-by-the-query-engine)). No patch-based redefinition; materialized views are not actually cached/refreshed |
 | Nested schemas and column evolution | Partial | `schema.fields` supports real `mode` (`NULLABLE`/`REQUIRED`/`REPEATED`) and nested `fields` (`RECORD`/`STRUCT`), rendered end-to-end with BigQuery's real nested REST shape; `tables.patch` can append `NULLABLE` columns and relax `REQUIRED`→`NULLABLE` (see [Nested Schemas](#nested-schemas-structrecord-and-arrayrepeated)). Real nested load/extract is `NEWLINE_DELIMITED_JSON`-only; `CSV`/`AVRO`/`PARQUET` reject nested fields explicitly |
 | Partitioning and clustering | Partial | `tables.insert/get/list/patch/update` persist and validate time-unit, ingestion-time and integer-range partitioning, up to four clustering fields, partition expiration and `requirePartitionFilter`; `_PARTITIONTIME`/`_PARTITIONDATE` are executable, hidden from `SELECT *`, read-only and supported by required filters/DML. Read-only equality predicates use AST-proven logical partition pruning and reduce `totalBytesProcessed`; partition rows remain observable through `INFORMATION_SCHEMA.PARTITIONS`/`COLUMNS`/`TABLE_OPTIONS`. No range-predicate/parameter/OR pruning, physical column-cost model, SQL `PARTITION BY` DDL, or clustering optimizer yet |
@@ -199,6 +240,23 @@ Execution is statement-atomic: LocaQL materializes the referenced tables into an
 Job resources expose `statistics.query.statementType` and `numDmlAffectedRows`; simple INSERT/UPDATE/DELETE also expose their unambiguous `dmlStats` category. Query responses expose `numDmlAffectedRows`. This is verified in CI with pinned `google-cloud-bigquery 3.42.3`, including SDK-visible affected-row counts for INSERT/UPDATE/MERGE/DELETE and persisted CTAS/DROP behavior.
 
 Declared limits: cross-project mutation targets, DML against views/external tables, DML targeting `_SESSION`, and persistent DDL/DML while a session transaction is open fail explicitly. Multi-statement script execution is not yet an atomic persistent transaction. `ALTER TABLE`/procedural SQL are not part of this increment.
+
+### Streaming Inserts (`tabledata.insertAll`)
+
+```bash
+curl -X POST "http://localhost:9050/bigquery/v2/projects/p1/datasets/analytics/tables/events/insertAll" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "rows": [
+      {"insertId": "row-1", "json": {"id": 1, "label": "signup"}},
+      {"insertId": "row-2", "json": {"id": 2, "label": "purchase"}}
+    ]
+  }'
+```
+
+Rows commit straight to the catalog — no job, no polling — through the same `WRITE_APPEND`/`CREATE_NEVER` primitive BigQuery Storage Write's `_default` stream already uses, and row encoding reuses the exact same path as `NEWLINE_DELIMITED_JSON` load, so `RECORD`/`REPEATED` nested fields work identically rather than a flattened subset.
+
+`skipInvalidRows` and `ignoreUnknownValues` match real BigQuery's own defaults: by default, one invalid row (a missing `REQUIRED` field, or an unknown JSON key when `ignoreUnknownValues` is unset) fails the *entire* request and reports every problem row in `insertErrors`; with `skipInvalidRows: true`, valid rows commit and only the invalid ones are reported. `insertId` deduplication is real, bounded to a 15-minute window per table (the same explicit-TTL convention already used for job `requestId` idempotency, not BigQuery's own undocumented window). `templateSuffix` and inserting into a view or external table are rejected explicitly with a `400` rather than silently ignored.
 
 ## Concurrency and Isolation Notes
 
@@ -333,8 +391,8 @@ The console's **Workspace** tab exposes the same four operations as forms over t
 
 - `NEWLINE_DELIMITED_JSON`: one JSON object per line, projected onto `schema.fields` by **name**.
 - `CSV`: rows mapped onto `schema.fields` by **position**; optional `fieldDelimiter` (default `,`) and `skipLeadingRows` (default `0`) are supported. Row width must match the schema field count exactly — jagged rows fail the job rather than being padded or truncated.
-- `AVRO`: records read from an Avro Object Container File and projected onto `schema.fields` by **name**, same as NDJSON. The emulator does not autodetect a BigQuery schema from the file's embedded Avro schema — `schema.fields` is still required.
-- `PARQUET`: rows read via [`parquet-go/parquet-go`](https://github.com/parquet-go/parquet-go) using a Parquet schema built from `schema.fields`, projected by **name** just like Avro/NDJSON. Same no-schema-autodetect limitation applies.
+- `AVRO`: records read from an Avro Object Container File and projected onto `schema.fields` by **name**, same as NDJSON.
+- `PARQUET`: rows read via [`parquet-go/parquet-go`](https://github.com/parquet-go/parquet-go) using a Parquet schema built from `schema.fields`, projected by **name** just like Avro/NDJSON.
 
 Direct uploads use BigQuery's real upload endpoints, so the official Python client can call `Client.load_table_from_file` without staging the file in GCS. LocaQL supports both protocols selected by that method: `multipart/related` for a known file smaller than 5 MiB, and resumable sessions (`POST` initiation, chunked `PUT`, `308` progress responses and `200` completion) when `size=None` or the client selects resumable upload. The returned resource includes `configuration.load` and nested `statistics.load`, so the SDK returns a real `LoadJob`, `job.result()` polls normally and `output_rows` is populated. This exact flow is covered by the pinned official-client smoke test in `test/clients/python/load_table_from_file.py` and its dedicated CI job.
 
@@ -373,7 +431,7 @@ job.result()
 Known limitations, declared explicitly rather than silently ignored:
 
 - Only `NEWLINE_DELIMITED_JSON`, `CSV`, `AVRO` and `PARQUET` are supported; other formats such as `ORC` fail the job explicitly. When `sourceFormat` is omitted, LocaQL now uses BigQuery's real default, `CSV`.
-- `schema.fields` is required when `sourceUris` or direct uploaded media is used; there is no schema autodetect yet.
+- `schema.fields` is required when `sourceUris` or direct uploaded media is used, unless `configuration.load.autodetect: true` (see [Schema Autodetect](#schema-autodetect-ndjson--csv--avro--parquet) below).
 - No `maxBadRecords`/per-row error tolerance yet: any malformed row fails the whole job.
 - Avro and Parquet preserve scalar `NULLABLE`/`REQUIRED` modes; nested `RECORD`/`REPEATED` fields remain supported only by NDJSON and are rejected explicitly for CSV/Avro/Parquet.
 - Resumable upload sessions are process-local and expire after one hour of inactivity. Incomplete media is buffered in memory rather than spooled to disk, so this is intended for local integration tests, not unbounded production-size uploads. Completed jobs and sessions release their media buffers immediately.
@@ -474,6 +532,23 @@ Known limitations, declared explicitly:
 - A nested `RECORD` field's own sub-`fields` cannot be evolved via `tables.patch` once the table exists.
 - Partitioning and clustering are top-level table settings implemented independently from nested schema evolution; see [Partitioning and Clustering](#partitioning-and-clustering) for supported semantics and explicit limits.
 
+## Wildcard Tables (`table_*` and `_TABLE_SUFFIX`)
+
+```sql
+SELECT id, label, _TABLE_SUFFIX AS shard
+FROM `analytics.events_*`
+WHERE _TABLE_SUFFIX = '20260101'
+```
+
+A table path whose last component ends in `*` is resolved against every real, standard (non-view, non-external) table in that dataset whose name starts with the given prefix, unioned together with a real `_TABLE_SUFFIX` column holding each row's source table name with the prefix stripped — the same semantics real BigQuery's own wildcard tables have. This is handled natively by the embedded query engine itself once the matching tables exist in its materialized catalog (see [`goccy/googlesqlite`'s own `wildcard_table.go`](https://github.com/goccy/googlesqlite)); LocaQL's own part is deciding, correctly, which real catalog tables that is before materialization.
+
+Declared limits:
+
+- `SELECT *` includes `_TABLE_SUFFIX` as a real column — real BigQuery hides it from `SELECT *` as a pseudocolumn. This is an engine-level behavior this project does not currently post-process around; select `_TABLE_SUFFIX` explicitly when you need it, and expect it to also appear in a bare `SELECT *`.
+- Matching is scoped to the tables that already exist in this project's own catalog for that dataset at query time — no cross-dataset or cross-project wildcards, matching real BigQuery (wildcard tables are always dataset-scoped there too).
+- A wildcard resolving to zero tables fails the query explicitly with the embedded engine's own error, rather than a fabricated empty result.
+- Wildcard tables are a read-only query construct, matching real BigQuery: this only affects `FROM`/`JOIN` table discovery, not DML/DDL targets.
+
 ## Partitioning and Clustering
 
 LocaQL persists and validates BigQuery's REST table settings instead of accepting and discarding them:
@@ -550,7 +625,7 @@ curl -X POST http://localhost:9050/bigquery/v2/projects/p1/datasets/analytics/ro
 
 ## External Tables: Query Local Files Without Loading
 
-`tables.insert` accepts an `externalDataConfiguration` (`sourceUris`, `sourceFormat`, plus `fieldDelimiter`/`skipLeadingRows` for CSV) instead of ingesting rows into an internal table. An explicit `schema.fields` is required — there is no autodetect. The resulting table's `type` is `EXTERNAL` (a plain internal table's `type` is `TABLE`).
+`tables.insert` accepts an `externalDataConfiguration` (`sourceUris`, `sourceFormat`, plus `fieldDelimiter`/`skipLeadingRows` for CSV) instead of ingesting rows into an internal table. `schema.fields` is required unless `autodetect: true` is set (see [Schema Autodetect](#schema-autodetect-ndjson--csv--avro--parquet) below). The resulting table's `type` is `EXTERNAL` (a plain internal table's `type` is `TABLE`).
 
 Unlike load jobs, **nothing is copied into the catalog at creation time**: `sourceUris` are re-read fresh from disk (or fake-GCS via `LOCAQL_FAKE_GCS_ROOT`) on every access — `SELECT`, `tabledata.list`, `INFORMATION_SCHEMA`, and using the table as a `copy`/`extract` source — so an external table always reflects the current file contents, matching real BigQuery external table semantics. If the files can't be read when data is actually requested, the request fails explicitly (a 400 for `tabledata.list`/sync queries, a job `errorResult` for async query/copy/extract jobs) rather than silently returning stale or empty data.
 
@@ -571,7 +646,32 @@ curl -X POST http://localhost:9050/bigquery/v2/projects/p1/datasets/analytics/ta
   }'
 ```
 
-Supported `sourceFormat` values are the same four covered by load/extract: `NEWLINE_DELIMITED_JSON`, `CSV`, `AVRO`, `PARQUET` (`ORC` and other formats are rejected). Deleting an external table (or its dataset) only removes the LocaQL catalog entry — the underlying file is never touched. Patching `externalDataConfiguration` after creation, autodetect, Hive partitioning, and compression options are not supported yet.
+Supported `sourceFormat` values are the same four covered by load/extract: `NEWLINE_DELIMITED_JSON`, `CSV`, `AVRO`, `PARQUET` (`ORC` and other formats are rejected). Deleting an external table (or its dataset) only removes the LocaQL catalog entry — the underlying file is never touched. Patching `externalDataConfiguration` after creation, Hive partitioning, and compression options are not supported yet.
+
+## Schema Autodetect (NDJSON / CSV / Avro / Parquet)
+
+Both load jobs (`configuration.load.autodetect: true`) and external tables (`externalDataConfiguration.autodetect: true`) can infer `schema.fields` from the source instead of requiring it explicitly:
+
+```bash
+curl -X POST "http://localhost:9050/bigquery/v2/projects/p1/jobs" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "configuration": {
+      "load": {
+        "destinationTable": {"projectId": "p1", "datasetId": "analytics", "tableId": "events"},
+        "sourceUris": ["/data/events.csv"],
+        "sourceFormat": "CSV",
+        "autodetect": true
+      }
+    }
+  }'
+```
+
+`AVRO` and `PARQUET` are exact, not heuristic: both formats embed their own schema in the file, so autodetect reads it directly (`goavro`'s `Codec.Schema()` / `parquet-go`'s `Reader.Schema()`) rather than sampling rows — only a bare primitive or a two-branch `["null", primitive]` union is recognized, matching this project's own Avro/Parquet encode scope (`INT64`/`FLOAT64`/`BOOL`/`STRING`).
+
+`NEWLINE_DELIMITED_JSON` and `CSV` sample up to 500 rows: each column's type is the widened union of every observed value (`INT64` widens to `FLOAT64` on a mixed column; anything else falls back to `STRING`), and every detected field is `NULLABLE` — autodetect never infers `REQUIRED` from a sample. CSV additionally detects a header row using the same signal real BigQuery's own autodetect documents: row 1 is treated as a header when at least one column's row-1 value doesn't fit the type the rest of that column widens to (a label next to real data); with no detected header, columns are named `string_field_0`, `string_field_1`, ... A detected header is folded into `skipLeadingRows` automatically, so the real row-reading pass never re-reads it as data.
+
+Declared limits: only the first `sourceUri` is sampled (a multi-file source with divergent columns across files should use an explicit `schema.fields` instead); a top-level nested/repeated (`RECORD`/`ARRAY`) value in any format fails autodetect explicitly rather than being guessed at or flattened.
 
 ## Views and Materialized Views: Real Resources Backed by the Query Engine
 
@@ -947,6 +1047,10 @@ The `license-scan` job pins `go-licenses` to `v1.0.0` rather than `@latest`: at 
 ## Contributing
 
 Issues and pull requests are welcome. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the branching model (`feature`/`fix`/`docs`/`chore`/`hotfix` → `dev` → `main`), commit conventions, the pull request checklist, and exactly who can approve and merge into `main`/`dev` (branch protection is enforced via a GitHub ruleset + [`CODEOWNERS`](.github/CODEOWNERS): any PR needs the code owner's approval, and only the repository owner can bypass that requirement). Significant, hard-to-reverse design decisions are recorded in [`docs/adr/`](docs/adr/README.md).
+
+## Security
+
+See [`SECURITY.md`](SECURITY.md) for supported versions, scope, and how to report a vulnerability privately (GitHub Security Advisories, not a public issue). CI runs [`govulncheck`](https://go.dev/blog/vuln) on every push/PR (`vulnerability-scan` job, `-scan package` mode — see the comment in `Makefile` for why not the default `-scan symbol`) to catch known CVEs in imported dependencies; run it locally with `make vuln`.
 
 ## License
 

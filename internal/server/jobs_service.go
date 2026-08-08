@@ -37,6 +37,7 @@ type jobRecord struct {
 	LoadFieldDelimiter       string
 	LoadSkipLeadingRows      int
 	LoadCompression          string
+	LoadAutodetect           bool
 	ExtractSourceTable       tableReference
 	ExtractDestinationURIs   []string
 	ExtractDestinationFormat string
@@ -119,6 +120,7 @@ type jobInsertOptions struct {
 	LoadFieldDelimiter       string
 	LoadSkipLeadingRows      int
 	LoadCompression          string
+	LoadAutodetect           bool
 	ExtractSourceTable       tableReference
 	ExtractDestinationURIs   []string
 	ExtractDestinationFormat string
@@ -279,6 +281,7 @@ func (s *jobService) insert(opts jobInsertOptions) (*jobRecord, bool) {
 		LoadFieldDelimiter:       opts.LoadFieldDelimiter,
 		LoadSkipLeadingRows:      opts.LoadSkipLeadingRows,
 		LoadCompression:          strings.TrimSpace(opts.LoadCompression),
+		LoadAutodetect:           opts.LoadAutodetect,
 		ExtractSourceTable:       opts.ExtractSourceTable,
 		ExtractDestinationURIs:   cloneStringSlice(opts.ExtractDestinationURIs),
 		ExtractDestinationFormat: strings.TrimSpace(opts.ExtractDestinationFormat),
