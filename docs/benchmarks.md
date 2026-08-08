@@ -90,6 +90,20 @@ We searched `goccy/googlesqlite` and `goccy/go-googlesql`'s issue trackers and f
 - **Connection pooling** (`internal/server/sql_engine_pool.go`): embedded-engine instances are reused across queries instead of opening a fresh one every time. This was our first hypothesis for the crash's root cause — measured directly, it did **not** reduce per-query latency (the ~200ms cost is not `sql.Open` itself) and did **not** fully prevent the crash either: the corruption reproduces at roughly the same cumulative query count regardless of how many distinct connections were involved, which points to shared state inside the WASM bridge's own runtime module rather than something scoped per connection. Kept anyway because it's a real, measured reduction in `sql.Open` call volume with no downside, verified against the same correctness suite (including a real bug it exposed and fixed: a reused connection could otherwise inherit a stale table from an earlier, unrelated query).
 - **Automatic process recovery** (`internal/procsupervisor.Supervise`): since the crash can't be prevented from inside the process, a supervised child now restarts automatically on an unexpected exit, bounded by a sliding-window limit (so an unrelated, persistent problem still fails loudly instead of crash-looping forever). This is the same pattern long-running worker processes have used for exactly this class of problem for decades (Unicorn/Puma worker recycling, PHP-FPM's `max_requests`). `cmd/locaql-supervisor` applies it to the emulator process it manages; `locaql start --self-restart` applies the identical mechanism to itself, re-executing as a supervised child, for deployments that run the bare binary directly. Verified with real child-process tests (`internal/procsupervisor/procsupervisor_test.go`, `cmd/locaql/start_self_restart_test.go`): the restart loop recovers from repeated crashes, still gives up correctly past the bound, and — for the self-restart path — recovers through a real re-exec of the actual binary rather than just a generic stand-in process.
 
+```mermaid
+flowchart TB
+	Crash["WASM-bridge memory corruption\n(goccy/go-googlesql)"]
+	Crash -->|"during query execution\n(recoverable)"| Panic["panic inside sql.Open\n/ engine invoke"]
+	Crash -->|"at GC time\n(not recoverable in app code)"| Finalizer["panic inside a Go runtime finalizer"]
+
+	Panic --> Recover["jobService.recoverJobPanic\nfails only that one job"]
+	Finalizer --> ProcessExit["the process exits"]
+
+	ProcessExit --> Restart["internal/procsupervisor.Supervise\nrestart, bounded by a sliding window"]
+	Restart --> ViaSupervisor["cmd/locaql-supervisor\n(Docker entrypoint, always on)"]
+	Restart --> ViaSelfRestart["locaql start --self-restart\n(opt-in, re-execs itself)"]
+```
+
 **Practical takeaway:** running via `locaql-supervisor` (the Docker image's entrypoint), the service stays available through this failure mode — the emulator process recycles automatically instead of taking the container down. Running the bare `locaql` binary directly also has this protection now, opt-in: `locaql start --self-restart` re-execs itself as a supervised child and restarts automatically on an unexpected exit, using the same bounded-restart mechanism (`internal/procsupervisor`) as `locaql-supervisor`. Without `--self-restart` (the default), a direct `locaql start` still has no protection against this specific crash.
 
 ## Future work
