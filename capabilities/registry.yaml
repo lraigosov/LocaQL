@@ -177,7 +177,21 @@ capabilities:
       - unit/server/external_table_unreadable_source_fails_query_explicitly
       - unit/server/external_table_information_schema_tables_marks_type_external
       - unit/server/external_table_copy_job_materializes_into_destination
-    reason: "tables.insert accepts externalDataConfiguration (sourceUris/sourceFormat/fieldDelimiter/skipLeadingRows, mirroring configuration.load's flat field layout instead of real BigQuery's nested csvOptions) with an explicit schema.fields required (no autodetect); nothing is materialized at creation time — every consumer of real row data (query execution, tabledata.list, copy/extract job sources, INFORMATION_SCHEMA.PARTITIONS row counts) re-reads sourceUris fresh through a single resolveTableRows choke point, so external tables always reflect current file contents. An unreadable source fails the request/job explicitly instead of silently falling back to empty or simulated data. Supported sourceFormat values are the same four as load/extract (NEWLINE_DELIMITED_JSON/CSV/AVRO/PARQUET); ORC and other formats, patching externalDataConfiguration after creation, autodetect, Hive partitioning and compression options are not supported"
+    reason: "tables.insert accepts externalDataConfiguration (sourceUris/sourceFormat/fieldDelimiter/skipLeadingRows, mirroring configuration.load's flat field layout instead of real BigQuery's nested csvOptions); schema.fields is required unless externalDataConfiguration.autodetect is true (see rest.tables.external.schema_autodetect). Nothing is materialized at creation time — every consumer of real row data (query execution, tabledata.list, copy/extract job sources, INFORMATION_SCHEMA.PARTITIONS row counts) re-reads sourceUris fresh through a single resolveTableRows choke point, so external tables always reflect current file contents. An unreadable source fails the request/job explicitly instead of silently falling back to empty or simulated data. Supported sourceFormat values are the same four as load/extract (NEWLINE_DELIMITED_JSON/CSV/AVRO/PARQUET); ORC and other formats, patching externalDataConfiguration after creation, Hive partitioning and compression options are not supported"
+  rest.tables.external.schema_autodetect:
+    status: partial
+    fidelity: medium
+    tests:
+      - unit/server/detect_schema_from_ndjson_widens_and_defaults_nullable
+      - unit/server/detect_schema_from_ndjson_rejects_nested_values
+      - unit/server/detect_schema_from_csv_with_header_row
+      - unit/server/detect_schema_from_csv_without_header_row_uses_generic_names
+      - unit/server/detect_schema_from_csv_honors_skip_leading_rows
+      - unit/server/detect_schema_from_avro_reads_embedded_schema_exactly
+      - unit/server/detect_schema_from_parquet_reads_embedded_schema_exactly
+      - unit/server/external_table_autodetect_from_csv
+      - unit/server/external_table_without_schema_or_autodetect_fails_explicitly
+    reason: "externalDataConfiguration.autodetect=true (and configuration.load.autodetect=true for load jobs, see rest.jobs.load.schema_autodetect) samples the first sourceUri to detect schema.fields when it is omitted. AVRO/PARQUET are exact, not heuristic: both formats embed their own schema (goavro Codec.Schema() / parquet.Reader.Schema()), so autodetect reads it directly rather than sampling rows; only a bare primitive or a two-branch [\"null\", primitive] union is supported, matching this project's own Avro/Parquet encode scope (INT64/FLOAT64/BOOL/STRING) — records, arrays, maps, enums, fixed types and wider unions are rejected explicitly. NDJSON/CSV sample up to 500 rows: NDJSON unions each field's observed JSON value types (INT64 widening to FLOAT64 on a mixed column, anything else falling back to STRING) and always reports NULLABLE, never inferring REQUIRED from a sample; CSV applies the same widening per column and detects a header row using real BigQuery's own documented signal (row 1 looks like a label when its value doesn't fit the type the rest of the column widens to), naming columns string_field_N when no header is detected. A detected CSV header is folded into skipLeadingRows so the real, live-reread query path never re-reads it as a data row. Nested/repeated top-level values are rejected explicitly in every format, not silently flattened."
   rest.tables.views:
     status: supported
     fidelity: medium
@@ -285,7 +299,14 @@ capabilities:
       - unit/server/bigquery_resumable_upload_accepts_empty_file
       - unit/server/bigquery_resumable_upload_rejects_non_contiguous_chunk
       - e2e/python/official_client_load_table_from_file_multipart_and_resumable
-    reason: "Added after the comparative report identified that the official Python Client.load_table_from_file endpoint returned 404: LocaQL now exposes /upload/bigquery/v2/projects/{project}/jobs for both uploadType=multipart and uploadType=resumable. Multipart parses the real multipart/related metadata-plus-media body and returns the 200 status required by google-resumable-media. Resumable upload implements 200 initiation with Location, sequential Content-Range chunks, 308 plus Range progress acknowledgement, duplicate committed-chunk acknowledgement, offset conflict rejection, zero-byte completion, and a cached final response for retries. Both paths submit the bytes to the existing real load executor and therefore share CSV/NDJSON/Avro/Parquet and compression semantics with sourceUris instead of maintaining a second parser. Job resources now render configuration.load and statistics.load, so google-cloud-bigquery 3.42.3 constructs a real LoadJob, job.result() completes, and output_rows reports the materialized rows; the pinned official SDK smoke test covers both size-known multipart and size=None resumable modes and is wired into CI. Official int64-as-string encoding for skipLeadingRows was found by this E2E and is accepted for both load jobs and external tables. Fidelity is medium because schema.fields is still required (no autodetect), incomplete resumable sessions are memory-buffered/process-local with a one-hour idle TTL rather than durable or disk-spooled, and the official-client matrix currently covers Python only. Uploaded media is excluded from job persistence and released from completed jobs/sessions immediately."
+    reason: "Added after the comparative report identified that the official Python Client.load_table_from_file endpoint returned 404: LocaQL now exposes /upload/bigquery/v2/projects/{project}/jobs for both uploadType=multipart and uploadType=resumable. Multipart parses the real multipart/related metadata-plus-media body and returns the 200 status required by google-resumable-media. Resumable upload implements 200 initiation with Location, sequential Content-Range chunks, 308 plus Range progress acknowledgement, duplicate committed-chunk acknowledgement, offset conflict rejection, zero-byte completion, and a cached final response for retries. Both paths submit the bytes to the existing real load executor and therefore share CSV/NDJSON/Avro/Parquet and compression semantics with sourceUris instead of maintaining a second parser. Job resources now render configuration.load and statistics.load, so google-cloud-bigquery 3.42.3 constructs a real LoadJob, job.result() completes, and output_rows reports the materialized rows; the pinned official SDK smoke test covers both size-known multipart and size=None resumable modes and is wired into CI. Official int64-as-string encoding for skipLeadingRows was found by this E2E and is accepted for both load jobs and external tables. Fidelity is medium because schema.fields is required unless configuration.load.autodetect is true (see rest.jobs.load.schema_autodetect), incomplete resumable sessions are memory-buffered/process-local with a one-hour idle TTL rather than durable or disk-spooled, and the official-client matrix currently covers Python only. Uploaded media is excluded from job persistence and released from completed jobs/sessions immediately."
+  rest.jobs.load.schema_autodetect:
+    status: partial
+    fidelity: medium
+    tests:
+      - unit/server/load_job_autodetect_from_ndjson
+      - unit/server/load_job_without_schema_or_autodetect_fails_explicitly
+    reason: "configuration.load.autodetect=true samples the job's inline upload (Client.load_table_from_file) or the first sourceUri when schema.fields is omitted; execution then fails explicitly with schema.fields is required... unless autodetect is true if neither is set. Shares its detection logic entirely with rest.tables.external.schema_autodetect (detectSchemaFromBytes): same 500-row sample bound and NULLABLE-only inference for NDJSON/CSV, same exact embedded-schema read for AVRO/PARQUET, same explicit rejection of nested/repeated top-level values, and the same CSV-header-into-skipLeadingRows fold so the real ingestion pass never re-reads a detected header as data."
   rest.routines.crud:
     status: supported
     fidelity: medium
@@ -379,6 +400,20 @@ capabilities:
       - unit/server/tabledata_list_real_bigquery_path_unknown_table_404s
       - unit/server/tabledata_list_final_page_omits_page_token
     reason: "Real BigQuery's tabledata.list lives at .../datasets/{datasetId}/tables/{tableId}/data (6 path segments), which is what google-cloud-bigquery's list_rows() actually requests — the router previously only recognized a made-up .../tabledata/{datasetId}/{tableId}/data shape that no official client ever calls (only this project's own tests and bundled UI did), so every real client request 404'd even though the same table's schema was reachable fine via tables.get. Fixed by handling the real path shape explicitly in dispatchDatasetSubResource's tables case; the old shape stays working as an internal alias rather than being removed, since the UI and its own test still use it. Separately, the response always included a pageToken key even on the final page (echoing the request's own start index) — the official client's row iterator for this endpoint specifically checks the mere presence of a pageToken key (not nextPageToken) to decide whether to fetch another page, so list_rows() looped forever re-requesting the same last page instead of ever returning. pageToken and nextPageToken are now both omitted once end reaches len(rows). Both bugs were found together while integrating a real external project against this emulator, not from this project's own test suite, which is why neither one had a reason field or a real-path test before this."
+  rest.tabledata.insertAll:
+    status: partial
+    fidelity: medium
+    tests:
+      - unit/server/streaming_insert_appends_rows_real_time
+      - unit/server/streaming_insert_nested_record_matches_load_encoding
+      - unit/server/streaming_insert_required_field_missing_fails_whole_request_by_default
+      - unit/server/streaming_insert_skip_invalid_rows_keeps_valid_ones
+      - unit/server/streaming_insert_unknown_field_rejected_by_default
+      - unit/server/streaming_insert_ignore_unknown_values_allows_extra_fields
+      - unit/server/streaming_insert_dedupes_by_insert_id
+      - unit/server/streaming_insert_rejects_template_suffix
+      - unit/server/streaming_insert_missing_table_returns_404
+    reason: "POST .../datasets/{datasetId}/tables/{tableId}/insertAll commits rows straight to the catalog via the same tableService.upsertCopyDestination (WRITE_APPEND/CREATE_NEVER) primitive BigQuery Storage Write's _default stream already uses, so it shares the same atomicity and REQUIRED/partition validation instead of a third, divergent write path. Row encoding reuses parseNDJSONRow verbatim, so RECORD/REPEATED nested fields work identically to NEWLINE_DELIMITED_JSON load, not a flattened subset. skipInvalidRows and ignoreUnknownValues are both real: by default an invalid or unknown-field row fails the whole request (matching real BigQuery's own default), reporting structured insertErrors; with skipInvalidRows=true, valid rows commit and only the invalid ones are reported. insertId deduplication is real but explicitly bounded: a 15-minute TTL cache per project:dataset.table (the same window convention already used for job requestId idempotency), not BigQuery's own undocumented, effectively-unbounded best-effort window. templateSuffix (create-and-write to a templated shard table) is rejected explicitly with a 400 rather than silently ignored — out of scope for this increment. Marked partial, not supported, for that reason plus: no per-request byte/row-count quota modeling, and views/external tables are rejected explicitly as insertAll targets (matching real BigQuery, which also rejects them, though with different underlying reasons)."
   sql.types.core_scalars:
     status: partial
     fidelity: medium
@@ -389,6 +424,15 @@ capabilities:
       - unit/server/date_column_to_column_comparison_works_correctly
       - unit/server/date_string_literal_parses_correctly_regardless_of_host_timezone
     reason: "NUMERIC and BIGNUMERIC are real query-engine types with exact decimal round trips and arithmetic. DATE/DATETIME/TIME/TIMESTAMP round-trip, and DATE literal construction is timezone-stable because LocaQL fixes process time.Local to UTC (the prior off-by-one defect only reproduced on negative-offset hosts). SQL NULL is lossless and distinct from empty/zero/false through the escaped cell representation described by rest.rows.nullability. GEOGRAPHY, RANGE and INTERVAL remain explicit non-goals."
+  sql.wildcard_tables:
+    status: partial
+    fidelity: medium
+    tests:
+      - unit/server/wildcard_table_unions_matching_tables_with_table_suffix
+      - unit/server/wildcard_table_suffix_filter_narrows_to_one_shard
+      - unit/server/wildcard_table_excludes_views_and_external_tables
+      - unit/server/wildcard_table_with_no_matches_fails_explicitly
+    reason: "A table path ending in '*' (dataset.prefix*) is expanded, before materialization, to every real standard table in that dataset whose name starts with prefix (views and external tables are never matched); each one is materialized under its own real name into the embedded engine's isolated catalog, and the engine's own native wildcard-table support (goccy/googlesqlite's internal wildcard_table.go) resolves the reference into a genuine UNION ALL with a computed _TABLE_SUFFIX column — this project supplies the correct candidate table set, not the union logic itself. Expansion happens ahead of requirePartitionFilter enforcement and partition pruning, so a partitioned shard matched by a wildcard is still checked/pruned correctly per shard. Marked partial because: SELECT * includes _TABLE_SUFFIX as a real column rather than hiding it as BigQuery's own pseudocolumn does (an engine-level behavior not currently post-processed around); matching is scoped to a single dataset/project, matching real BigQuery's own scoping; and a wildcard resolving to zero tables surfaces the embedded engine's own error rather than a LocaQL-authored one."
   sql.information_schema.priority:
     status: partial
     fidelity: medium

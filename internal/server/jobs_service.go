@@ -3,8 +3,10 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -37,6 +39,7 @@ type jobRecord struct {
 	LoadFieldDelimiter       string
 	LoadSkipLeadingRows      int
 	LoadCompression          string
+	LoadAutodetect           bool
 	ExtractSourceTable       tableReference
 	ExtractDestinationURIs   []string
 	ExtractDestinationFormat string
@@ -119,6 +122,7 @@ type jobInsertOptions struct {
 	LoadFieldDelimiter       string
 	LoadSkipLeadingRows      int
 	LoadCompression          string
+	LoadAutodetect           bool
 	ExtractSourceTable       tableReference
 	ExtractDestinationURIs   []string
 	ExtractDestinationFormat string
@@ -279,6 +283,7 @@ func (s *jobService) insert(opts jobInsertOptions) (*jobRecord, bool) {
 		LoadFieldDelimiter:       opts.LoadFieldDelimiter,
 		LoadSkipLeadingRows:      opts.LoadSkipLeadingRows,
 		LoadCompression:          strings.TrimSpace(opts.LoadCompression),
+		LoadAutodetect:           opts.LoadAutodetect,
 		ExtractSourceTable:       opts.ExtractSourceTable,
 		ExtractDestinationURIs:   cloneStringSlice(opts.ExtractDestinationURIs),
 		ExtractDestinationFormat: strings.TrimSpace(opts.ExtractDestinationFormat),
@@ -359,7 +364,48 @@ func (s *jobService) recordJobOutcomeLocked(jr *jobRecord) {
 	}
 }
 
+// recoverJobPanic converts a panic anywhere in this job's synchronous
+// execution chain into a normal failed-job outcome instead of letting it
+// propagate and crash the entire server process — every other in-flight
+// request would otherwise go down with it, since a goroutine panic with no
+// recover is always fatal to the whole Go process, not just that goroutine.
+// Discovered as a real, reproducible failure while building this project's
+// own benchmark suite (see docs/benchmarks.md): the embedded engine's WASM
+// bridge (goccy/googlesqlite -> goccy/go-googlesql) can panic with a
+// memory-corruption-shaped "slice bounds out of range" error from
+// database/sql.Open itself, after enough sequential/concurrent
+// materializations over a long-running process's lifetime — and this
+// reproduced on Linux/WSL, the officially supported platform, not just the
+// already-documented native Windows/macOS WASM trap (KNOWN-DIVERGENCES.md
+// Blocking #2, a distinct issue). This does not fix that root cause, which
+// lives in the third-party WASM bridge, not this project's own code; it
+// only contains the damage to the one job that triggered it. The failed job
+// surfaces through the exact same failedTotal/recentFailures path any other
+// job failure does (recordJobOutcomeLocked), so no new diagnostics plumbing
+// was needed for it to show up in GET /_emulator/diagnostics.
+func (s *jobService) recoverJobPanic(jobID, projectID string) {
+	r := recover()
+	if r == nil {
+		return
+	}
+	log.Printf("job %s (project %s) panicked and was recovered at the job-executor boundary: %v\n%s", jobID, projectID, r, debug.Stack())
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	jr := s.jobsByProject[projectID][jobID]
+	if jr == nil {
+		return
+	}
+	jr.State = jobStateDone
+	jr.ErrorReason = "internalError"
+	jr.ErrorMessage = fmt.Sprintf("job execution panicked and was recovered at the process boundary: %v", r)
+	jr.EndedAt = time.Now().UTC()
+	s.recordJobOutcomeLocked(jr)
+	_ = s.persistLocked()
+}
+
 func (s *jobService) run(jobID, projectID string) {
+	defer s.recoverJobPanic(jobID, projectID)
 	s.mu.RLock()
 	jrForPriority := s.jobsByProject[projectID][jobID]
 	priority := ""
