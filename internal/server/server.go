@@ -42,6 +42,7 @@ type Server struct {
 	logger   *slog.Logger
 
 	streamingInserts *streamingInsertDedupStore
+	sqlEngines       *sqlEnginePool
 }
 
 func New(reg capabilities.Registry) *Server {
@@ -58,6 +59,7 @@ func New(reg capabilities.Registry) *Server {
 		uploads:          newBigQueryUploadService(),
 		logger:           newDefaultLogger(),
 		streamingInserts: newStreamingInsertDedupStore(),
+		sqlEngines:       newSQLEnginePool(),
 	}
 	s.jobs.copyExecutor = s.executeCopyJob
 	s.jobs.loadExecutor = s.executeLoadJob

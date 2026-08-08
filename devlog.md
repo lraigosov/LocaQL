@@ -1343,3 +1343,30 @@ umDmlAffectedRows, habilitando compatibilidad con el seguimiento de filas afecta
 - Actualización de la matriz de capacidades con soporte de streaming inserts y wildcard tables.
 - Mejora de la infraestructura de CI con flujos de validación automatizados.
 - Verificación de integridad del árbol de trabajo y cumplimiento de políticas de commit antes del push final.
+
+## 2026-08-08
+### Sesión 34
+- Implementación de un supervisor de procesos independiente (locaql-supervisor) para gestionar el ciclo de vida del servidor principal y permitir reinicios automáticos.
+- Incorporación de un pool de motores SQL (sqlEnginePool) en el servidor para mejorar la fiabilidad y evitar la contención en procesos de larga duración.
+- Refactorización de cmd/locaql/main.go para integrar la lógica de auto-reinicio y comunicación con el supervisor.
+- Adición de pruebas de integración para validar el comportamiento del supervisor bajo señales de terminación y fallos inesperados.
+- Actualización de documentación técnica y benchmarks para reflejar las mejoras de disponibilidad y rendimiento.
+- Validación completa en WSL con go test ./... en estado PASS.
+
+## 2026-08-08
+### Sesión 34
+- Implementación de un supervisor de procesos independiente (locaql-supervisor) para gestionar el ciclo de vida del servidor principal y permitir reinicios automáticos.
+- Incorporación de un pool de motores SQL (sqlEnginePool) en el servidor para mejorar la fiabilidad y evitar la contención en procesos de larga duración.
+- Refactorización de cmd/locaql/main.go para integrar la lógica de auto-reinicio y comunicación con el supervisor.
+- Adición de pruebas de integración para validar el comportamiento del supervisor bajo señales de terminación y fallos inesperados.
+- Actualización de documentación técnica y benchmarks para reflejar las mejoras de disponibilidad y rendimiento.
+- Validación completa en WSL con go test ./... en estado PASS.
+
+## 2026-08-08
+### Sesión 34
+- Implementación de un supervisor de procesos independiente (locaql-supervisor) para gestionar el ciclo de vida del servidor principal y permitir reinicios automáticos.
+- Incorporación de un pool de motores SQL (sqlEnginePool) en el servidor para mejorar la fiabilidad y evitar la contención en procesos de larga duración.
+- Refactorización de cmd/locaql/main.go para integrar la lógica de auto-reinicio y comunicación con el supervisor.
+- Adición de pruebas de integración para validar el comportamiento del supervisor bajo señales de terminación y fallos inesperados.
+- Actualización de documentación técnica y benchmarks para reflejar las mejoras de disponibilidad y rendimiento.
+- Validación completa en WSL con go test ./... en estado PASS.

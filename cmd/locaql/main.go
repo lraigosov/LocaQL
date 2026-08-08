@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -9,14 +10,27 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/lraigosov/LocaQL/internal/capabilities"
 	"github.com/lraigosov/LocaQL/internal/conformance"
+	"github.com/lraigosov/LocaQL/internal/procsupervisor"
 	"github.com/lraigosov/LocaQL/internal/server"
 	"github.com/lraigosov/LocaQL/internal/workspace"
 )
+
+// selfRestartChildEnv marks the re-exec'd child process started by
+// --self-restart, so it runs the server directly instead of trying to
+// supervise itself recursively.
+const selfRestartChildEnv = "LOCAQL_SELF_RESTART_CHILD=1"
+
+func isSelfRestartChild() bool {
+	return os.Getenv("LOCAQL_SELF_RESTART_CHILD") != ""
+}
 
 func main() {
 	if len(os.Args) < 2 {
@@ -250,36 +264,93 @@ func runWorkspaceValidate(args []string) error {
 	return nil
 }
 
-func runStart(args []string) error {
+// startConfig holds runStart's parsed flags, kept separate so
+// parseStartFlags can be exercised directly in tests without needing to
+// actually start a server or listener.
+type startConfig struct {
+	addr            string
+	storageGRPCAddr string
+	capPath         string
+	selfRestart     bool
+	restartPolicy   procsupervisor.RestartPolicy
+}
+
+func parseStartFlags(args []string) (startConfig, error) {
 	fs := flag.NewFlagSet("start", flag.ContinueOnError)
 	addr := fs.String("addr", ":9050", "http address")
 	storageGRPCAddr := fs.String("storage-grpc-addr", ":9060", "BigQuery Storage Read API gRPC address")
 	capPath := fs.String("capabilities", "capabilities/registry.yaml", "capabilities registry path")
+	selfRestart := fs.Bool("self-restart", false, "restart automatically if the process crashes (see KNOWN-DIVERGENCES.md Blocking #3); re-executes this same binary as a supervised child instead of running the server in this process directly")
+	maxRestarts := fs.Int("self-restart-max-restarts", 20, "give up and exit if the process crashes this many times within --self-restart-window, instead of restarting it again")
+	restartWindow := fs.Duration("self-restart-window", 10*time.Minute, "sliding window --self-restart-max-restarts is measured over")
+	restartBackoff := fs.Duration("self-restart-backoff", 2*time.Second, "delay before restarting a crashed process")
 	if err := fs.Parse(args); err != nil {
+		return startConfig{}, err
+	}
+	return startConfig{
+		addr: *addr, storageGRPCAddr: *storageGRPCAddr, capPath: *capPath, selfRestart: *selfRestart,
+		restartPolicy: procsupervisor.RestartPolicy{MaxRestarts: *maxRestarts, Window: *restartWindow, Backoff: *restartBackoff},
+	}, nil
+}
+
+func runStart(args []string) error {
+	cfg, err := parseStartFlags(args)
+	if err != nil {
 		return err
 	}
 
-	reg, err := capabilities.Load(*capPath)
+	if cfg.selfRestart && !isSelfRestartChild() {
+		return runSelfSupervised(args, cfg.restartPolicy)
+	}
+
+	return runServer(cfg.addr, cfg.storageGRPCAddr, cfg.capPath)
+}
+
+func runServer(addr, storageGRPCAddr, capPath string) error {
+	reg, err := capabilities.Load(capPath)
 	if err != nil {
 		return err
 	}
 
 	srv := server.New(reg)
 
-	grpcListener, err := net.Listen("tcp", *storageGRPCAddr)
+	grpcListener, err := net.Listen("tcp", storageGRPCAddr)
 	if err != nil {
-		return fmt.Errorf("listen for storage gRPC on %s: %w", *storageGRPCAddr, err)
+		return fmt.Errorf("listen for storage gRPC on %s: %w", storageGRPCAddr, err)
 	}
 	grpcServer := srv.NewStorageGRPCServer()
 	go func() {
-		log.Printf("LocaQL Storage Read API (gRPC) listening on %s", *storageGRPCAddr)
+		log.Printf("LocaQL Storage Read API (gRPC) listening on %s", storageGRPCAddr)
 		if err := grpcServer.Serve(grpcListener); err != nil {
 			log.Printf("storage gRPC server stopped: %v", err)
 		}
 	}()
 
-	log.Printf("LocaQL listening on %s", *addr)
-	return http.ListenAndServe(*addr, srv.Handler())
+	log.Printf("LocaQL listening on %s", addr)
+	return http.ListenAndServe(addr, srv.Handler())
+}
+
+// runSelfSupervised re-execs this same binary as a child (marked via
+// selfRestartChildEnv so it runs the server directly instead of recursing
+// into this same supervisor branch) and restarts it automatically on an
+// unexpected exit, bounded by policy — the same mitigation
+// cmd/locaql-supervisor applies to the emulator, made available to
+// deployments that run the bare `locaql` binary directly instead. See
+// internal/procsupervisor's doc comment for why this exists.
+func runSelfSupervised(originalArgs []string, policy procsupervisor.RestartPolicy) error {
+	exePath, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("resolve own executable path for --self-restart: %w", err)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	return procsupervisor.Supervise(ctx, exePath, selfRestartChildArgs(originalArgs), []string{selfRestartChildEnv}, policy)
+}
+
+func selfRestartChildArgs(originalArgs []string) []string {
+	return append([]string{"start"}, originalArgs...)
 }
 
 func runCapabilities(args []string) error {
@@ -340,7 +411,7 @@ func runConformance(args []string) error {
 func printUsage() {
 	fmt.Println("LocaQL CLI")
 	fmt.Println("Usage:")
-	fmt.Println("  locaql start [--addr :9050] [--capabilities capabilities/registry.yaml]")
+	fmt.Println("  locaql start [--addr :9050] [--capabilities capabilities/registry.yaml] [--self-restart]")
 	fmt.Println("  locaql capabilities [--capabilities capabilities/registry.yaml]")
 	fmt.Println("  locaql conformance [--base-url http://localhost:9050] [--cases test/conformance/cases/foundation.yaml]")
 	fmt.Println("  locaql workspace validate [--path .] [--json]")

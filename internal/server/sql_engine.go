@@ -479,11 +479,11 @@ func (s *Server) executeRealSQLQueryVisitingWithParams(projectID, queryText stri
 // logical partitions; physical column pruning and billing parity remain out of
 // scope for this metric.
 func (s *Server) executeRealSQLQueryVisitingWithParamsAndStats(projectID, queryText string, visiting map[string]bool, sess *sessionRecord, paramMode string, params []storedQueryParameter) ([]tableField, [][]string, int64, error) {
-	db, processedBytes, err := s.openMaterializedSQLDatabase(projectID, queryText, visiting, sess, nil, true)
+	db, release, processedBytes, err := s.openMaterializedSQLDatabase(projectID, queryText, visiting, sess, nil, true)
 	if err != nil {
 		return nil, nil, 0, err
 	}
-	defer db.Close()
+	defer release()
 
 	args, err := buildQueryArgs(paramMode, params)
 	if err != nil {
@@ -545,11 +545,13 @@ func (s *Server) expandWildcardTableRefs(projectID string, refs []datasetTableRe
 // FROM/JOIN, while a CREATE TABLE target needs its dataset schema created even
 // though the table does not exist yet. allowPartitionPruning must remain false
 // for persistent mutations so their materialized source cannot be narrowed.
-func (s *Server) openMaterializedSQLDatabase(projectID, queryText string, visiting map[string]bool, sess *sessionRecord, extraRefs []datasetTableRef, allowPartitionPruning bool) (*sql.DB, int64, error) {
-	db, err := sql.Open("googlesqlite", ":memory:")
+func (s *Server) openMaterializedSQLDatabase(projectID, queryText string, visiting map[string]bool, sess *sessionRecord, extraRefs []datasetTableRef, allowPartitionPruning bool) (db *sql.DB, release func(), processedBytes int64, err error) {
+	pe, err := s.sqlEngines.acquire()
 	if err != nil {
-		return nil, 0, fmt.Errorf("open real SQL engine: %w", err)
+		return nil, nil, 0, err
 	}
+	db = pe.db
+	release = func() { s.sqlEngines.release(pe) }
 
 	refs := s.expandWildcardTableRefs(projectID, referencedTables(queryText, projectID))
 	requireFilterCheck := make(map[datasetTableRef]bool, len(refs)+len(extraRefs))
@@ -571,16 +573,14 @@ func (s *Server) openMaterializedSQLDatabase(projectID, queryText string, visiti
 		seen[ref] = true
 		combined = append(combined, ref)
 	}
-	createdSchemas := map[string]bool{}
-	var processedBytes int64
 	for _, ref := range combined {
 		var catalogTable *tableRecord
 		if requireFilterCheck[ref] && !strings.EqualFold(ref.datasetID, sessionDatasetName) {
 			if table, ok, _ := s.tables.get(projectID, ref.datasetID, ref.tableID); ok {
 				catalogTable = table
 				if table.RequirePartitionFilter && !queryHasPartitionFilter(queryText, table) {
-					db.Close()
-					return nil, 0, fmt.Errorf("cannot query over table %s.%s without a filter on its partitioning column", ref.datasetID, ref.tableID)
+					s.sqlEngines.release(pe)
+					return nil, nil, 0, fmt.Errorf("cannot query over table %s.%s without a filter on its partitioning column", ref.datasetID, ref.tableID)
 				}
 			}
 		}
@@ -601,18 +601,26 @@ func (s *Server) openMaterializedSQLDatabase(projectID, queryText string, visiti
 			var ok bool
 			fields, rows, ok, err = s.resolveTableRowsVisiting(projectID, ref.datasetID, ref.tableID, visiting)
 			if err != nil {
-				db.Close()
-				return nil, 0, err
+				s.sqlEngines.release(pe)
+				return nil, nil, 0, err
 			}
 			found = ok
 		}
-		if !createdSchemas[ref.datasetID] {
-			if _, err := db.Exec("CREATE SCHEMA " + quoteIdent(ref.datasetID)); err != nil {
-				db.Close()
-				return nil, 0, fmt.Errorf("materialize dataset %s: %w", ref.datasetID, err)
-			}
-			createdSchemas[ref.datasetID] = true
+		if err := pe.ensureSchema(ref.datasetID); err != nil {
+			s.sqlEngines.release(pe)
+			return nil, nil, 0, fmt.Errorf("materialize dataset %s: %w", ref.datasetID, err)
 		}
+		// Marked here, unconditionally, not only after a successful
+		// materializeTable below: a DDL/DML target that does not exist yet
+		// in LocaQL's own catalog (found == false, e.g. a fresh CREATE
+		// TABLE) is never passed to materializeTable, but the statement the
+		// caller runs against this same connection right after
+		// openMaterializedSQLDatabase returns creates it for real on the
+		// engine regardless — release() must drop it before this connection
+		// is reused, or the next reuse's CREATE TABLE for the same name
+		// fails with "table already exists" (a real bug caught by
+		// TestPersistentCreateTableSchemaAndReplace while building this).
+		pe.markTableMaterialized(ref.datasetID, ref.tableID)
 		if !found {
 			continue
 		}
@@ -629,11 +637,11 @@ func (s *Server) openMaterializedSQLDatabase(projectID, queryText string, visiti
 		processedBytes += estimateRowsByteSize(rows)
 		fields, rows = materializeIngestionPseudocolumns(catalogTable, fields, rows)
 		if err := materializeTable(db, ref.datasetID, ref.tableID, fields, rows); err != nil {
-			db.Close()
-			return nil, 0, fmt.Errorf("materialize table %s.%s: %w", ref.datasetID, ref.tableID, err)
+			s.sqlEngines.release(pe)
+			return nil, nil, 0, fmt.Errorf("materialize table %s.%s: %w", ref.datasetID, ref.tableID, err)
 		}
 	}
-	return db, processedBytes, nil
+	return db, release, processedBytes, nil
 }
 
 // rewriteIngestionPseudocolumns replaces public pseudocolumn identifiers only
