@@ -1,15 +1,13 @@
 // locaql-bench is a small, dependency-free REST benchmark client for any
-// BigQuery-emulator-compatible server. It drives the same HTTP workloads
+// BigQuery-REST-compatible server. It drives the same HTTP workloads
 // against whatever --endpoint/--project it is pointed at, so the exact same
-// binary produces a reproducible, apples-to-apples comparison between
-// LocaQL and a different emulator (e.g. goccy/bigquery-emulator) instead of
-// two hand-tuned, drifting scripts. See docs/benchmarks.md for methodology,
+// binary produces reproducible results across runs and hardware instead of
+// hand-tuned, drifting scripts. See docs/benchmarks.md for methodology,
 // published results and their environment.
 //
 // Usage:
 //
 //	locaql-bench --endpoint http://127.0.0.1:9050 --project bench --label LocaQL
-//	locaql-bench --endpoint http://127.0.0.1:9051 --project bench --label goccy
 package main
 
 import (

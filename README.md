@@ -14,42 +14,8 @@ This repository currently implements incremental scope from the master plan:
 - Real query/load/extract/copy executors; query DDL/DML persists atomically while slot timing remains synthetic.
 - Configurable worker limits and resource-level serialization for conflicting job mutations.
 
-## LocaQL vs. `goccy/bigquery-emulator`
-
-[`goccy/bigquery-emulator`](https://github.com/goccy/bigquery-emulator) is the more established BigQuery emulator (active since 2022, broader external adoption) and both projects sit on the same underlying GoogleSQL engine lineage (`goccy/googlesqlite`), so query-language coverage is largely comparable between them. The honest, source-verified difference — not just docs, since goccy's own `docs/feature-support.md` self-declares a stale `Last reviewed` date — looks like this:
-
-**Where LocaQL is currently ahead** (verified against goccy's source, not just its docs):
-
-| Area | LocaQL | `goccy/bigquery-emulator` |
-| --- | --- | --- |
-| Copy jobs | Real, materializes destination rows | Not implemented |
-| Dataset undelete | Real (tombstone-based) | Not implemented |
-| `INFORMATION_SCHEMA` | `SCHEMATA`/`TABLES`/`COLUMNS`/`TABLE_OPTIONS`/`JOBS*`/`PARTITIONS`/`ROUTINES`/`PARAMETERS`/`MODELS`/`VIEWS` | `SCHEMATA`/`TABLES`/`TABLE_OPTIONS`/`COLUMNS` only |
-| Sessions / multi-statement transactions over REST | Real (scoped to `_SESSION.<table>`) | Not implemented |
-| Load/extract formats | NDJSON, CSV, Avro and Parquet, both directions | No Avro (load or extract); no Parquet on extract |
-| Schema autodetect | NDJSON, CSV, Avro and Parquet (load jobs and external tables) | CSV only, per its own docs |
-| Partitioning fidelity | Real pseudocolumns (`_PARTITIONTIME`/`_PARTITIONDATE`), `requirePartitionFilter`, and logical partition pruning | Partition/clustering metadata accepted but not emulated, per its own docs |
-| Local web console, diagnostics, workspace CLI/REST/UI | Yes, all three | None of these exist |
-| Fake Google Cloud Storage | Built in, one process | Requires a separate GCS emulator |
-| Divergences from real BigQuery | Published and classified by severity ([`KNOWN-DIVERGENCES.md`](KNOWN-DIVERGENCES.md)) | Feature matrix only, no severity/workaround classification |
-
-**Roughly at parity today:**
-
-- **External tables** — both support them for real (goccy added this after its docs were last reviewed, source-verified here). LocaQL re-reads the source live on every query and accepts local file paths directly; goccy snapshots at table-creation time (by its own admission, diverging from real BigQuery's live-read semantics) and only supports `gs://` sources. Neither is a strict upgrade over the other.
-- **Table snapshots/clones/time travel, IAM, BigQuery ML** — neither project implements these; both treat most of this as explicit non-goals for a local emulator.
-
-**Where `goccy/bigquery-emulator` is still ahead:**
-
-- **Multi-client conformance**: its CI runs official clients for Python, Ruby, PHP, Node.js, Java and `bq`; LocaQL's official-client CI coverage is Python only today.
-- **Community and time-in-production**: active since 2022, with far more external issues, forks and real-world regressions found by third parties.
-- **BigQuery Storage API breadth**: Arrow framing and multi-stream `SplitReadStream` support, versus LocaQL's Avro-only, single-stream implementation.
-- **Native runtime portability**: LocaQL's query engine only reliably runs on Linux/WSL today (see [Requirements](#requirements)).
-
-This comparison is maintained honestly in both directions — see [`KNOWN-DIVERGENCES.md`](KNOWN-DIVERGENCES.md) for what LocaQL itself doesn't do yet, classified by how much it actually matters for local development.
-
 ## Table of Contents
 
-- [LocaQL vs. goccy/bigquery-emulator](#locaql-vs-goccybigquery-emulator)
 - [Requirements](#requirements)
 - [Quick Start (WSL)](#quick-start-wsl)
 - [Capability Registry](#capability-registry)
@@ -991,7 +957,7 @@ Current UI scope:
 make bench
 ```
 
-Runs this project's own Go benchmarks (`internal/server/bench_test.go`) against the real HTTP handler stack — a local iteration signal for query latency, streaming-insert throughput and concurrent-query behavior. This is distinct from the reproducible, apples-to-apples comparison against `goccy/bigquery-emulator` (same client binary, [`cmd/locaql-bench`](cmd/locaql-bench), pointed at each server in turn): see [`docs/benchmarks.md`](docs/benchmarks.md) for methodology, published results, and a real reliability issue this benchmarking work surfaced and disclosed in full (a WASM-bridge crash under sustained load — see [Known Divergences](KNOWN-DIVERGENCES.md) Blocking #3).
+Runs this project's own Go benchmarks (`internal/server/bench_test.go`) against the real HTTP handler stack — a local iteration signal for query latency, streaming-insert throughput and concurrent-query behavior. [`cmd/locaql-bench`](cmd/locaql-bench) is a dependency-free REST client that drives the same workloads over the network against any BigQuery-REST-compatible server, useful for reproducing results on your own hardware. See [`docs/benchmarks.md`](docs/benchmarks.md) for methodology, published results, and a real reliability issue this benchmarking work surfaced and disclosed in full (a WASM-bridge crash under sustained load — see [Known Divergences](KNOWN-DIVERGENCES.md) Blocking #3).
 
 ## Building and Releasing
 

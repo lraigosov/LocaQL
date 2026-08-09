@@ -5,11 +5,10 @@ package server
 // calling internal functions directly — the number that matters is what a
 // real client sees over REST, not a microbenchmark of one internal call.
 // Run with: go test -bench=. -benchmem -run '^$' ./internal/server/...
-// (see `make bench`). These are LocaQL-only, local-iteration signals; the
-// reproducible comparison against goccy/bigquery-emulator lives in
-// cmd/locaql-bench and docs/benchmarks.md, since that requires driving two
-// separate real server processes over the network, not two in-process
-// httptest handlers.
+// (see `make bench`). These are local-iteration signals; the separate,
+// reproducible network benchmark lives in cmd/locaql-bench and
+// docs/benchmarks.md, since that requires driving a real server process
+// over the network, not an in-process httptest handler.
 
 import (
 	"encoding/json"

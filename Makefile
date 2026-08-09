@@ -87,12 +87,11 @@ vuln:
 	govulncheck -scan package ./...
 
 # bench runs this project's own Go benchmarks (internal/server/bench_test.go)
-# against the real HTTP handler stack — a local iteration signal, not a
-# comparison against another emulator. -benchtime=2s per benchmark keeps a
-# full run under a minute; override with BENCHTIME=... for a longer, less
-# noisy run. See docs/benchmarks.md for the separate, reproducible
-# comparison against goccy/bigquery-emulator (cmd/locaql-bench), which
-# requires driving two real server processes and isn't part of this target.
+# against the real HTTP handler stack — a local iteration signal.
+# -benchtime=2s per benchmark keeps a full run under a minute; override
+# with BENCHTIME=... for a longer, less noisy run. See docs/benchmarks.md
+# for the separate, reproducible network benchmark (cmd/locaql-bench),
+# which requires driving a real server process and isn't part of this target.
 BENCHTIME ?= 2s
 bench:
 	go test -run '^$$' -bench=. -benchtime=$(BENCHTIME) -benchmem ./internal/server/...
