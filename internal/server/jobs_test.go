@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -1972,6 +1973,66 @@ func TestJobsGetQueryResults(t *testing.T) {
 	}
 	if _, present := out["pageToken"]; present {
 		t.Fatalf("expected final query-results page to omit pageToken, got %v", out["pageToken"])
+	}
+}
+
+// TestJobsAnonymousDestinationTable exercises the code path official client
+// libraries use when they read a query job's results via tabledata.list
+// against configuration.query.destinationTable instead of polling
+// jobs.getQueryResults (the official Ruby client's QueryJob#data does this) —
+// a real gap found by test/clients/ruby/persistent_ddl_dml.rb against a real
+// server: LocaQL never populated destinationTable at all, and once it did,
+// tabledata.list's real-table pagination default (2 rows) silently truncated
+// a 5-row result set that the client never asked to page through.
+func TestJobsAnonymousDestinationTable(t *testing.T) {
+	s := newTestServer()
+	body := `{"configuration":{"query":{"query":"SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5"}}}`
+	createReq := httptest.NewRequest(http.MethodPost, "/bigquery/v2/projects/p1/jobs", strings.NewReader(body))
+	createReq.Header.Set("Content-Type", "application/json")
+	createRes := httptest.NewRecorder()
+	s.Handler().ServeHTTP(createRes, createReq)
+	if createRes.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d", createRes.Code)
+	}
+
+	var created map[string]any
+	if err := json.NewDecoder(createRes.Body).Decode(&created); err != nil {
+		t.Fatalf("decode created job: %v", err)
+	}
+	cfg := created["configuration"].(map[string]any)["query"].(map[string]any)
+	dest, ok := cfg["destinationTable"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected configuration.query.destinationTable, got %v", cfg)
+	}
+	datasetID := dest["datasetId"].(string)
+	tableID := dest["tableId"].(string)
+	if datasetID != anonymousQueryResultsDatasetID {
+		t.Fatalf("expected datasetId %q, got %q", anonymousQueryResultsDatasetID, datasetID)
+	}
+
+	dataReq := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/bigquery/v2/projects/p1/datasets/%s/tables/%s/data", datasetID, tableID), nil)
+	dataRes := httptest.NewRecorder()
+	s.Handler().ServeHTTP(dataRes, dataReq)
+	if dataRes.Code != http.StatusOK {
+		t.Fatalf("expected 200 reading anonymous destination table, got %d: %s", dataRes.Code, dataRes.Body.String())
+	}
+	var dataOut map[string]any
+	if err := json.NewDecoder(dataRes.Body).Decode(&dataOut); err != nil {
+		t.Fatalf("decode tabledata.list: %v", err)
+	}
+	rows, ok := dataOut["rows"].([]any)
+	if !ok || len(rows) != 5 {
+		t.Fatalf("expected all 5 rows with no maxResults specified, got %v", dataOut["rows"])
+	}
+	if _, present := dataOut["pageToken"]; present {
+		t.Fatalf("expected no pageToken when every row fit on the default page, got %v", dataOut["pageToken"])
+	}
+
+	notFoundReq := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/bigquery/v2/projects/p1/datasets/%s/tables/anondoes-not-exist/data", anonymousQueryResultsDatasetID), nil)
+	notFoundRes := httptest.NewRecorder()
+	s.Handler().ServeHTTP(notFoundRes, notFoundReq)
+	if notFoundRes.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for an unknown anonymous table, got %d", notFoundRes.Code)
 	}
 }
 

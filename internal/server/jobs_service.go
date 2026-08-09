@@ -978,6 +978,24 @@ func renderJobResource(j *jobRecord) map[string]any {
 			"query": map[string]any{
 				"query":    j.QueryText,
 				"priority": j.Priority,
+				// Real BigQuery always assigns a destination table to a query
+				// job — a user-specified one, or an anonymous one otherwise —
+				// even for a plain SELECT never written anywhere on purpose.
+				// Omitting it isn't just incomplete: the official Ruby
+				// client's QueryJob#data reads this field directly and calls
+				// tabledata.list against it, rather than polling
+				// jobs.getQueryResults like the other client libraries do;
+				// with no destinationTable it raised a bare NoMethodError on
+				// nil. LocaQL never materializes query results as a real
+				// project:dataset.table row set, so this points at a virtual
+				// table (see anonymousQueryResultsDatasetID/
+				// anonymousQueryResultsTableID) that tabledata.list resolves
+				// straight back to this job's cached result set.
+				"destinationTable": map[string]string{
+					"projectId": j.ProjectID,
+					"datasetId": anonymousQueryResultsDatasetID,
+					"tableId":   anonymousQueryResultsTableID(j.JobID),
+				},
 			},
 		}
 	}

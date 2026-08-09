@@ -225,6 +225,40 @@ jobs:
           done
           bash test/clients/bq/persistent_ddl_dml.sh --endpoint=http://127.0.0.1:19054
 
+  ruby-client:
+    name: Official Ruby client (BigQuery)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+          bundler-cache: true
+          working-directory: test/clients/ruby
+      - name: Exercise persistent SQL mutations and streaming inserts
+        run: |
+          go build -o /tmp/locaql-ruby-client-server ./cmd/locaql
+          /tmp/locaql-ruby-client-server start \
+            --addr 127.0.0.1:19055 \
+            --storage-grpc-addr 127.0.0.1:19065 \
+            --capabilities "$PWD/capabilities/registry.yaml" &
+          server_pid=$!
+          trap 'kill "$server_pid"' EXIT
+          for attempt in $(seq 1 40); do
+            if curl --fail --silent http://127.0.0.1:19055/_emulator/health >/dev/null; then
+              break
+            fi
+            if [ "$attempt" -eq 40 ]; then
+              echo "LocaQL did not become healthy" >&2
+              exit 1
+            fi
+            sleep 0.25
+          done
+          (cd test/clients/ruby && bundle exec ruby persistent_ddl_dml.rb --endpoint=http://127.0.0.1:19055)
+
   native:
     name: Native build/vet/test (${{ matrix.os }})
     strategy:
