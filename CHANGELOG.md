@@ -4,6 +4,8 @@ All notable user-facing changes to LocaQL are documented here, in the style of [
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-08-09
+
 ### Added
 - Soak testing for the restart-loop mitigations shipped in `v0.12.0`: `cmd/locaql-bench --soak-duration` sustains load indefinitely (concurrent workers against `SELECT 1 AS one`, no dataset/table dependency) and tracks outage shape — how many distinct continuous-failure periods occurred and how long the longest one lasted — rather than just an error count, failing only if the server stays down longer than `--soak-max-outage` (default 60s). `.github/workflows/soak-test.yml` (manual `workflow_dispatch`, default 20 minutes) runs it against a `locaql start --self-restart` process and uploads the report/log as artifacts, closing the "validate the restart loop over many cycles" follow-up from `v0.12.0`. See [Known Divergences](KNOWN-DIVERGENCES.md) Blocking #3 and [`docs/benchmarks.md`](docs/benchmarks.md#soak-testing-the-restart-loop).
 - Official Node.js client conformance: `test/clients/node/persistent_ddl_dml.js`, pinning `@google-cloud/bigquery 8.3.1`, exercises the same persistent SQL mutations (INSERT/UPDATE/MERGE/DELETE/CTAS/DROP) the Python conformance suite already covers, plus a streaming insert against the resulting table, wired into CI as a new `node-client` job. See [README: Persistent DDL and DML](README.md#persistent-ddl-and-dml).
