@@ -193,6 +193,38 @@ jobs:
           done
           java -jar test/clients/java/target/locaql-java-client-conformance.jar --endpoint=http://127.0.0.1:19053
 
+  bq-client:
+    name: Official bq CLI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: google-github-actions/setup-gcloud@v2
+        with:
+          install_components: bq
+      - name: Exercise persistent SQL mutations against the hand-written discovery document
+        run: |
+          go build -o /tmp/locaql-bq-client-server ./cmd/locaql
+          /tmp/locaql-bq-client-server start \
+            --addr 127.0.0.1:19054 \
+            --storage-grpc-addr 127.0.0.1:19064 \
+            --capabilities "$PWD/capabilities/registry.yaml" &
+          server_pid=$!
+          trap 'kill "$server_pid"' EXIT
+          for attempt in $(seq 1 40); do
+            if curl --fail --silent http://127.0.0.1:19054/_emulator/health >/dev/null; then
+              break
+            fi
+            if [ "$attempt" -eq 40 ]; then
+              echo "LocaQL did not become healthy" >&2
+              exit 1
+            fi
+            sleep 0.25
+          done
+          bash test/clients/bq/persistent_ddl_dml.sh --endpoint=http://127.0.0.1:19054
+
   native:
     name: Native build/vet/test (${{ matrix.os }})
     strategy:

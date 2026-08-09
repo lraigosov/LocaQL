@@ -274,6 +274,12 @@ capabilities:
     tests:
       - unit/server/jobs_request_id_idempotency
     reason: requestId behavior implemented for jobs.insert and queries endpoint with TTL-based replay window
+  rest.discovery_document:
+    status: partial
+    fidelity: low
+    tests:
+      - clients/bq/persistent_ddl_dml
+    reason: "GET /$discovery/rest?version=v2 serves a hand-written discovery document scoped to the jobs.* resource only (insert/get/list/query/getQueryResults/cancel) — the official `bq` CLI (unlike every other official client library) is built on the older apitools/Discovery-API generator and fetches this document before issuing any real API call, so without it `bq` cannot run at all. rootUrl/baseUrl/mtlsRootUrl are rewritten to the request's own Host at serve time. Datasets/tables/tabledata resources are deliberately not described here, so bq subcommands depending on them (mk, ls datasets/tables, load, extract, cp, insert) are not yet supported; `bq query`/`bq show -j`/`bq cancel`/`bq ls -j` are."
   rest.jobs.executors.query_load_extract_copy:
     status: partial
     fidelity: medium

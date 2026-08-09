@@ -117,6 +117,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/_emulator/workspace/plan", s.workspacePlan)
 	s.mux.HandleFunc("/_emulator/workspace/diff", s.workspaceDiff)
 	s.mux.HandleFunc("/_emulator/workspace/apply", s.workspaceApply)
+	s.mux.HandleFunc("/$discovery/rest", s.bigQueryDiscoveryDocument)
 	s.mux.HandleFunc("/bigquery/v2/projects/", s.bigQueryV2)
 	s.mux.HandleFunc("/upload/bigquery/v2/projects/", s.bigQueryJobUpload)
 	s.mux.HandleFunc("/storage/v1/b", s.gcsBucketsCollection)
