@@ -18,6 +18,11 @@ All notable user-facing changes to LocaQL are documented here, in the style of [
 - Bumped the pinned Go toolchain from `1.25.0` to `1.25.12`, closing several stdlib CVEs fixed in the Go 1.25.1–1.25.3 point releases (`net/url`, `encoding/pem`, `crypto/tls`, `crypto/x509`, `net/http`) that `govulncheck` (added in this same change) surfaced immediately upon first use.
 - Bumped `google.golang.org/grpc` `v1.82.0` → `v1.82.1` (GO-2026-6061: xDS RBAC authorization engine and HTTP/2 transport server), `golang.org/x/text` `v0.38.0` → `v0.39.0` (GO-2026-5970: infinite loop on invalid input), and `github.com/klauspost/compress` `v1.18.2` → `v1.18.7` (GO-2026-5841: out-of-bounds read in `s2`) — all three were known, already-patched CVEs found by the same first `govulncheck` run.
 
+## [0.11.1] - 2026-08-07
+
+### Fixed
+- `CHANGELOG.md` had been committed with CRLF line endings at least once — likely via a GitHub web merge-conflict resolution, which does not apply line-ending normalization to what it writes — breaking `auto-tag-release.yml`'s exact-match check for the `## [Unreleased]` header and failing that promotion's automatic tag creation (recovered manually at the time by pushing the tag by hand). The same CRLF had already spread into most Go source files and workflow/Markdown files. A `.gitattributes` file now forces LF for Go, Markdown, YAML, Makefile and shell script text regardless of a contributor's local `core.autocrlf` setting, every previously CRLF-stored tracked file has been renormalized to LF, and both `prepare-release.yml` and `auto-tag-release.yml` now strip a stray carriage return before parsing `CHANGELOG.md` so this cannot silently break the check again.
+
 ## [0.11.0] - 2026-08-07
 
 ### Added

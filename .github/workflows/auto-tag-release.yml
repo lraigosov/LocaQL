@@ -35,6 +35,14 @@ jobs:
         run: |
           set -euo pipefail
 
+          # CHANGELOG.md has been committed with CRLF at least once before
+          # (a GitHub web merge-conflict resolution does not apply
+          # .gitattributes-based normalization to the file it writes), which
+          # made every anchored grep/awk/sed below silently find nothing.
+          # Strip any stray \r before parsing so this check tolerates it
+          # even if .gitattributes/eol=lf is ever bypassed again.
+          sed -i 's/\r$//' CHANGELOG.md
+
           unreleased_count=$(grep -c '^## \[Unreleased\]$' CHANGELOG.md || true)
           if [ "$unreleased_count" -ne 1 ]; then
             echo "CHANGELOG.md must contain exactly one ## [Unreleased] section; found $unreleased_count." >&2

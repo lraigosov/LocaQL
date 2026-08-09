@@ -37,6 +37,12 @@ jobs:
         run: |
           set -euo pipefail
 
+          # See the matching comment in auto-tag-release.yml: CHANGELOG.md has
+          # been committed with CRLF before, which silently breaks every
+          # anchored grep/awk/sed below. Normalize before parsing so a stray
+          # \r never causes this step to misdetect zero Unreleased sections.
+          sed -i 's/\r$//' CHANGELOG.md
+
           unreleased_count=$(grep -c '^## \[Unreleased\]$' CHANGELOG.md || true)
           if [ "$unreleased_count" -ne 1 ]; then
             echo "CHANGELOG.md must contain exactly one ## [Unreleased] section; found $unreleased_count." >&2
