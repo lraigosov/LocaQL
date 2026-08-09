@@ -298,7 +298,7 @@ func TestJobsExecutorTypeAndStatistics(t *testing.T) {
 	if sim["executor"] != "copy" {
 		t.Fatalf("expected copy executor, got %v", sim["executor"])
 	}
-	if stats["outputRows"] != float64(4) {
+	if stats["outputRows"] != "4" {
 		t.Fatalf("expected 4 copied rows, got %v", stats["outputRows"])
 	}
 }
@@ -393,7 +393,7 @@ func TestLoadJobMaterializesDestinationTableSchema(t *testing.T) {
 		t.Fatalf("expected 2 schema fields, got %d", len(fields))
 	}
 	first := fields[0].(map[string]any)
-	if first["name"] != "event_id" || first["type"] != "INT64" {
+	if first["name"] != "event_id" || first["type"] != "INTEGER" {
 		t.Fatalf("unexpected first field: %v", first)
 	}
 
@@ -468,7 +468,7 @@ func TestLoadJobIngestsNDJSONSourceRows(t *testing.T) {
 		t.Fatalf("unexpected job error: %v", status["errorResult"])
 	}
 	stats := jobOut["statistics"].(map[string]any)
-	if stats["outputRows"] != float64(2) {
+	if stats["outputRows"] != "2" {
 		t.Fatalf("expected 2 ingested rows, got %v", stats["outputRows"])
 	}
 
@@ -678,7 +678,7 @@ func TestLoadJobIngestsCSVSourceRows(t *testing.T) {
 		t.Fatalf("unexpected job error: %v", status["errorResult"])
 	}
 	stats := jobOut["statistics"].(map[string]any)
-	if stats["outputRows"] != float64(2) {
+	if stats["outputRows"] != "2" {
 		t.Fatalf("expected 2 ingested rows, got %v", stats["outputRows"])
 	}
 
@@ -783,7 +783,7 @@ func TestLoadJobIngestsAvroSourceRows(t *testing.T) {
 		t.Fatalf("unexpected job error: %v", status["errorResult"])
 	}
 	stats := jobOut["statistics"].(map[string]any)
-	if stats["outputRows"] != float64(2) {
+	if stats["outputRows"] != "2" {
 		t.Fatalf("expected 2 ingested rows, got %v", stats["outputRows"])
 	}
 
@@ -897,7 +897,7 @@ func TestLoadJobIngestsParquetSourceRows(t *testing.T) {
 		t.Fatalf("unexpected job error: %v", status["errorResult"])
 	}
 	stats := jobOut["statistics"].(map[string]any)
-	if stats["outputRows"] != float64(2) {
+	if stats["outputRows"] != "2" {
 		t.Fatalf("expected 2 ingested rows, got %v", stats["outputRows"])
 	}
 
@@ -1168,7 +1168,7 @@ func TestLoadJobRoundTripsGzipCompressedCSVSourceRows(t *testing.T) {
 		t.Fatalf("unexpected job error: %v", status["errorResult"])
 	}
 	stats := jobOut["statistics"].(map[string]any)
-	if stats["outputRows"] != float64(2) {
+	if stats["outputRows"] != "2" {
 		t.Fatalf("expected 2 ingested rows from gzip-compressed CSV, got %v", stats["outputRows"])
 	}
 }
@@ -1249,7 +1249,7 @@ func TestExtractJobWritesNDJSONDestination(t *testing.T) {
 	if sim["enabled"] != false || sim["executor"] != "extract" {
 		t.Fatalf("expected real extract executor, got %v", sim)
 	}
-	if stats["outputRows"] != float64(4) {
+	if stats["outputRows"] != "4" {
 		t.Fatalf("expected 4 extracted rows from default events table, got %v", stats["outputRows"])
 	}
 
@@ -1510,11 +1510,12 @@ func TestQueryJobReflectsRealResultStatistics(t *testing.T) {
 	if sim["enabled"] != false || sim["executor"] != "query" {
 		t.Fatalf("expected real query executor, got %v", sim)
 	}
-	if stats["outputRows"] != float64(4) {
+	if stats["outputRows"] != "4" {
 		t.Fatalf("expected 4 rows matching the default events table, got %v", stats["outputRows"])
 	}
-	processedBytes, ok := stats["processedBytes"].(float64)
-	if !ok || processedBytes <= 0 {
+	processedBytesStr, ok := stats["processedBytes"].(string)
+	processedBytes, convErr := strconv.ParseInt(processedBytesStr, 10, 64)
+	if !ok || convErr != nil || processedBytes <= 0 {
 		t.Fatalf("expected processedBytes derived from the real result set, got %v", stats["processedBytes"])
 	}
 }

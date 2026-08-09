@@ -261,7 +261,7 @@ func TestGCSAndLoadExtractGSURIsInteroperate(t *testing.T) {
 		t.Fatalf("unexpected load error: %v", status["errorResult"])
 	}
 	stats := jobOut["statistics"].(map[string]any)
-	if stats["outputRows"] != float64(1) {
+	if stats["outputRows"] != "1" {
 		t.Fatalf("expected 1 row loaded from the object uploaded via fake-GCS API, got %v", stats["outputRows"])
 	}
 }
@@ -318,7 +318,7 @@ func TestLoadJobStatisticsNestUnderJobType(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected statistics.load object, got statistics=%v", stats)
 	}
-	if loadStats["outputRows"] != float64(2) {
+	if loadStats["outputRows"] != "2" {
 		t.Fatalf("expected statistics.load.outputRows=2, got %v", loadStats["outputRows"])
 	}
 	if _, ok := loadStats["outputBytes"]; !ok {

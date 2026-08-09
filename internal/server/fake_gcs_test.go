@@ -81,7 +81,7 @@ func TestLoadJobIngestsNDJSONFromFakeGCSRoot(t *testing.T) {
 		t.Fatalf("unexpected job error: %v", status["errorResult"])
 	}
 	stats := jobOut["statistics"].(map[string]any)
-	if stats["outputRows"] != float64(2) {
+	if stats["outputRows"] != "2" {
 		t.Fatalf("expected 2 ingested rows from fake GCS root, got %v", stats["outputRows"])
 	}
 }

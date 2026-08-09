@@ -893,10 +893,21 @@ func renderJobResource(j *jobRecord) map[string]any {
 		status["errors"] = j.Errors
 	}
 
+	// Real BigQuery renders every int64 statistics field as a JSON string,
+	// not a bare number — a long-standing, deliberate convention of Google's
+	// REST APIs to avoid precision loss in JavaScript's Number type, which
+	// cannot safely represent the full int64 range. Official client
+	// libraries built on generated REST stubs enforce this on the wire:
+	// Python/Node's JSON parsing is lenient enough to accept a bare number
+	// too, but the official Go client's generated structs use a `,string`
+	// json tag that rejects an unquoted number outright ("invalid use of
+	// ,string struct tag") — caught by test/clients/go/persistent_ddl_dml.go
+	// the first time it ran against a real server, the same way the
+	// Node.js client caught the jobReference.jobId gap above.
 	stats := map[string]any{
-		"totalSlotMs":    j.Statistics.TotalSlotMs,
-		"processedBytes": j.Statistics.ProcessedBytes,
-		"outputRows":     j.Statistics.OutputRows,
+		"totalSlotMs":    strconv.FormatInt(j.Statistics.TotalSlotMs, 10),
+		"processedBytes": strconv.FormatInt(j.Statistics.ProcessedBytes, 10),
+		"outputRows":     strconv.FormatInt(j.Statistics.OutputRows, 10),
 		"simulation": map[string]any{
 			"enabled":  j.Statistics.Simulated,
 			"executor": j.Statistics.Executor,
@@ -917,8 +928,8 @@ func renderJobResource(j *jobRecord) map[string]any {
 	// weren't part of this bug's repro.
 	if j.JobType == "load" {
 		stats["load"] = map[string]any{
-			"outputRows":  j.Statistics.OutputRows,
-			"outputBytes": j.Statistics.ProcessedBytes,
+			"outputRows":  strconv.FormatInt(j.Statistics.OutputRows, 10),
+			"outputBytes": strconv.FormatInt(j.Statistics.ProcessedBytes, 10),
 		}
 	}
 	if j.JobType == "query" && j.Statistics.StatementType != "" {

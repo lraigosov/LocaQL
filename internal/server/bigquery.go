@@ -1908,13 +1908,47 @@ func renderTableSchemaFields(fields []tableField) []map[string]any {
 		if mode == "" {
 			mode = "NULLABLE"
 		}
-		entry := map[string]any{"name": field.Name, "type": field.Type, "mode": mode}
+		entry := map[string]any{"name": field.Name, "type": restFieldTypeName(field.Type), "mode": mode}
 		if isRecordType(field.Type) && len(field.Fields) > 0 {
 			entry["fields"] = renderTableSchemaFields(field.Fields)
 		}
 		out = append(out, entry)
 	}
 	return out
+}
+
+// restFieldTypeName renders a schema field's type in BigQuery's actual REST
+// TableFieldSchema wire form. tableField.Type is stored internally using
+// GoogleSQL/standard-SQL scalar names (INT64, FLOAT64, BOOL, STRUCT — see
+// realSQLScalarTypes in sql_engine.go, needed as-is to build real CREATE
+// TABLE statements against the embedded engine), but real BigQuery's REST
+// schema responses (tables.get, tabledata.list, query result schemas) use
+// the older legacy names instead — both are documented, accepted aliases of
+// the same type, but not every official client library's own schema/row
+// decoder recognizes both forms in every code path: the official Go
+// client's row-value converter rejected "INT64" outright ("unrecognized
+// type: INT64") the first time it queried a real result set, even though
+// its own schema-parsing accepts the alias — caught by
+// test/clients/go/persistent_ddl_dml.go, not by the already-passing Python
+// or Node.js conformance tests, which happen to be more lenient here.
+// Rendering the canonical/legacy form is unconditionally correct per
+// BigQuery's own documented aliases, so this applies to every client, not
+// just Go. INFORMATION_SCHEMA.COLUMNS.data_type is deliberately NOT run
+// through this — real BigQuery renders that column using GoogleSQL type
+// names, the opposite convention, in that specific context only.
+func restFieldTypeName(t string) string {
+	switch strings.ToUpper(strings.TrimSpace(t)) {
+	case "INT64":
+		return "INTEGER"
+	case "FLOAT64":
+		return "FLOAT"
+	case "BOOL":
+		return "BOOLEAN"
+	case "STRUCT":
+		return "RECORD"
+	default:
+		return t
+	}
 }
 
 // renderRESTRows converts stored rows into BigQuery's REST row shape

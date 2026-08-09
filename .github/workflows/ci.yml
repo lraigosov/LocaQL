@@ -123,6 +123,38 @@ jobs:
           done
           node test/clients/node/persistent_ddl_dml.js --endpoint=http://127.0.0.1:19051
 
+  go-client:
+    name: Official Go client (BigQuery)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build the emulator and the pinned official Go client test
+        run: |
+          go build -o /tmp/locaql-go-client-server ./cmd/locaql
+          (cd test/clients/go && go build -o /tmp/locaql-go-client-test .)
+      - name: Exercise persistent SQL mutations and streaming inserts
+        run: |
+          /tmp/locaql-go-client-server start \
+            --addr 127.0.0.1:19052 \
+            --storage-grpc-addr 127.0.0.1:19062 \
+            --capabilities "$PWD/capabilities/registry.yaml" &
+          server_pid=$!
+          trap 'kill "$server_pid"' EXIT
+          for attempt in $(seq 1 40); do
+            if curl --fail --silent http://127.0.0.1:19052/_emulator/health >/dev/null; then
+              break
+            fi
+            if [ "$attempt" -eq 40 ]; then
+              echo "LocaQL did not become healthy" >&2
+              exit 1
+            fi
+            sleep 0.25
+          done
+          /tmp/locaql-go-client-test --endpoint=http://127.0.0.1:19052
+
   native:
     name: Native build/vet/test (${{ matrix.os }})
     strategy:
