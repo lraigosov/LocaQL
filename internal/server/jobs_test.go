@@ -241,13 +241,13 @@ func TestJobsListByUserRangeAndParent(t *testing.T) {
 
 func TestRequestIDTTLAllowsNewJobAfterExpiration(t *testing.T) {
 	js := newJobServiceWithTTL(1 * time.Millisecond)
-	first, created := js.insert(jobInsertOptions{ProjectID: "p1", RequestID: "rq1"})
+	first, created, _ := js.insert(jobInsertOptions{ProjectID: "p1", RequestID: "rq1"})
 	if !created {
 		t.Fatalf("expected first insert to create job")
 	}
 
 	time.Sleep(3 * time.Millisecond)
-	second, createdAgain := js.insert(jobInsertOptions{ProjectID: "p1", RequestID: "rq1"})
+	second, createdAgain, _ := js.insert(jobInsertOptions{ProjectID: "p1", RequestID: "rq1"})
 	if !createdAgain {
 		t.Fatalf("expected second insert to create a new job after TTL expiration")
 	}
@@ -2138,7 +2138,7 @@ func TestJobsListAllUsersAndSort(t *testing.T) {
 func TestJobsPersistenceAcrossRestart(t *testing.T) {
 	storePath := filepath.Join(t.TempDir(), "jobs", "state.json")
 	firstService := newJobServiceWithPersistence(storePath)
-	job, created := firstService.insert(jobInsertOptions{ProjectID: "p1", RequestID: "persist-req", JobType: "query"})
+	job, created, _ := firstService.insert(jobInsertOptions{ProjectID: "p1", RequestID: "persist-req", JobType: "query"})
 	if !created {
 		t.Fatalf("expected new job creation")
 	}
@@ -2159,7 +2159,7 @@ func TestJobsPersistenceAtomicReplaceDoesNotLeakTempFile(t *testing.T) {
 	storePath := filepath.Join(t.TempDir(), "jobs", "state.json")
 	js := newJobServiceWithPersistence(storePath)
 
-	jr, created := js.insert(jobInsertOptions{ProjectID: "p1", RequestID: "persist-tmp", JobType: "query"})
+	jr, created, _ := js.insert(jobInsertOptions{ProjectID: "p1", RequestID: "persist-tmp", JobType: "query"})
 	if !created {
 		t.Fatalf("expected job creation")
 	}
@@ -2205,10 +2205,10 @@ func TestJobsPersistenceAtomicReplaceDoesNotLeakTempFile(t *testing.T) {
 func TestJobServiceWorkerLimitBackpressure(t *testing.T) {
 	js := newJobServiceWithWorkerLimit(1)
 
-	if _, created := js.insert(jobInsertOptions{ProjectID: "p1", JobType: "query"}); !created {
+	if _, created, _ := js.insert(jobInsertOptions{ProjectID: "p1", JobType: "query"}); !created {
 		t.Fatalf("expected first job to be created")
 	}
-	if _, created := js.insert(jobInsertOptions{ProjectID: "p1", JobType: "load"}); !created {
+	if _, created, _ := js.insert(jobInsertOptions{ProjectID: "p1", JobType: "load"}); !created {
 		t.Fatalf("expected second job to be created")
 	}
 
@@ -2280,10 +2280,10 @@ func TestJobServiceStorageWriteBackpressure(t *testing.T) {
 	t.Setenv("LOCAQL_STORAGE_WRITE_WORKERS", "1")
 	js := newJobServiceWithWorkerLimit(4)
 
-	if _, created := js.insert(jobInsertOptions{ProjectID: "p1", JobType: "load"}); !created {
+	if _, created, _ := js.insert(jobInsertOptions{ProjectID: "p1", JobType: "load"}); !created {
 		t.Fatalf("expected first storage-write job to be created")
 	}
-	if _, created := js.insert(jobInsertOptions{ProjectID: "p1", JobType: "copy"}); !created {
+	if _, created, _ := js.insert(jobInsertOptions{ProjectID: "p1", JobType: "copy"}); !created {
 		t.Fatalf("expected second storage-write job to be created")
 	}
 
@@ -2327,7 +2327,7 @@ func TestJobServiceConcurrentProjectsAndClients(t *testing.T) {
 			idx := i
 			go func() {
 				defer wg.Done()
-				_, _ = js.insert(jobInsertOptions{
+				_, _, _ = js.insert(jobInsertOptions{
 					ProjectID: project,
 					UserEmail: users[idx%len(users)],
 					JobType:   "query",
@@ -2361,13 +2361,13 @@ func TestJobServiceSerializesConflictingResourceMutations(t *testing.T) {
 
 	first := common
 	first.JobType = "load"
-	if _, created := js.insert(first); !created {
+	if _, created, _ := js.insert(first); !created {
 		t.Fatalf("expected first mutation job creation")
 	}
 
 	second := common
 	second.JobType = "copy"
-	if _, created := js.insert(second); !created {
+	if _, created, _ := js.insert(second); !created {
 		t.Fatalf("expected second mutation job creation")
 	}
 
@@ -2405,7 +2405,7 @@ func TestJobServiceConcurrentReadsDuringWrites(t *testing.T) {
 	go func() {
 		defer close(writerDone)
 		for i := 0; i < 25; i++ {
-			_, _ = js.insert(jobInsertOptions{
+			_, _, _ = js.insert(jobInsertOptions{
 				ProjectID: "p-read",
 				UserEmail: "reader@example.com",
 				JobType:   "query",

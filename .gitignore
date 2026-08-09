@@ -34,7 +34,13 @@ vendor/
 coverage.txt
 profile.cov
 
+# Node.js client conformance test dependencies (test/clients/node) — the
+# lockfile is versioned for reproducible `npm ci`, installed packages are not
+node_modules/
+
 # Built binaries (repo root only — without the leading slash these would
-# also match the cmd/locaql and cmd/locaql-ui source directories)
+# also match the cmd/locaql, cmd/locaql-ui and cmd/locaql-bench source
+# directories)
 /locaql
 /locaql-ui
+/locaql-bench

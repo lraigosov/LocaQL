@@ -36,6 +36,11 @@ type config struct {
 	warmup      int
 	jsonOut     string
 	timeout     time.Duration
+
+	soakDuration       time.Duration
+	soakConcurrency    int
+	soakMaxOutage      time.Duration
+	soakReportInterval time.Duration
 }
 
 func parseConfig() config {
@@ -50,11 +55,17 @@ func parseConfig() config {
 	warmup := fs.Int("warmup", 3, "warmup iterations excluded from reported stats, per workload")
 	jsonOut := fs.String("json", "", "optional path to also write the report as JSON")
 	timeout := fs.Duration("timeout", 30*time.Second, "per-request HTTP client timeout")
+	soakDuration := fs.Duration("soak-duration", 0, "if set, ignore the normal workload report and instead sustain load for this long against a single long-lived server, to validate a supervised process's restart loop over many cycles (see docs/benchmarks.md)")
+	soakConcurrency := fs.Int("soak-concurrency", 6, "concurrent workers hammering the server during --soak-duration")
+	soakMaxOutage := fs.Duration("soak-max-outage", 60*time.Second, "fail immediately if the server produces no successful response for this long continuously during a soak run — a real, unrecovered outage rather than one restart cycle's brief blip")
+	soakReportInterval := fs.Duration("soak-report-interval", 30*time.Second, "how often to log soak progress")
 	fs.Parse(os.Args[1:])
 	return config{
 		endpoint: *endpoint, project: *project, dataset: *dataset, label: *label,
 		iterations: *iterations, insertIters: *insertIters, concurrency: *concurrency,
 		warmup: *warmup, jsonOut: *jsonOut, timeout: *timeout,
+		soakDuration: *soakDuration, soakConcurrency: *soakConcurrency,
+		soakMaxOutage: *soakMaxOutage, soakReportInterval: *soakReportInterval,
 	}
 }
 
@@ -262,6 +273,177 @@ func runConcurrentWorkload(name string, total, concurrency int, fn func() (time.
 	return l
 }
 
+// soakState tracks a soak run's outcome across concurrent workers: not just
+// aggregate error counts, but *outage* shape — how many distinct periods of
+// continuous failure occurred (each one a restart cycle, if the target is
+// running under a supervisor or --self-restart) and how long the longest one
+// lasted. That distinction matters here specifically because occasional
+// failures are the expected, successfully-mitigated behavior (see
+// docs/benchmarks.md's Blocking #3 finding) — a soak run with zero outages
+// didn't reproduce the known crash at all this time, which is a valid if
+// less informative outcome, while a soak run with one very long outage means
+// the restart loop did not actually recover.
+type soakState struct {
+	mu            sync.Mutex
+	attempts      int64
+	successes     int64
+	failures      int64
+	inOutage      bool
+	outageStarted time.Time
+	outageCount   int
+	longestOutage time.Duration
+}
+
+func (s *soakState) recordSuccess() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.attempts++
+	s.successes++
+	if s.inOutage {
+		if d := time.Since(s.outageStarted); d > s.longestOutage {
+			s.longestOutage = d
+		}
+		s.inOutage = false
+	}
+}
+
+func (s *soakState) recordFailure() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.attempts++
+	s.failures++
+	if !s.inOutage {
+		s.inOutage = true
+		s.outageStarted = time.Now()
+		s.outageCount++
+	}
+}
+
+// currentOutageDuration reports how long the *current, still-ongoing*
+// outage has lasted, or zero if the server is currently healthy — this is
+// what --soak-max-outage bounds, checked continuously rather than only at
+// the end of the run, so a genuinely stuck server fails the soak promptly
+// instead of only after the full --soak-duration elapses.
+func (s *soakState) currentOutageDuration() time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.inOutage {
+		return 0
+	}
+	return time.Since(s.outageStarted)
+}
+
+type soakSnapshot struct {
+	attempts, successes, failures int64
+	outageCount                   int
+	longestOutage                 time.Duration
+}
+
+func (s *soakState) snapshot() soakSnapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return soakSnapshot{
+		attempts: s.attempts, successes: s.successes, failures: s.failures,
+		outageCount: s.outageCount, longestOutage: s.longestOutage,
+	}
+}
+
+// soakWorker repeatedly issues the cheapest possible real query
+// (SELECT 1 AS one) as fast as the server answers — no dataset/table
+// dependency, since a supervised restart wipes the catalog of a
+// non-persistent process, and this exercises exactly the code path that
+// KNOWN-DIVERGENCES.md Blocking #3 documents as the crash trigger
+// (materializing a fresh isolated engine instance per query via sql.Open).
+// A failure is recorded and retried after a short backoff rather than
+// treated as fatal — a connection refused/reset here is the expected,
+// transient shape of one restart cycle, not a bug in this client.
+func soakWorker(stop <-chan struct{}, c *client, state *soakState) {
+	for {
+		select {
+		case <-stop:
+			return
+		default:
+		}
+		if _, err := c.query("SELECT 1 AS one"); err != nil {
+			state.recordFailure()
+			time.Sleep(200 * time.Millisecond)
+			continue
+		}
+		state.recordSuccess()
+	}
+}
+
+type soakReport struct {
+	Label            string  `json:"label"`
+	Endpoint         string  `json:"endpoint"`
+	DurationSeconds  float64 `json:"durationSeconds"`
+	Attempts         int64   `json:"attempts"`
+	Successes        int64   `json:"successes"`
+	Failures         int64   `json:"failures"`
+	ErrorRatePercent float64 `json:"errorRatePercent"`
+	OutageCount      int     `json:"outageCount"`
+	LongestOutageSec float64 `json:"longestOutageSeconds"`
+}
+
+// runSoak sustains load for cfg.soakDuration and validates that the server
+// stays *eventually* available throughout — the reliability property this
+// project can actually promise given Blocking #3's unresolved upstream root
+// cause: an occasional crash is expected and mitigated (pooling, panic
+// recovery, process-level auto-restart), not eliminated. It returns an error
+// only when the server goes down and stays down longer than
+// --soak-max-outage, which is the one outcome that would mean the mitigation
+// itself has regressed, not that the known crash happened again.
+func runSoak(cfg config, c *client) (soakReport, error) {
+	state := &soakState{}
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < cfg.soakConcurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			soakWorker(stop, c, state)
+		}()
+	}
+
+	start := time.Now()
+	deadline := start.Add(cfg.soakDuration)
+	nextReport := start.Add(cfg.soakReportInterval)
+	var failErr error
+
+	for time.Now().Before(deadline) {
+		time.Sleep(1 * time.Second)
+		if d := state.currentOutageDuration(); d > cfg.soakMaxOutage {
+			snap := state.snapshot()
+			failErr = fmt.Errorf("soak failed: server unavailable for %s (exceeds --soak-max-outage=%s) after %d attempts (%d successes, %d failures, %d prior outages) — restart loop did not recover in time",
+				d.Round(time.Second), cfg.soakMaxOutage, snap.attempts, snap.successes, snap.failures, snap.outageCount)
+			break
+		}
+		if now := time.Now(); !now.Before(nextReport) {
+			snap := state.snapshot()
+			log.Printf("[soak] %s elapsed: attempts=%d successes=%d failures=%d outages=%d longestOutage=%s",
+				now.Sub(start).Round(time.Second), snap.attempts, snap.successes, snap.failures, snap.outageCount, snap.longestOutage.Round(time.Second))
+			nextReport = now.Add(cfg.soakReportInterval)
+		}
+	}
+
+	close(stop)
+	wg.Wait()
+
+	snap := state.snapshot()
+	errorRate := 0.0
+	if snap.attempts > 0 {
+		errorRate = float64(snap.failures) / float64(snap.attempts) * 100
+	}
+	rep := soakReport{
+		Label: cfg.label, Endpoint: cfg.endpoint, DurationSeconds: time.Since(start).Seconds(),
+		Attempts: snap.attempts, Successes: snap.successes, Failures: snap.failures,
+		ErrorRatePercent: errorRate, OutageCount: snap.outageCount, LongestOutageSec: snap.longestOutage.Seconds(),
+	}
+	log.Printf("[soak] finished: duration=%s attempts=%d successes=%d failures=%d (%.2f%% error rate) outages=%d longestOutage=%s",
+		cfg.soakDuration, snap.attempts, snap.successes, snap.failures, errorRate, snap.outageCount, snap.longestOutage.Round(time.Second))
+	return rep, failErr
+}
+
 type report struct {
 	Label     string           `json:"label"`
 	Endpoint  string           `json:"endpoint"`
@@ -311,9 +493,44 @@ func seedRows(n int, offset int) []map[string]any {
 	return rows
 }
 
+// writeJSONReport marshals v as indented JSON to path, used for both the
+// normal workload report and the soak report.
+func writeJSONReport(path string, v any) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	enc := json.NewEncoder(f)
+	enc.SetIndent("", "  ")
+	return enc.Encode(v)
+}
+
+// runSoakCommand runs the soak workload and writes its JSON report if
+// requested, returning the soak's own outcome (a real, unrecovered outage)
+// separately from a report-writing failure, both surfaced via a single
+// error so main can stay a flat, unnested dispatcher.
+func runSoakCommand(cfg config, c *client) error {
+	rep, soakErr := runSoak(cfg, c)
+	if cfg.jsonOut != "" {
+		if err := writeJSONReport(cfg.jsonOut, rep); err != nil {
+			return fmt.Errorf("write soak report: %w", err)
+		}
+		fmt.Printf("\nSoak JSON report written to %s\n", cfg.jsonOut)
+	}
+	return soakErr
+}
+
 func main() {
 	cfg := parseConfig()
 	c := newClient(cfg)
+
+	if cfg.soakDuration > 0 {
+		if err := runSoakCommand(cfg, c); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 
 	eventsFields := []map[string]any{
 		{"name": "id", "type": "INT64"},
@@ -381,12 +598,7 @@ func main() {
 	printReportTable(rep)
 
 	if cfg.jsonOut != "" {
-		f, err := os.Create(cfg.jsonOut)
-		must(err)
-		defer f.Close()
-		enc := json.NewEncoder(f)
-		enc.SetIndent("", "  ")
-		must(enc.Encode(rep))
+		must(writeJSONReport(cfg.jsonOut, rep))
 		fmt.Printf("\nJSON report written to %s\n", cfg.jsonOut)
 	}
 }

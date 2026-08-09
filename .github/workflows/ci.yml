@@ -86,6 +86,43 @@ jobs:
           .venv/bin/python test/clients/python/storage_download.py \
             --endpoint http://127.0.0.1:19050
 
+  node-client:
+    name: Official Node.js client (BigQuery)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: test/clients/node/package-lock.json
+      - name: Install the pinned official client
+        run: npm ci
+        working-directory: test/clients/node
+      - name: Exercise persistent SQL mutations and streaming inserts
+        run: |
+          go build -o /tmp/locaql-node-client ./cmd/locaql
+          /tmp/locaql-node-client start \
+            --addr 127.0.0.1:19051 \
+            --storage-grpc-addr 127.0.0.1:19061 \
+            --capabilities "$PWD/capabilities/registry.yaml" &
+          server_pid=$!
+          trap 'kill "$server_pid"' EXIT
+          for attempt in $(seq 1 40); do
+            if curl --fail --silent http://127.0.0.1:19051/_emulator/health >/dev/null; then
+              break
+            fi
+            if [ "$attempt" -eq 40 ]; then
+              echo "LocaQL did not become healthy" >&2
+              exit 1
+            fi
+            sleep 0.25
+          done
+          node test/clients/node/persistent_ddl_dml.js --endpoint=http://127.0.0.1:19051
+
   native:
     name: Native build/vet/test (${{ matrix.os }})
     strategy:

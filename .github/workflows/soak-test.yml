@@ -1,0 +1,72 @@
+name: Soak test (restart-loop reliability)
+
+# Manual-only, not on every push/PR: this deliberately sustains load for
+# minutes rather than seconds, to validate that the known WASM-bridge crash
+# (KNOWN-DIVERGENCES.md Blocking #3, docs/benchmarks.md) gets absorbed by
+# the process-level auto-restart mitigation over many cycles, not just the
+# 2-3 reproduced manually while building it. The crash itself is not
+# deterministic — a given run may or may not trigger it — so this job does
+# not require the crash to occur to pass; it requires that *if* the server
+# goes down, it comes back within --soak-max-outage every time.
+on:
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: "How long to sustain load against one long-lived process (minutes)"
+        required: false
+        default: "20"
+
+jobs:
+  soak:
+    name: Sustained load against locaql start --self-restart
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build locaql and locaql-bench
+        run: |
+          go build -o /tmp/locaql ./cmd/locaql
+          go build -o /tmp/locaql-bench ./cmd/locaql-bench
+
+      - name: Start locaql with --self-restart
+        run: |
+          /tmp/locaql start --addr 127.0.0.1:19050 --storage-grpc-addr 127.0.0.1:19060 \
+            --capabilities "$PWD/capabilities/registry.yaml" \
+            --self-restart --self-restart-max-restarts 500 --self-restart-window 5m --self-restart-backoff 1s \
+            > /tmp/locaql-soak.log 2>&1 &
+          echo $! > /tmp/locaql-soak.pid
+          for attempt in $(seq 1 40); do
+            if curl --fail --silent http://127.0.0.1:19050/_emulator/health >/dev/null; then
+              break
+            fi
+            if [ "$attempt" -eq 40 ]; then
+              echo "LocaQL did not become healthy" >&2
+              exit 1
+            fi
+            sleep 0.25
+          done
+
+      - name: Sustain load for the requested duration
+        run: |
+          /tmp/locaql-bench --endpoint http://127.0.0.1:19050 --project soak --label soak \
+            --soak-duration "${{ github.event.inputs.duration_minutes }}m" --soak-concurrency 6 \
+            --json /tmp/soak-report.json
+
+      - name: Stop locaql
+        if: always()
+        run: kill "$(cat /tmp/locaql-soak.pid)" 2>/dev/null || true
+
+      - name: Show restart-loop log lines (evidence the mitigation actually engaged, if the crash occurred this run)
+        if: always()
+        run: grep -E "exited unexpectedly|restart" /tmp/locaql-soak.log || echo "no restarts observed this run (the crash is not deterministic — see docs/benchmarks.md)"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: soak-report
+          path: |
+            /tmp/soak-report.json
+            /tmp/locaql-soak.log

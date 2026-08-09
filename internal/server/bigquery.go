@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -1359,11 +1360,17 @@ func (s *Server) insertJob(w http.ResponseWriter, r *http.Request, projectID str
 	var queryParameters []storedQueryParameter
 	parameterMode := ""
 	var queryParametersErr error
+	requestedJobID := ""
 	if r.Body != nil {
 		body, _ := io.ReadAll(r.Body)
 		if len(body) > 0 {
 			var raw map[string]any
 			if err := json.Unmarshal(body, &raw); err == nil {
+				if jobRef, ok := raw["jobReference"].(map[string]any); ok {
+					if id, ok := jobRef["jobId"].(string); ok {
+						requestedJobID = strings.TrimSpace(id)
+					}
+				}
 				if conf, ok := raw["configuration"].(map[string]any); ok {
 					if qCfg, ok := conf["query"].(map[string]any); ok {
 						if p, ok := qCfg["priority"].(string); ok {
@@ -1506,10 +1513,15 @@ func (s *Server) insertJob(w http.ResponseWriter, r *http.Request, projectID str
 		IsScript:                 isScript,
 		ParameterMode:            parameterMode,
 		QueryParameters:          queryParameters,
+		RequestedJobID:           requestedJobID,
 	}
 
 	if isScript {
-		jr, childJobs, created := s.jobs.insertScriptWithChildren(insertOpts)
+		jr, childJobs, created, err := s.jobs.insertScriptWithChildren(insertOpts)
+		if err != nil {
+			writeJobInsertError(w, err)
+			return
+		}
 		status := http.StatusOK
 		if created {
 			status = http.StatusCreated
@@ -1525,12 +1537,29 @@ func (s *Server) insertJob(w http.ResponseWriter, r *http.Request, projectID str
 		return
 	}
 
-	jr, created := s.jobs.insert(insertOpts)
+	jr, created, err := s.jobs.insert(insertOpts)
+	if err != nil {
+		writeJobInsertError(w, err)
+		return
+	}
 	status := http.StatusOK
 	if created {
 		status = http.StatusCreated
 	}
 	writeJSON(w, status, renderJobResource(jr))
+}
+
+// writeJobInsertError renders a jobIDConflictError (an invalid or
+// already-used client-supplied jobReference.jobId) with the same
+// status/reason convention every other "duplicate"/"invalid" REST error in
+// this codebase already uses.
+func writeJobInsertError(w http.ResponseWriter, err error) {
+	var conflict *jobIDConflictError
+	if errors.As(err, &conflict) {
+		writeError(w, conflict.HTTPStatus, conflict.Error(), conflict.Reason)
+		return
+	}
+	writeError(w, http.StatusInternalServerError, err.Error(), "internalError")
 }
 
 func (s *Server) getJob(w http.ResponseWriter, _ *http.Request, projectID, jobID string) {
@@ -1628,8 +1657,15 @@ func (s *Server) handleJobsQuery(w http.ResponseWriter, r *http.Request, project
 		QueryParameters: queryParams,
 	}
 
-	jr, created := s.jobs.insert(insertOpts)
+	jr, created, err := s.jobs.insert(insertOpts)
 	_ = created // jobId is what matters
+	if err != nil {
+		// jobs.query/projects.queries never sets RequestedJobID (real
+		// BigQuery's QueryRequest has no jobReference field), so this
+		// should be unreachable — handled defensively rather than assumed.
+		writeJobInsertError(w, err)
+		return
+	}
 
 	// Wait loop (simulated)
 	start := time.Now()
