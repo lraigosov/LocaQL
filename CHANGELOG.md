@@ -4,6 +4,8 @@ All notable user-facing changes to LocaQL are documented here, in the style of [
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-08-09
+
 ### Added
 - [`SECURITY.md`](SECURITY.md): supported versions, scope, and how to report a vulnerability privately via GitHub Security Advisories.
 - `govulncheck` in CI (`vulnerability-scan` job) and `make vuln`, run in `-scan package` mode rather than the default `-scan symbol` due to a confirmed upstream crash unrelated to this project (golang/go#75584 and related: `golang.org/x/tools/go/ssa` panics building the call graph for any module depending on `go-json-experiment/json`, which this project pulls in transitively). Finding and fixing this tooling immediately surfaced real, previously-unnoticed issues, not just a formality: the pinned Go toolchain (`1.25.0`) was missing several stdlib security fixes, and three dependencies (`google.golang.org/grpc`, `golang.org/x/text`, `github.com/klauspost/compress`) had known CVEs with patched versions already available. All fixed in this same change (see Fixed below); `govulncheck -scan package ./...` now reports zero vulnerabilities.
