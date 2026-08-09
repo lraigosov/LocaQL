@@ -965,10 +965,18 @@ func renderJobResource(j *jobRecord) map[string]any {
 		"status":      status,
 	}
 
-	// For query jobs, include priority if set
+	// For query jobs, echo the submitted query text back alongside priority.
+	// Real BigQuery always includes configuration.query.query in a job
+	// resource — omitting it isn't just incomplete, it broke the official
+	// Java client outright: QueryJobConfiguration.fromPb (used to
+	// reconstruct a Job from the REST response returned by jobs.insert)
+	// requires it non-null and throws a bare NullPointerException via
+	// Preconditions.checkNotNull otherwise, found the first time
+	// test/clients/java/PersistentDdlDml.java ran against a real server.
 	if j.JobType == "query" || j.JobType == "script" {
 		res["configuration"] = map[string]any{
 			"query": map[string]any{
+				"query":    j.QueryText,
 				"priority": j.Priority,
 			},
 		}
