@@ -139,6 +139,7 @@ The matrix above says *whether* something is supported; it doesn't say how much 
 flowchart LR
 	Client[Client SDK or CLI] --> REST[BigQuery REST v2 handler]
 	Client --> GCSApi["Fake GCS JSON API (/storage/v1/b)"]
+	Client -->|"bq CLI only"| Discovery["/$discovery/rest (jobs.* subset)"]
 	REST --> JobService[jobService]
 	REST --> Registry[Capability registry]
 	JobService --> WorkerSlots[Worker slots by LOCAQL_JOB_WORKERS]
@@ -221,7 +222,7 @@ Declared limits: cross-project mutation targets, DML against views/external tabl
 
 Unlike every other official client library (Python, Node.js, Go, Java), the official `bq` CLI is built on the older `apitools`/Discovery-API-driven generator: before issuing any real API call it fetches `GET /$discovery/rest?version=v2`, a JSON document describing the entire API surface it can call. LocaQL serves its own, deliberately scoped version of that document (`internal/server/discovery.go`, `internal/server/assets/bigquery_discovery_v2.json`) covering only the `jobs.*` resource (`insert`/`get`/`list`/`query`/`getQueryResults`/`cancel`) — real BigQuery's actual discovery document is roughly 570KB describing its full API; writing a smaller one scoped to what LocaQL actually implements keeps the same capability-transparency stance as [Known Divergences](KNOWN-DIVERGENCES.md) and `capabilities/registry.yaml` rather than bundling and relabeling Google's document. `rootUrl`/`baseUrl`/`mtlsRootUrl` are rewritten to the request's own `Host` at serve time so `bq`'s subsequent calls come back to LocaQL instead of real Google infrastructure.
 
-This makes `bq query` (including the same persistent CREATE/INSERT/UPDATE/MERGE/DELETE/SELECT sequence the other four clients' conformance tests run — `test/clients/bq/persistent_ddl_dml.sh`), `bq show -j`, `bq cancel`, and `bq ls -j` work against LocaQL. `bq` subcommands that depend on datasets/tables/tabledata resources (`mk`, `ls` for datasets/tables, `load`, `extract`, `cp`, `insert`) are not yet supported, since those resources are deliberately not described in the document — see `rest.discovery_document` in `capabilities/registry.yaml` for the exact scope. `bq` also refuses to run at all without a locally "active account" configured even against an anonymous-only local server; set `CLOUDSDK_AUTH_ACCESS_TOKEN` to any non-empty value to satisfy that check without real `gcloud auth login`, as the conformance test and its CI job both do.
+This makes `bq query` (including the same persistent CREATE/INSERT/UPDATE/MERGE/DELETE/SELECT sequence the other five clients' conformance tests run — `test/clients/bq/persistent_ddl_dml.sh`), `bq show -j`, `bq cancel`, and `bq ls -j` work against LocaQL. `bq` subcommands that depend on datasets/tables/tabledata resources (`mk`, `ls` for datasets/tables, `load`, `extract`, `cp`, `insert`) are not yet supported, since those resources are deliberately not described in the document — see `rest.discovery_document` in `capabilities/registry.yaml` for the exact scope. `bq` also refuses to run at all without a locally "active account" configured even against an anonymous-only local server; set `CLOUDSDK_AUTH_ACCESS_TOKEN` to any non-empty value to satisfy that check without real `gcloud auth login`, as the conformance test and its CI job both do.
 
 ### Streaming Inserts (`tabledata.insertAll`)
 
@@ -267,7 +268,8 @@ Every request passes through a real HTTP middleware (`internal/server/observabil
 ```mermaid
 flowchart LR
 	Request[Incoming request] --> Middleware[withObservability]
-	Middleware --> Handler[Route handler]
+	Middleware --> GzipDecode["withGzipRequestDecoding\n(transparent gzip body decompress)"]
+	GzipDecode --> Handler[Route handler]
 	Handler --> Middleware
 	Middleware --> Log["log/slog JSON line\n(Debug/Warn/Error by status)"]
 	Middleware --> Metrics["metricsService\n(counters + latency histogram)"]
