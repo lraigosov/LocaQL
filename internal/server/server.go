@@ -40,21 +40,26 @@ type Server struct {
 	metrics  *metricsService
 	uploads  *bigQueryUploadService
 	logger   *slog.Logger
+
+	streamingInserts *streamingInsertDedupStore
+	sqlEngines       *sqlEnginePool
 }
 
 func New(reg capabilities.Registry) *Server {
 	s := &Server{
-		mux:      http.NewServeMux(),
-		registry: reg,
-		jobs:     newJobService(),
-		datasets: newDatasetService(),
-		tables:   newTableService(),
-		routines: newRoutineService(),
-		models:   newModelService(),
-		sessions: newSessionService(),
-		metrics:  newMetricsService(time.Now()),
-		uploads:  newBigQueryUploadService(),
-		logger:   newDefaultLogger(),
+		mux:              http.NewServeMux(),
+		registry:         reg,
+		jobs:             newJobService(),
+		datasets:         newDatasetService(),
+		tables:           newTableService(),
+		routines:         newRoutineService(),
+		models:           newModelService(),
+		sessions:         newSessionService(),
+		metrics:          newMetricsService(time.Now()),
+		uploads:          newBigQueryUploadService(),
+		logger:           newDefaultLogger(),
+		streamingInserts: newStreamingInsertDedupStore(),
+		sqlEngines:       newSQLEnginePool(),
 	}
 	s.jobs.copyExecutor = s.executeCopyJob
 	s.jobs.loadExecutor = s.executeLoadJob
