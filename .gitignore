@@ -34,7 +34,17 @@ vendor/
 coverage.txt
 profile.cov
 
+# Node.js client conformance test dependencies (test/clients/node) — the
+# lockfile is versioned for reproducible `npm ci`, installed packages are not
+node_modules/
+
+# Maven build output (test/clients/java) — pom.xml is versioned, the
+# compiled/shaded jar and intermediate classes are not
+test/clients/java/target/
+
 # Built binaries (repo root only — without the leading slash these would
-# also match the cmd/locaql and cmd/locaql-ui source directories)
+# also match the cmd/locaql, cmd/locaql-ui and cmd/locaql-bench source
+# directories)
 /locaql
 /locaql-ui
+/locaql-bench

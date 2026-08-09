@@ -91,7 +91,20 @@ flowchart TB
 
 **Practical takeaway:** running via `locaql-supervisor` (the Docker image's entrypoint), the service stays available through this failure mode — the emulator process recycles automatically instead of taking the container down. Running the bare `locaql` binary directly also has this protection now, opt-in: `locaql start --self-restart` re-execs itself as a supervised child and restarts automatically on an unexpected exit, using the same bounded-restart mechanism (`internal/procsupervisor`) as `locaql-supervisor`. Without `--self-restart` (the default), a direct `locaql start` still has no protection against this specific crash.
 
+## Soak testing the restart loop
+
+`cmd/locaql-bench --soak-duration <duration>` replaces the normal one-shot workload report with an indefinite load loop: concurrent workers hammer `SELECT 1 AS one` (no dataset/table dependency, since a supervised restart wipes a non-persistent process's catalog) for the given wall-clock duration, tracking not just error counts but *outage shape* — how many distinct periods of continuous failure occurred (each one a restart cycle, if the target is supervised) and how long the longest one lasted. `--soak-max-outage` (default 60s) fails the run immediately if the server is ever down longer than that continuously — the one outcome that would mean the mitigation itself has regressed, as opposed to the known crash simply happening again and recovering.
+
+```bash
+# terminal 1
+go run ./cmd/locaql start --addr 127.0.0.1:19050 --self-restart
+
+# terminal 2
+go run ./cmd/locaql-bench --endpoint http://127.0.0.1:19050 --soak-duration 20m --soak-concurrency 6 --json soak-report.json
+```
+
+`.github/workflows/soak-test.yml` runs this same tool against a `locaql start --self-restart` process for a configurable duration (`workflow_dispatch` input, default 20 minutes) — manual-only rather than on every push, since it deliberately sustains load for minutes rather than seconds. It uploads the JSON report and full server log as artifacts. The crash is not deterministic — a given run may see zero, one, or several occurrences — so the job does not require it to happen to pass; it only requires that the server recovers within the outage bound every time it does. This is the "confirm the restart loop holds up over many cycles" validation that a one-off manual reproduction can't provide.
+
 ## Future work
 
-- **A soak-test CI job** that runs this same benchmark tool in a loop for an extended period, to get a real, repeatable crash-time distribution instead of the one anecdotal data point in this document — and to confirm the restart loop holds up over many cycles, not just the two or three reproduced manually here.
 - **Extend coverage** to load/extract throughput and BigQuery Storage API read/write paths, which this first pass didn't cover.

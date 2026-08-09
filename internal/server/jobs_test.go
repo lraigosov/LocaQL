@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -241,13 +242,13 @@ func TestJobsListByUserRangeAndParent(t *testing.T) {
 
 func TestRequestIDTTLAllowsNewJobAfterExpiration(t *testing.T) {
 	js := newJobServiceWithTTL(1 * time.Millisecond)
-	first, created := js.insert(jobInsertOptions{ProjectID: "p1", RequestID: "rq1"})
+	first, created, _ := js.insert(jobInsertOptions{ProjectID: "p1", RequestID: "rq1"})
 	if !created {
 		t.Fatalf("expected first insert to create job")
 	}
 
 	time.Sleep(3 * time.Millisecond)
-	second, createdAgain := js.insert(jobInsertOptions{ProjectID: "p1", RequestID: "rq1"})
+	second, createdAgain, _ := js.insert(jobInsertOptions{ProjectID: "p1", RequestID: "rq1"})
 	if !createdAgain {
 		t.Fatalf("expected second insert to create a new job after TTL expiration")
 	}
@@ -298,7 +299,7 @@ func TestJobsExecutorTypeAndStatistics(t *testing.T) {
 	if sim["executor"] != "copy" {
 		t.Fatalf("expected copy executor, got %v", sim["executor"])
 	}
-	if stats["outputRows"] != float64(4) {
+	if stats["outputRows"] != "4" {
 		t.Fatalf("expected 4 copied rows, got %v", stats["outputRows"])
 	}
 }
@@ -393,7 +394,7 @@ func TestLoadJobMaterializesDestinationTableSchema(t *testing.T) {
 		t.Fatalf("expected 2 schema fields, got %d", len(fields))
 	}
 	first := fields[0].(map[string]any)
-	if first["name"] != "event_id" || first["type"] != "INT64" {
+	if first["name"] != "event_id" || first["type"] != "INTEGER" {
 		t.Fatalf("unexpected first field: %v", first)
 	}
 
@@ -468,7 +469,7 @@ func TestLoadJobIngestsNDJSONSourceRows(t *testing.T) {
 		t.Fatalf("unexpected job error: %v", status["errorResult"])
 	}
 	stats := jobOut["statistics"].(map[string]any)
-	if stats["outputRows"] != float64(2) {
+	if stats["outputRows"] != "2" {
 		t.Fatalf("expected 2 ingested rows, got %v", stats["outputRows"])
 	}
 
@@ -678,7 +679,7 @@ func TestLoadJobIngestsCSVSourceRows(t *testing.T) {
 		t.Fatalf("unexpected job error: %v", status["errorResult"])
 	}
 	stats := jobOut["statistics"].(map[string]any)
-	if stats["outputRows"] != float64(2) {
+	if stats["outputRows"] != "2" {
 		t.Fatalf("expected 2 ingested rows, got %v", stats["outputRows"])
 	}
 
@@ -783,7 +784,7 @@ func TestLoadJobIngestsAvroSourceRows(t *testing.T) {
 		t.Fatalf("unexpected job error: %v", status["errorResult"])
 	}
 	stats := jobOut["statistics"].(map[string]any)
-	if stats["outputRows"] != float64(2) {
+	if stats["outputRows"] != "2" {
 		t.Fatalf("expected 2 ingested rows, got %v", stats["outputRows"])
 	}
 
@@ -897,7 +898,7 @@ func TestLoadJobIngestsParquetSourceRows(t *testing.T) {
 		t.Fatalf("unexpected job error: %v", status["errorResult"])
 	}
 	stats := jobOut["statistics"].(map[string]any)
-	if stats["outputRows"] != float64(2) {
+	if stats["outputRows"] != "2" {
 		t.Fatalf("expected 2 ingested rows, got %v", stats["outputRows"])
 	}
 
@@ -1168,7 +1169,7 @@ func TestLoadJobRoundTripsGzipCompressedCSVSourceRows(t *testing.T) {
 		t.Fatalf("unexpected job error: %v", status["errorResult"])
 	}
 	stats := jobOut["statistics"].(map[string]any)
-	if stats["outputRows"] != float64(2) {
+	if stats["outputRows"] != "2" {
 		t.Fatalf("expected 2 ingested rows from gzip-compressed CSV, got %v", stats["outputRows"])
 	}
 }
@@ -1249,7 +1250,7 @@ func TestExtractJobWritesNDJSONDestination(t *testing.T) {
 	if sim["enabled"] != false || sim["executor"] != "extract" {
 		t.Fatalf("expected real extract executor, got %v", sim)
 	}
-	if stats["outputRows"] != float64(4) {
+	if stats["outputRows"] != "4" {
 		t.Fatalf("expected 4 extracted rows from default events table, got %v", stats["outputRows"])
 	}
 
@@ -1510,11 +1511,12 @@ func TestQueryJobReflectsRealResultStatistics(t *testing.T) {
 	if sim["enabled"] != false || sim["executor"] != "query" {
 		t.Fatalf("expected real query executor, got %v", sim)
 	}
-	if stats["outputRows"] != float64(4) {
+	if stats["outputRows"] != "4" {
 		t.Fatalf("expected 4 rows matching the default events table, got %v", stats["outputRows"])
 	}
-	processedBytes, ok := stats["processedBytes"].(float64)
-	if !ok || processedBytes <= 0 {
+	processedBytesStr, ok := stats["processedBytes"].(string)
+	processedBytes, convErr := strconv.ParseInt(processedBytesStr, 10, 64)
+	if !ok || convErr != nil || processedBytes <= 0 {
 		t.Fatalf("expected processedBytes derived from the real result set, got %v", stats["processedBytes"])
 	}
 }
@@ -1974,6 +1976,66 @@ func TestJobsGetQueryResults(t *testing.T) {
 	}
 }
 
+// TestJobsAnonymousDestinationTable exercises the code path official client
+// libraries use when they read a query job's results via tabledata.list
+// against configuration.query.destinationTable instead of polling
+// jobs.getQueryResults (the official Ruby client's QueryJob#data does this) —
+// a real gap found by test/clients/ruby/persistent_ddl_dml.rb against a real
+// server: LocaQL never populated destinationTable at all, and once it did,
+// tabledata.list's real-table pagination default (2 rows) silently truncated
+// a 5-row result set that the client never asked to page through.
+func TestJobsAnonymousDestinationTable(t *testing.T) {
+	s := newTestServer()
+	body := `{"configuration":{"query":{"query":"SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5"}}}`
+	createReq := httptest.NewRequest(http.MethodPost, "/bigquery/v2/projects/p1/jobs", strings.NewReader(body))
+	createReq.Header.Set("Content-Type", "application/json")
+	createRes := httptest.NewRecorder()
+	s.Handler().ServeHTTP(createRes, createReq)
+	if createRes.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d", createRes.Code)
+	}
+
+	var created map[string]any
+	if err := json.NewDecoder(createRes.Body).Decode(&created); err != nil {
+		t.Fatalf("decode created job: %v", err)
+	}
+	cfg := created["configuration"].(map[string]any)["query"].(map[string]any)
+	dest, ok := cfg["destinationTable"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected configuration.query.destinationTable, got %v", cfg)
+	}
+	datasetID := dest["datasetId"].(string)
+	tableID := dest["tableId"].(string)
+	if datasetID != anonymousQueryResultsDatasetID {
+		t.Fatalf("expected datasetId %q, got %q", anonymousQueryResultsDatasetID, datasetID)
+	}
+
+	dataReq := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/bigquery/v2/projects/p1/datasets/%s/tables/%s/data", datasetID, tableID), nil)
+	dataRes := httptest.NewRecorder()
+	s.Handler().ServeHTTP(dataRes, dataReq)
+	if dataRes.Code != http.StatusOK {
+		t.Fatalf("expected 200 reading anonymous destination table, got %d: %s", dataRes.Code, dataRes.Body.String())
+	}
+	var dataOut map[string]any
+	if err := json.NewDecoder(dataRes.Body).Decode(&dataOut); err != nil {
+		t.Fatalf("decode tabledata.list: %v", err)
+	}
+	rows, ok := dataOut["rows"].([]any)
+	if !ok || len(rows) != 5 {
+		t.Fatalf("expected all 5 rows with no maxResults specified, got %v", dataOut["rows"])
+	}
+	if _, present := dataOut["pageToken"]; present {
+		t.Fatalf("expected no pageToken when every row fit on the default page, got %v", dataOut["pageToken"])
+	}
+
+	notFoundReq := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/bigquery/v2/projects/p1/datasets/%s/tables/anondoes-not-exist/data", anonymousQueryResultsDatasetID), nil)
+	notFoundRes := httptest.NewRecorder()
+	s.Handler().ServeHTTP(notFoundRes, notFoundReq)
+	if notFoundRes.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for an unknown anonymous table, got %d", notFoundRes.Code)
+	}
+}
+
 func TestJobsSyncQuery(t *testing.T) {
 	s := newTestServer()
 	body := `{"query":"SELECT 'sync' AS val", "timeoutMs": 2000}`
@@ -2138,7 +2200,7 @@ func TestJobsListAllUsersAndSort(t *testing.T) {
 func TestJobsPersistenceAcrossRestart(t *testing.T) {
 	storePath := filepath.Join(t.TempDir(), "jobs", "state.json")
 	firstService := newJobServiceWithPersistence(storePath)
-	job, created := firstService.insert(jobInsertOptions{ProjectID: "p1", RequestID: "persist-req", JobType: "query"})
+	job, created, _ := firstService.insert(jobInsertOptions{ProjectID: "p1", RequestID: "persist-req", JobType: "query"})
 	if !created {
 		t.Fatalf("expected new job creation")
 	}
@@ -2159,7 +2221,7 @@ func TestJobsPersistenceAtomicReplaceDoesNotLeakTempFile(t *testing.T) {
 	storePath := filepath.Join(t.TempDir(), "jobs", "state.json")
 	js := newJobServiceWithPersistence(storePath)
 
-	jr, created := js.insert(jobInsertOptions{ProjectID: "p1", RequestID: "persist-tmp", JobType: "query"})
+	jr, created, _ := js.insert(jobInsertOptions{ProjectID: "p1", RequestID: "persist-tmp", JobType: "query"})
 	if !created {
 		t.Fatalf("expected job creation")
 	}
@@ -2205,10 +2267,10 @@ func TestJobsPersistenceAtomicReplaceDoesNotLeakTempFile(t *testing.T) {
 func TestJobServiceWorkerLimitBackpressure(t *testing.T) {
 	js := newJobServiceWithWorkerLimit(1)
 
-	if _, created := js.insert(jobInsertOptions{ProjectID: "p1", JobType: "query"}); !created {
+	if _, created, _ := js.insert(jobInsertOptions{ProjectID: "p1", JobType: "query"}); !created {
 		t.Fatalf("expected first job to be created")
 	}
-	if _, created := js.insert(jobInsertOptions{ProjectID: "p1", JobType: "load"}); !created {
+	if _, created, _ := js.insert(jobInsertOptions{ProjectID: "p1", JobType: "load"}); !created {
 		t.Fatalf("expected second job to be created")
 	}
 
@@ -2280,10 +2342,10 @@ func TestJobServiceStorageWriteBackpressure(t *testing.T) {
 	t.Setenv("LOCAQL_STORAGE_WRITE_WORKERS", "1")
 	js := newJobServiceWithWorkerLimit(4)
 
-	if _, created := js.insert(jobInsertOptions{ProjectID: "p1", JobType: "load"}); !created {
+	if _, created, _ := js.insert(jobInsertOptions{ProjectID: "p1", JobType: "load"}); !created {
 		t.Fatalf("expected first storage-write job to be created")
 	}
-	if _, created := js.insert(jobInsertOptions{ProjectID: "p1", JobType: "copy"}); !created {
+	if _, created, _ := js.insert(jobInsertOptions{ProjectID: "p1", JobType: "copy"}); !created {
 		t.Fatalf("expected second storage-write job to be created")
 	}
 
@@ -2327,7 +2389,7 @@ func TestJobServiceConcurrentProjectsAndClients(t *testing.T) {
 			idx := i
 			go func() {
 				defer wg.Done()
-				_, _ = js.insert(jobInsertOptions{
+				_, _, _ = js.insert(jobInsertOptions{
 					ProjectID: project,
 					UserEmail: users[idx%len(users)],
 					JobType:   "query",
@@ -2361,13 +2423,13 @@ func TestJobServiceSerializesConflictingResourceMutations(t *testing.T) {
 
 	first := common
 	first.JobType = "load"
-	if _, created := js.insert(first); !created {
+	if _, created, _ := js.insert(first); !created {
 		t.Fatalf("expected first mutation job creation")
 	}
 
 	second := common
 	second.JobType = "copy"
-	if _, created := js.insert(second); !created {
+	if _, created, _ := js.insert(second); !created {
 		t.Fatalf("expected second mutation job creation")
 	}
 
@@ -2405,7 +2467,7 @@ func TestJobServiceConcurrentReadsDuringWrites(t *testing.T) {
 	go func() {
 		defer close(writerDone)
 		for i := 0; i < 25; i++ {
-			_, _ = js.insert(jobInsertOptions{
+			_, _, _ = js.insert(jobInsertOptions{
 				ProjectID: "p-read",
 				UserEmail: "reader@example.com",
 				JobType:   "query",

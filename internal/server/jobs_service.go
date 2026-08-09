@@ -4,8 +4,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime/debug"
 	"sort"
 	"strconv"
@@ -135,6 +137,20 @@ type jobInsertOptions struct {
 	TargetTable              string
 	IsScript                 bool
 	SessionID                string
+	RequestedJobID           string
+}
+
+// validJobID matches real BigQuery's own jobId character rules: letters,
+// numbers, underscores and hyphens. The 1024-character length cap is
+// checked separately (isValidJobID) rather than in the pattern itself —
+// Go's RE2-based regexp engine rejects a bounded repeat above 1000
+// (`invalid repeat count`), so {1,1024} cannot be expressed directly here.
+var validJobID = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+
+const maxJobIDLength = 1024
+
+func isValidJobID(id string) bool {
+	return len(id) <= maxJobIDLength && validJobID.MatchString(id)
 }
 
 type jobListFilters struct {
@@ -238,7 +254,51 @@ func readDefaultStorageWriteWorkerLimit() int {
 	return n
 }
 
-func (s *jobService) insert(opts jobInsertOptions) (*jobRecord, bool) {
+// jobIDConflictError reports that a client-supplied jobReference.jobId
+// collides with a job that already exists, or fails BigQuery's own jobId
+// character rules — distinct from requestId-based idempotent retry below,
+// which returns the existing job successfully rather than an error.
+// HTTPStatus/Reason let the REST handler render the same status/reason
+// convention already used for every other "duplicate"/"invalid" error in
+// this codebase, without the handler needing to parse the message text.
+type jobIDConflictError struct {
+	msg        string
+	HTTPStatus int
+	Reason     string
+}
+
+func (e *jobIDConflictError) Error() string { return e.msg }
+
+// resolveJobIDLocked decides the new job's ID: a client-supplied
+// jobReference.jobId is honored exactly if valid and unused (matching real
+// BigQuery's own contract — official client libraries, the Node.js one
+// among them, generate their own jobId client-side and poll
+// getQueryResults/jobs.get using that exact value afterward, assuming the
+// server used it; an emulator that silently substitutes its own id breaks
+// that poll with a real "job not found"), otherwise one is auto-generated as
+// before. Callers must already hold s.mu.
+func (s *jobService) resolveJobIDLocked(projectID, requestedJobID string) (string, error) {
+	requestedJobID = strings.TrimSpace(requestedJobID)
+	if requestedJobID == "" {
+		s.counter++
+		return "job_" + strconv.FormatInt(s.counter, 10), nil
+	}
+	if !isValidJobID(requestedJobID) {
+		return "", &jobIDConflictError{
+			msg:        fmt.Sprintf("Invalid job ID %q: must be 1-%d characters matching %s", requestedJobID, maxJobIDLength, validJobID.String()),
+			HTTPStatus: http.StatusBadRequest, Reason: "invalid",
+		}
+	}
+	if _, exists := s.jobsByProject[projectID][requestedJobID]; exists {
+		return "", &jobIDConflictError{
+			msg:        fmt.Sprintf("Already Exists: Job %s:%s", projectID, requestedJobID),
+			HTTPStatus: http.StatusConflict, Reason: "duplicate",
+		}
+	}
+	return requestedJobID, nil
+}
+
+func (s *jobService) insert(opts jobInsertOptions) (*jobRecord, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if strings.TrimSpace(opts.TargetDataset) == "" && strings.TrimSpace(opts.TargetTable) == "" && !opts.IsScript {
@@ -258,14 +318,16 @@ func (s *jobService) insert(opts jobInsertOptions) (*jobRecord, bool) {
 			if existingRef, exists := s.requestIDIndex[projectID][requestID]; exists {
 				if existing := s.jobsByProject[projectID][existingRef.JobID]; existing != nil {
 					cp := *existing
-					return &cp, false
+					return &cp, false, nil
 				}
 			}
 		}
 	}
 
-	s.counter++
-	jobID := "job_" + strconv.FormatInt(s.counter, 10)
+	jobID, err := s.resolveJobIDLocked(projectID, opts.RequestedJobID)
+	if err != nil {
+		return nil, false, err
+	}
 	jr := &jobRecord{
 		ProjectID:                projectID,
 		JobID:                    jobID,
@@ -323,19 +385,25 @@ func (s *jobService) insert(opts jobInsertOptions) (*jobRecord, bool) {
 
 	go s.run(jobID, projectID)
 	cp := *jr
-	return &cp, true
+	return &cp, true, nil
 }
 
-func (s *jobService) insertScriptWithChildren(opts jobInsertOptions) (*jobRecord, []*jobRecord, bool) {
-	parent, created := s.insert(opts)
+func (s *jobService) insertScriptWithChildren(opts jobInsertOptions) (*jobRecord, []*jobRecord, bool, error) {
+	parent, created, err := s.insert(opts)
+	if err != nil {
+		return nil, nil, false, err
+	}
 	if !created {
-		return parent, nil, false
+		return parent, nil, false, nil
 	}
 
 	childJobs := make([]*jobRecord, 0)
 	parts := splitScriptStatements(opts.QueryText)
 	for range parts {
-		child, _ := s.insert(jobInsertOptions{
+		// Child jobs never have their own client-supplied jobId — real
+		// BigQuery script children are always server-assigned regardless of
+		// the parent's jobReference.
+		child, _, _ := s.insert(jobInsertOptions{
 			ProjectID:   opts.ProjectID,
 			ParentJobID: parent.JobID,
 			UserEmail:   opts.UserEmail,
@@ -346,7 +414,7 @@ func (s *jobService) insertScriptWithChildren(opts jobInsertOptions) (*jobRecord
 		childJobs = append(childJobs, child)
 	}
 
-	return parent, childJobs, true
+	return parent, childJobs, true, nil
 }
 
 // recordJobOutcomeLocked increments the completed/failed counters exposed by
@@ -825,10 +893,21 @@ func renderJobResource(j *jobRecord) map[string]any {
 		status["errors"] = j.Errors
 	}
 
+	// Real BigQuery renders every int64 statistics field as a JSON string,
+	// not a bare number — a long-standing, deliberate convention of Google's
+	// REST APIs to avoid precision loss in JavaScript's Number type, which
+	// cannot safely represent the full int64 range. Official client
+	// libraries built on generated REST stubs enforce this on the wire:
+	// Python/Node's JSON parsing is lenient enough to accept a bare number
+	// too, but the official Go client's generated structs use a `,string`
+	// json tag that rejects an unquoted number outright ("invalid use of
+	// ,string struct tag") — caught by test/clients/go/persistent_ddl_dml.go
+	// the first time it ran against a real server, the same way the
+	// Node.js client caught the jobReference.jobId gap above.
 	stats := map[string]any{
-		"totalSlotMs":    j.Statistics.TotalSlotMs,
-		"processedBytes": j.Statistics.ProcessedBytes,
-		"outputRows":     j.Statistics.OutputRows,
+		"totalSlotMs":    strconv.FormatInt(j.Statistics.TotalSlotMs, 10),
+		"processedBytes": strconv.FormatInt(j.Statistics.ProcessedBytes, 10),
+		"outputRows":     strconv.FormatInt(j.Statistics.OutputRows, 10),
 		"simulation": map[string]any{
 			"enabled":  j.Statistics.Simulated,
 			"executor": j.Statistics.Executor,
@@ -849,8 +928,8 @@ func renderJobResource(j *jobRecord) map[string]any {
 	// weren't part of this bug's repro.
 	if j.JobType == "load" {
 		stats["load"] = map[string]any{
-			"outputRows":  j.Statistics.OutputRows,
-			"outputBytes": j.Statistics.ProcessedBytes,
+			"outputRows":  strconv.FormatInt(j.Statistics.OutputRows, 10),
+			"outputBytes": strconv.FormatInt(j.Statistics.ProcessedBytes, 10),
 		}
 	}
 	if j.JobType == "query" && j.Statistics.StatementType != "" {
@@ -886,11 +965,37 @@ func renderJobResource(j *jobRecord) map[string]any {
 		"status":      status,
 	}
 
-	// For query jobs, include priority if set
+	// For query jobs, echo the submitted query text back alongside priority.
+	// Real BigQuery always includes configuration.query.query in a job
+	// resource — omitting it isn't just incomplete, it broke the official
+	// Java client outright: QueryJobConfiguration.fromPb (used to
+	// reconstruct a Job from the REST response returned by jobs.insert)
+	// requires it non-null and throws a bare NullPointerException via
+	// Preconditions.checkNotNull otherwise, found the first time
+	// test/clients/java/PersistentDdlDml.java ran against a real server.
 	if j.JobType == "query" || j.JobType == "script" {
 		res["configuration"] = map[string]any{
 			"query": map[string]any{
+				"query":    j.QueryText,
 				"priority": j.Priority,
+				// Real BigQuery always assigns a destination table to a query
+				// job — a user-specified one, or an anonymous one otherwise —
+				// even for a plain SELECT never written anywhere on purpose.
+				// Omitting it isn't just incomplete: the official Ruby
+				// client's QueryJob#data reads this field directly and calls
+				// tabledata.list against it, rather than polling
+				// jobs.getQueryResults like the other client libraries do;
+				// with no destinationTable it raised a bare NoMethodError on
+				// nil. LocaQL never materializes query results as a real
+				// project:dataset.table row set, so this points at a virtual
+				// table (see anonymousQueryResultsDatasetID/
+				// anonymousQueryResultsTableID) that tabledata.list resolves
+				// straight back to this job's cached result set.
+				"destinationTable": map[string]string{
+					"projectId": j.ProjectID,
+					"datasetId": anonymousQueryResultsDatasetID,
+					"tableId":   anonymousQueryResultsTableID(j.JobID),
+				},
 			},
 		}
 	}

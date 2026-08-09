@@ -1,0 +1,9 @@
+{
+  "name": "locaql-node-client-conformance",
+  "private": true,
+  "description": "Official @google-cloud/bigquery smoke test against LocaQL, pinned for reproducible CI runs.",
+  "dependencies": {
+    "@google-cloud/bigquery": "8.3.1",
+    "@google-cloud/common": "6.0.0"
+  }
+}
