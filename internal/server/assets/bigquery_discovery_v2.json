@@ -1,0 +1,393 @@
+{
+  "kind": "discovery#restDescription",
+  "discoveryVersion": "v1",
+  "id": "bigquery:v2",
+  "name": "bigquery",
+  "canonicalName": "BigQuery",
+  "version": "v2",
+  "revision": "0",
+  "title": "LocaQL BigQuery API (scoped discovery document)",
+  "description": "LocaQL's own discovery document, deliberately scoped to the jobs.* resource only (insert, get, list, query, getQueryResults, cancel) — enough for `bq query`, `bq show -j`, `bq cancel` and `bq ls -j` to work against a local LocaQL server. Other bq subcommands that depend on datasets/tables/tabledata resources (mk, ls, load, extract, cp, insert) are not yet covered here; see KNOWN-DIVERGENCES.md. Every method and schema below describes only what LocaQL actually implements, not the full real BigQuery API surface.",
+  "ownerDomain": "google.com",
+  "ownerName": "Google",
+  "documentationLink": "https://github.com/lraigosov/LocaQL",
+  "protocol": "rest",
+  "rootUrl": "__ROOT_URL__/",
+  "mtlsRootUrl": "__ROOT_URL__/",
+  "servicePath": "bigquery/v2/",
+  "basePath": "/bigquery/v2/",
+  "baseUrl": "__ROOT_URL__/bigquery/v2/",
+  "batchPath": "batch/bigquery/v2",
+  "parameters": {
+    "alt": {
+      "type": "string",
+      "description": "Data format for the response.",
+      "default": "json",
+      "enum": ["json"],
+      "enumDescriptions": ["Responses with Content-Type of application/json"],
+      "location": "query"
+    },
+    "fields": {
+      "type": "string",
+      "description": "Selector specifying which fields to include in a partial response.",
+      "location": "query"
+    },
+    "prettyPrint": {
+      "type": "boolean",
+      "description": "Returns response with indentations and line breaks.",
+      "default": "true",
+      "location": "query"
+    }
+  },
+  "schemas": {
+    "ErrorProto": {
+      "id": "ErrorProto",
+      "type": "object",
+      "properties": {
+        "reason": {"type": "string"},
+        "location": {"type": "string"},
+        "message": {"type": "string"}
+      }
+    },
+    "JobReference": {
+      "id": "JobReference",
+      "type": "object",
+      "properties": {
+        "projectId": {"type": "string"},
+        "jobId": {"type": "string"},
+        "location": {"type": "string"}
+      }
+    },
+    "TableReference": {
+      "id": "TableReference",
+      "type": "object",
+      "properties": {
+        "projectId": {"type": "string"},
+        "datasetId": {"type": "string"},
+        "tableId": {"type": "string"}
+      }
+    },
+    "DatasetReference": {
+      "id": "DatasetReference",
+      "type": "object",
+      "properties": {
+        "projectId": {"type": "string"},
+        "datasetId": {"type": "string"}
+      }
+    },
+    "TableFieldSchema": {
+      "id": "TableFieldSchema",
+      "type": "object",
+      "properties": {
+        "name": {"type": "string"},
+        "type": {"type": "string"},
+        "mode": {"type": "string"},
+        "description": {"type": "string"},
+        "fields": {
+          "type": "array",
+          "items": {"$ref": "TableFieldSchema"}
+        }
+      }
+    },
+    "TableSchema": {
+      "id": "TableSchema",
+      "type": "object",
+      "properties": {
+        "fields": {
+          "type": "array",
+          "items": {"$ref": "TableFieldSchema"}
+        }
+      }
+    },
+    "TableCell": {
+      "id": "TableCell",
+      "type": "object",
+      "properties": {
+        "v": {"type": "any"}
+      }
+    },
+    "TableRow": {
+      "id": "TableRow",
+      "type": "object",
+      "properties": {
+        "f": {
+          "type": "array",
+          "items": {"$ref": "TableCell"}
+        }
+      }
+    },
+    "JobConfigurationQuery": {
+      "id": "JobConfigurationQuery",
+      "type": "object",
+      "properties": {
+        "query": {"type": "string"},
+        "useLegacySql": {"type": "boolean"},
+        "priority": {"type": "string"},
+        "createDisposition": {"type": "string"},
+        "writeDisposition": {"type": "string"},
+        "defaultDataset": {"$ref": "DatasetReference"},
+        "destinationTable": {"$ref": "TableReference"}
+      }
+    },
+    "JobConfiguration": {
+      "id": "JobConfiguration",
+      "type": "object",
+      "properties": {
+        "jobType": {"type": "string"},
+        "query": {"$ref": "JobConfigurationQuery"},
+        "dryRun": {"type": "boolean"}
+      }
+    },
+    "JobStatus": {
+      "id": "JobStatus",
+      "type": "object",
+      "properties": {
+        "state": {"type": "string"},
+        "errorResult": {"$ref": "ErrorProto"},
+        "errors": {
+          "type": "array",
+          "items": {"$ref": "ErrorProto"}
+        }
+      }
+    },
+    "DmlStats": {
+      "id": "DmlStats",
+      "type": "object",
+      "properties": {
+        "insertedRowCount": {"type": "string", "format": "int64"},
+        "updatedRowCount": {"type": "string", "format": "int64"},
+        "deletedRowCount": {"type": "string", "format": "int64"}
+      }
+    },
+    "JobStatistics2": {
+      "id": "JobStatistics2",
+      "type": "object",
+      "properties": {
+        "totalBytesProcessed": {"type": "string", "format": "int64"},
+        "cacheHit": {"type": "boolean"},
+        "statementType": {"type": "string"},
+        "numDmlAffectedRows": {"type": "string", "format": "int64"},
+        "dmlStats": {"$ref": "DmlStats"}
+      }
+    },
+    "JobStatistics": {
+      "id": "JobStatistics",
+      "type": "object",
+      "properties": {
+        "creationTime": {"type": "string", "format": "int64"},
+        "startTime": {"type": "string", "format": "int64"},
+        "endTime": {"type": "string", "format": "int64"},
+        "totalSlotMs": {"type": "string", "format": "int64"},
+        "query": {"$ref": "JobStatistics2"}
+      }
+    },
+    "Job": {
+      "id": "Job",
+      "type": "object",
+      "properties": {
+        "kind": {"type": "string", "default": "bigquery#job"},
+        "id": {"type": "string"},
+        "jobReference": {"$ref": "JobReference"},
+        "configuration": {"$ref": "JobConfiguration"},
+        "status": {"$ref": "JobStatus"},
+        "statistics": {"$ref": "JobStatistics"},
+        "user_email": {"type": "string"}
+      }
+    },
+    "JobList": {
+      "id": "JobList",
+      "type": "object",
+      "properties": {
+        "kind": {"type": "string", "default": "bigquery#jobList"},
+        "etag": {"type": "string"},
+        "nextPageToken": {"type": "string"},
+        "jobs": {
+          "type": "array",
+          "items": {"$ref": "Job"}
+        }
+      }
+    },
+    "JobCancelResponse": {
+      "id": "JobCancelResponse",
+      "type": "object",
+      "properties": {
+        "kind": {"type": "string", "default": "bigquery#jobCancelResponse"},
+        "job": {"$ref": "Job"}
+      }
+    },
+    "QueryParameter": {
+      "id": "QueryParameter",
+      "type": "object",
+      "properties": {
+        "name": {"type": "string"}
+      }
+    },
+    "QueryRequest": {
+      "id": "QueryRequest",
+      "type": "object",
+      "properties": {
+        "kind": {"type": "string", "default": "bigquery#queryRequest"},
+        "query": {"type": "string"},
+        "useLegacySql": {"type": "boolean", "default": "true"},
+        "maxResults": {"type": "integer", "format": "uint32"},
+        "timeoutMs": {"type": "integer", "format": "uint32"},
+        "dryRun": {"type": "boolean"},
+        "requestId": {"type": "string"},
+        "parameterMode": {"type": "string"},
+        "queryParameters": {
+          "type": "array",
+          "items": {"$ref": "QueryParameter"}
+        },
+        "defaultDataset": {"$ref": "DatasetReference"},
+        "location": {"type": "string"}
+      }
+    },
+    "QueryResponse": {
+      "id": "QueryResponse",
+      "type": "object",
+      "properties": {
+        "kind": {"type": "string", "default": "bigquery#queryResponse"},
+        "schema": {"$ref": "TableSchema"},
+        "jobReference": {"$ref": "JobReference"},
+        "totalRows": {"type": "string", "format": "uint64"},
+        "pageToken": {"type": "string"},
+        "rows": {
+          "type": "array",
+          "items": {"$ref": "TableRow"}
+        },
+        "totalBytesProcessed": {"type": "string", "format": "int64"},
+        "jobComplete": {"type": "boolean"},
+        "cacheHit": {"type": "boolean"},
+        "numDmlAffectedRows": {"type": "string", "format": "int64"},
+        "errors": {
+          "type": "array",
+          "items": {"$ref": "ErrorProto"}
+        }
+      }
+    },
+    "GetQueryResultsResponse": {
+      "id": "GetQueryResultsResponse",
+      "type": "object",
+      "properties": {
+        "kind": {"type": "string", "default": "bigquery#getQueryResultsResponse"},
+        "etag": {"type": "string"},
+        "schema": {"$ref": "TableSchema"},
+        "jobReference": {"$ref": "JobReference"},
+        "totalRows": {"type": "string", "format": "uint64"},
+        "rows": {
+          "type": "array",
+          "items": {"$ref": "TableRow"}
+        },
+        "pageToken": {"type": "string"},
+        "totalBytesProcessed": {"type": "string", "format": "int64"},
+        "jobComplete": {"type": "boolean"},
+        "cacheHit": {"type": "boolean"},
+        "numDmlAffectedRows": {"type": "string", "format": "int64"},
+        "errors": {
+          "type": "array",
+          "items": {"$ref": "ErrorProto"}
+        }
+      }
+    }
+  },
+  "resources": {
+    "jobs": {
+      "methods": {
+        "insert": {
+          "id": "bigquery.jobs.insert",
+          "path": "projects/{+projectId}/jobs",
+          "flatPath": "projects/{projectsId}/jobs",
+          "httpMethod": "POST",
+          "parameters": {
+            "projectId": {"type": "string", "required": true, "location": "path"}
+          },
+          "parameterOrder": ["projectId"],
+          "request": {"$ref": "Job"},
+          "response": {"$ref": "Job"},
+          "supportsMediaUpload": true,
+          "mediaUpload": {
+            "accept": ["*/*"],
+            "protocols": {
+              "simple": {"multipart": true, "path": "/upload/bigquery/v2/projects/{+projectId}/jobs"},
+              "resumable": {"multipart": true, "path": "/resumable/upload/bigquery/v2/projects/{+projectId}/jobs"}
+            }
+          }
+        },
+        "get": {
+          "id": "bigquery.jobs.get",
+          "path": "projects/{+projectId}/jobs/{+jobId}",
+          "flatPath": "projects/{projectsId}/jobs/{jobsId}",
+          "httpMethod": "GET",
+          "parameters": {
+            "projectId": {"type": "string", "required": true, "location": "path"},
+            "jobId": {"type": "string", "required": true, "location": "path"},
+            "location": {"type": "string", "location": "query"}
+          },
+          "parameterOrder": ["projectId", "jobId"],
+          "response": {"$ref": "Job"}
+        },
+        "list": {
+          "id": "bigquery.jobs.list",
+          "path": "projects/{+projectId}/jobs",
+          "flatPath": "projects/{projectsId}/jobs",
+          "httpMethod": "GET",
+          "parameters": {
+            "projectId": {"type": "string", "required": true, "location": "path"},
+            "maxResults": {"type": "integer", "format": "uint32", "location": "query"},
+            "pageToken": {"type": "string", "location": "query"},
+            "stateFilter": {"type": "string", "location": "query"},
+            "allUsers": {"type": "boolean", "location": "query"},
+            "projection": {"type": "string", "enum": ["full", "minimal"], "location": "query"},
+            "parentJobId": {"type": "string", "location": "query"},
+            "minCreationTime": {"type": "string", "format": "uint64", "location": "query"},
+            "maxCreationTime": {"type": "string", "format": "uint64", "location": "query"}
+          },
+          "parameterOrder": ["projectId"],
+          "response": {"$ref": "JobList"}
+        },
+        "cancel": {
+          "id": "bigquery.jobs.cancel",
+          "path": "projects/{+projectId}/jobs/{+jobId}/cancel",
+          "flatPath": "projects/{projectsId}/jobs/{jobsId}/cancel",
+          "httpMethod": "POST",
+          "parameters": {
+            "projectId": {"type": "string", "required": true, "location": "path"},
+            "jobId": {"type": "string", "required": true, "location": "path"},
+            "location": {"type": "string", "location": "query"}
+          },
+          "parameterOrder": ["projectId", "jobId"],
+          "response": {"$ref": "JobCancelResponse"}
+        },
+        "query": {
+          "id": "bigquery.jobs.query",
+          "path": "projects/{+projectId}/queries",
+          "flatPath": "projects/{projectsId}/queries",
+          "httpMethod": "POST",
+          "parameters": {
+            "projectId": {"type": "string", "required": true, "location": "path"}
+          },
+          "parameterOrder": ["projectId"],
+          "request": {"$ref": "QueryRequest"},
+          "response": {"$ref": "QueryResponse"}
+        },
+        "getQueryResults": {
+          "id": "bigquery.jobs.getQueryResults",
+          "path": "projects/{+projectId}/queries/{+jobId}",
+          "flatPath": "projects/{projectsId}/queries/{queriesId}",
+          "httpMethod": "GET",
+          "parameters": {
+            "projectId": {"type": "string", "required": true, "location": "path"},
+            "jobId": {"type": "string", "required": true, "location": "path"},
+            "startIndex": {"type": "string", "format": "uint64", "location": "query"},
+            "maxResults": {"type": "integer", "format": "uint32", "location": "query"},
+            "pageToken": {"type": "string", "location": "query"},
+            "timeoutMs": {"type": "integer", "format": "uint32", "location": "query"},
+            "location": {"type": "string", "location": "query"}
+          },
+          "parameterOrder": ["projectId", "jobId"],
+          "response": {"$ref": "GetQueryResultsResponse"}
+        }
+      }
+    }
+  }
+}

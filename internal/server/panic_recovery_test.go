@@ -21,7 +21,7 @@ func TestJobExecutorPanicIsContainedNotFatal(t *testing.T) {
 		panic("simulated engine panic, matching the real slice-bounds-out-of-range crash")
 	}
 
-	jr, _ := s.jobs.insert(jobInsertOptions{ProjectID: "p1", JobType: "query", QueryText: "SELECT 1"})
+	jr, _, _ := s.jobs.insert(jobInsertOptions{ProjectID: "p1", JobType: "query", QueryText: "SELECT 1"})
 
 	deadline := time.Now().Add(5 * time.Second)
 	var final *jobRecord
@@ -57,7 +57,7 @@ func TestJobExecutorPanicIsContainedNotFatal(t *testing.T) {
 	// The server must still be fully usable afterward — the whole point of
 	// containing the panic to one job.
 	s.jobs.queryExecutor = originalExecutor
-	jr2, _ := s.jobs.insert(jobInsertOptions{ProjectID: "p1", JobType: "query", QueryText: "SELECT 1 AS one"})
+	jr2, _, _ := s.jobs.insert(jobInsertOptions{ProjectID: "p1", JobType: "query", QueryText: "SELECT 1 AS one"})
 	deadline = time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		job, ok := s.jobs.get("p1", jr2.JobID)

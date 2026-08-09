@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -1359,11 +1360,17 @@ func (s *Server) insertJob(w http.ResponseWriter, r *http.Request, projectID str
 	var queryParameters []storedQueryParameter
 	parameterMode := ""
 	var queryParametersErr error
+	requestedJobID := ""
 	if r.Body != nil {
 		body, _ := io.ReadAll(r.Body)
 		if len(body) > 0 {
 			var raw map[string]any
 			if err := json.Unmarshal(body, &raw); err == nil {
+				if jobRef, ok := raw["jobReference"].(map[string]any); ok {
+					if id, ok := jobRef["jobId"].(string); ok {
+						requestedJobID = strings.TrimSpace(id)
+					}
+				}
 				if conf, ok := raw["configuration"].(map[string]any); ok {
 					if qCfg, ok := conf["query"].(map[string]any); ok {
 						if p, ok := qCfg["priority"].(string); ok {
@@ -1506,10 +1513,15 @@ func (s *Server) insertJob(w http.ResponseWriter, r *http.Request, projectID str
 		IsScript:                 isScript,
 		ParameterMode:            parameterMode,
 		QueryParameters:          queryParameters,
+		RequestedJobID:           requestedJobID,
 	}
 
 	if isScript {
-		jr, childJobs, created := s.jobs.insertScriptWithChildren(insertOpts)
+		jr, childJobs, created, err := s.jobs.insertScriptWithChildren(insertOpts)
+		if err != nil {
+			writeJobInsertError(w, err)
+			return
+		}
 		status := http.StatusOK
 		if created {
 			status = http.StatusCreated
@@ -1525,12 +1537,29 @@ func (s *Server) insertJob(w http.ResponseWriter, r *http.Request, projectID str
 		return
 	}
 
-	jr, created := s.jobs.insert(insertOpts)
+	jr, created, err := s.jobs.insert(insertOpts)
+	if err != nil {
+		writeJobInsertError(w, err)
+		return
+	}
 	status := http.StatusOK
 	if created {
 		status = http.StatusCreated
 	}
 	writeJSON(w, status, renderJobResource(jr))
+}
+
+// writeJobInsertError renders a jobIDConflictError (an invalid or
+// already-used client-supplied jobReference.jobId) with the same
+// status/reason convention every other "duplicate"/"invalid" REST error in
+// this codebase already uses.
+func writeJobInsertError(w http.ResponseWriter, err error) {
+	var conflict *jobIDConflictError
+	if errors.As(err, &conflict) {
+		writeError(w, conflict.HTTPStatus, conflict.Error(), conflict.Reason)
+		return
+	}
+	writeError(w, http.StatusInternalServerError, err.Error(), "internalError")
 }
 
 func (s *Server) getJob(w http.ResponseWriter, _ *http.Request, projectID, jobID string) {
@@ -1628,8 +1657,15 @@ func (s *Server) handleJobsQuery(w http.ResponseWriter, r *http.Request, project
 		QueryParameters: queryParams,
 	}
 
-	jr, created := s.jobs.insert(insertOpts)
+	jr, created, err := s.jobs.insert(insertOpts)
 	_ = created // jobId is what matters
+	if err != nil {
+		// jobs.query/projects.queries never sets RequestedJobID (real
+		// BigQuery's QueryRequest has no jobReference field), so this
+		// should be unreachable — handled defensively rather than assumed.
+		writeJobInsertError(w, err)
+		return
+	}
 
 	// Wait loop (simulated)
 	start := time.Now()
@@ -1672,6 +1708,33 @@ func (s *Server) getQueryResults(w http.ResponseWriter, r *http.Request, project
 	s.writeQueryResults(w, r, projectID, jobID, "bigquery#getQueryResultsResponse")
 }
 
+// computeQueryJobResultRows returns the schema/rows for a query or script
+// job's result set. A DONE job's result set was already computed once by
+// executeQueryJob and cached on Statistics.ResultSchema/ResultRows — reuse it
+// instead of re-running queryText a second time. This isn't just an
+// optimization: some query text has real, non-idempotent side effects
+// (session control statements, see jobStatistics.ResultSchema), so re-running
+// it here to serve a second/paginated fetch (or a tabledata.list read of the
+// job's anonymous destination table, see anonymousQueryResultsTableID) would
+// re-apply those side effects instead of returning the already-computed
+// result.
+func (s *Server) computeQueryJobResultRows(projectID string, j *jobRecord) ([]tableField, [][]string, error) {
+	if j.State == jobStateDone && j.Statistics.ResultSchema != nil {
+		return j.Statistics.ResultSchema, j.Statistics.ResultRows, nil
+	}
+	// Preserve the existing early-result behavior for side-effect-free
+	// SELECTs, but never execute DDL/DML or session control merely because a
+	// PENDING/RUNNING job was polled. A mutation must run exactly once after
+	// its job acquires the target-table lock.
+	_, mutating, _ := parsePersistentSQLStatement(projectID, j.QueryText)
+	trimmedQuery := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(j.QueryText), ";"))
+	sessionControl := sessionBeginPattern.MatchString(trimmedQuery) || sessionCommitPattern.MatchString(trimmedQuery) || sessionRollbackPattern.MatchString(trimmedQuery) || sessionCreateTempTablePattern.MatchString(trimmedQuery)
+	if mutating || sessionControl {
+		return []tableField{}, [][]string{}, nil
+	}
+	return s.simulateQueryResultTable(projectID, j.SessionID, j.QueryText, j.UserEmail, j.ParameterMode, j.QueryParameters)
+}
+
 func (s *Server) writeQueryResults(w http.ResponseWriter, r *http.Request, projectID, jobID, kind string) {
 	j, ok := s.jobs.get(projectID, jobID)
 	if !ok {
@@ -1688,36 +1751,10 @@ func (s *Server) writeQueryResults(w http.ResponseWriter, r *http.Request, proje
 	}
 
 	start, size := parsePagination(r, 20, 1000)
-	// A DONE query job's result set was already computed once by
-	// executeQueryJob and cached on Statistics.ResultSchema/ResultRows —
-	// reuse it instead of re-running queryText a second time. This isn't
-	// just an optimization: some query text has real, non-idempotent side
-	// effects (session control statements, see jobStatistics.ResultSchema),
-	// so re-running it here to serve a second/paginated fetch would
-	// re-apply those side effects instead of returning the already-computed
-	// result.
-	var schema []tableField
-	var values [][]string
-	if j.State == jobStateDone && j.Statistics.ResultSchema != nil {
-		schema, values = j.Statistics.ResultSchema, j.Statistics.ResultRows
-	} else {
-		// Preserve the existing early-result behavior for side-effect-free
-		// SELECTs, but never execute DDL/DML or session control merely because a
-		// PENDING/RUNNING job was polled. A mutation must run exactly once after
-		// its job acquires the target-table lock.
-		_, mutating, _ := parsePersistentSQLStatement(projectID, j.QueryText)
-		trimmedQuery := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(j.QueryText), ";"))
-		sessionControl := sessionBeginPattern.MatchString(trimmedQuery) || sessionCommitPattern.MatchString(trimmedQuery) || sessionRollbackPattern.MatchString(trimmedQuery) || sessionCreateTempTablePattern.MatchString(trimmedQuery)
-		if mutating || sessionControl {
-			schema, values = []tableField{}, [][]string{}
-		} else {
-			var err error
-			schema, values, err = s.simulateQueryResultTable(projectID, j.SessionID, j.QueryText, j.UserEmail, j.ParameterMode, j.QueryParameters)
-			if err != nil {
-				writeError(w, http.StatusBadRequest, err.Error(), "invalid")
-				return
-			}
-		}
+	schema, values, err := s.computeQueryJobResultRows(projectID, j)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error(), "invalid")
+		return
 	}
 	end := clampEnd(start, size, len(values))
 	rows := renderRESTRows(schema, values[start:end])
@@ -1801,7 +1838,31 @@ func flatSchemaToTableFields(schema []map[string]string) []tableField {
 	return fields
 }
 
+// anonymousQueryResultsDatasetID is the fixed dataset ID real BigQuery-style
+// anonymous query destination tables live under. Real BigQuery uses a
+// per-project hidden dataset with a generated name (also hidden from
+// datasets.list); LocaQL uses one fixed, deliberately non-listable name
+// instead since nothing here needs to be enumerable, only readable by the
+// exact reference a job hands back in configuration.query.destinationTable.
+const anonymousQueryResultsDatasetID = "_anon"
+
+// anonymousQueryResultsTableID names the virtual destination table backing a
+// query/script job's result set, keyed by job ID so listTableData can resolve
+// it straight back to the job record instead of a real catalog entry — no
+// query result is ever materialized as an actual project:dataset.table row
+// set. Required for official client libraries whose result-fetching path
+// reads configuration.query.destinationTable and calls tabledata.list against
+// it directly (e.g. the Ruby client's QueryJob#data) rather than polling
+// jobs.getQueryResults.
+func anonymousQueryResultsTableID(jobID string) string {
+	return "anon" + jobID
+}
+
 func (s *Server) listTableData(w http.ResponseWriter, r *http.Request, projectID, datasetID, tableID string) {
+	if datasetID == anonymousQueryResultsDatasetID {
+		s.listAnonymousQueryResultsTableData(w, r, projectID, tableID)
+		return
+	}
 	schema, rawRows, ok, err := s.resolveTableRows(projectID, datasetID, tableID)
 	if !ok {
 		writeError(w, http.StatusNotFound, fmt.Sprintf("Not found: Table %s:%s.%s", projectID, datasetID, tableID), "notFound")
@@ -1811,12 +1872,46 @@ func (s *Server) listTableData(w http.ResponseWriter, r *http.Request, projectID
 		writeError(w, http.StatusBadRequest, err.Error(), "invalid")
 		return
 	}
+	writeTableDataListResponse(w, r, projectID, datasetID, tableID, schema, rawRows, 2, 100000)
+}
+
+// listAnonymousQueryResultsTableData serves tabledata.list against a query or
+// script job's virtual anonymous destination table (see
+// anonymousQueryResultsTableID) by resolving the tableID straight back to the
+// job that produced it and reusing the exact same result computation as
+// jobs.getQueryResults, rather than a real catalog lookup.
+func (s *Server) listAnonymousQueryResultsTableData(w http.ResponseWriter, r *http.Request, projectID, tableID string) {
+	jobID := strings.TrimPrefix(tableID, "anon")
+	j, ok := s.jobs.get(projectID, jobID)
+	if !ok || (j.JobType != "query" && j.JobType != "script") {
+		writeError(w, http.StatusNotFound, fmt.Sprintf("Not found: Table %s:%s.%s", projectID, anonymousQueryResultsDatasetID, tableID), "notFound")
+		return
+	}
+	schema, rawRows, err := s.computeQueryJobResultRows(projectID, j)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error(), "invalid")
+		return
+	}
+	// Default/max page size here intentionally matches writeQueryResults
+	// (jobs.getQueryResults), not the real-table tabledata.list default of 2
+	// above: this endpoint backs the exact same query result set, just
+	// reached through a different official-client code path (the Ruby
+	// client's QueryJob#data calls tabledata.list on this virtual table
+	// directly instead of polling jobs.getQueryResults). A client that omits
+	// maxResults — which the Ruby client does by default — got silently
+	// truncated to 2 rows with the real-table default, a real gap invisible
+	// to every other client library because none of them read query results
+	// through tabledata.list.
+	writeTableDataListResponse(w, r, projectID, anonymousQueryResultsDatasetID, tableID, schema, rawRows, 20, 1000)
+}
+
+func writeTableDataListResponse(w http.ResponseWriter, r *http.Request, projectID, datasetID, tableID string, schema []tableField, rawRows [][]string, defaultSize, maxSize int) {
 	rows := make([]tableRow, 0, len(rawRows))
 	for _, raw := range rawRows {
 		rows = append(rows, tableRow{Values: append([]string(nil), raw...)})
 	}
 
-	start, size := parsePagination(r, 2, 100000)
+	start, size := parsePagination(r, defaultSize, maxSize)
 	if startIndex := r.URL.Query().Get("startIndex"); startIndex != "" {
 		if n, err := strconv.Atoi(startIndex); err == nil && n >= 0 {
 			start = n
@@ -1872,13 +1967,47 @@ func renderTableSchemaFields(fields []tableField) []map[string]any {
 		if mode == "" {
 			mode = "NULLABLE"
 		}
-		entry := map[string]any{"name": field.Name, "type": field.Type, "mode": mode}
+		entry := map[string]any{"name": field.Name, "type": restFieldTypeName(field.Type), "mode": mode}
 		if isRecordType(field.Type) && len(field.Fields) > 0 {
 			entry["fields"] = renderTableSchemaFields(field.Fields)
 		}
 		out = append(out, entry)
 	}
 	return out
+}
+
+// restFieldTypeName renders a schema field's type in BigQuery's actual REST
+// TableFieldSchema wire form. tableField.Type is stored internally using
+// GoogleSQL/standard-SQL scalar names (INT64, FLOAT64, BOOL, STRUCT — see
+// realSQLScalarTypes in sql_engine.go, needed as-is to build real CREATE
+// TABLE statements against the embedded engine), but real BigQuery's REST
+// schema responses (tables.get, tabledata.list, query result schemas) use
+// the older legacy names instead — both are documented, accepted aliases of
+// the same type, but not every official client library's own schema/row
+// decoder recognizes both forms in every code path: the official Go
+// client's row-value converter rejected "INT64" outright ("unrecognized
+// type: INT64") the first time it queried a real result set, even though
+// its own schema-parsing accepts the alias — caught by
+// test/clients/go/persistent_ddl_dml.go, not by the already-passing Python
+// or Node.js conformance tests, which happen to be more lenient here.
+// Rendering the canonical/legacy form is unconditionally correct per
+// BigQuery's own documented aliases, so this applies to every client, not
+// just Go. INFORMATION_SCHEMA.COLUMNS.data_type is deliberately NOT run
+// through this — real BigQuery renders that column using GoogleSQL type
+// names, the opposite convention, in that specific context only.
+func restFieldTypeName(t string) string {
+	switch strings.ToUpper(strings.TrimSpace(t)) {
+	case "INT64":
+		return "INTEGER"
+	case "FLOAT64":
+		return "FLOAT"
+	case "BOOL":
+		return "BOOLEAN"
+	case "STRUCT":
+		return "RECORD"
+	default:
+		return t
+	}
 }
 
 // renderRESTRows converts stored rows into BigQuery's REST row shape

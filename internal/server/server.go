@@ -1,6 +1,7 @@
 package server
 
 import (
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -70,7 +71,37 @@ func New(reg capabilities.Registry) *Server {
 }
 
 func (s *Server) Handler() http.Handler {
-	return s.withObservability(s.mux)
+	return s.withObservability(withGzipRequestDecoding(s.mux))
+}
+
+// withGzipRequestDecoding transparently decompresses a request body sent
+// with Content-Encoding: gzip before any handler reads it. The official
+// Java BigQuery client (google-http-client, used by
+// test/clients/java/PersistentDdlDml.java) gzip-compresses POST bodies by
+// default as a bandwidth optimization — without this, every handler's
+// io.ReadAll(r.Body) + json.Unmarshal reads raw gzip bytes, which fails to
+// parse as JSON. Several call sites treat that parse failure as "the field
+// was simply omitted" rather than a hard error (a reasonable assumption
+// when the body really is malformed JSON, not when it's valid JSON the
+// server just never decompressed), so a gzip-compressed jobs.insert
+// silently created a job with an empty query text and no jobType override
+// instead of executing the real statement or failing loudly — found the
+// first time the Java client conformance test ran against a real server.
+func withGzipRequestDecoding(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Body != nil && strings.EqualFold(r.Header.Get("Content-Encoding"), "gzip") {
+			gz, err := gzip.NewReader(r.Body)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, "invalid gzip-encoded request body: "+err.Error(), "invalid")
+				return
+			}
+			defer gz.Close()
+			r.Body = gz
+			r.Header.Del("Content-Encoding")
+			r.ContentLength = -1
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) routes() {
@@ -86,6 +117,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/_emulator/workspace/plan", s.workspacePlan)
 	s.mux.HandleFunc("/_emulator/workspace/diff", s.workspaceDiff)
 	s.mux.HandleFunc("/_emulator/workspace/apply", s.workspaceApply)
+	s.mux.HandleFunc("/$discovery/rest", s.bigQueryDiscoveryDocument)
 	s.mux.HandleFunc("/bigquery/v2/projects/", s.bigQueryV2)
 	s.mux.HandleFunc("/upload/bigquery/v2/projects/", s.bigQueryJobUpload)
 	s.mux.HandleFunc("/storage/v1/b", s.gcsBucketsCollection)

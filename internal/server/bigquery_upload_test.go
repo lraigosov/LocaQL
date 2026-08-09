@@ -221,7 +221,7 @@ func assertUploadedLoadJobResponse(t *testing.T, res *httptest.ResponseRecorder,
 	return resource["jobReference"].(map[string]any)["jobId"].(string)
 }
 
-func waitForUploadedLoadJob(t *testing.T, s *Server, jobID string, expectedRows float64) {
+func waitForUploadedLoadJob(t *testing.T, s *Server, jobID string, expectedRows int64) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
@@ -238,7 +238,7 @@ func waitForUploadedLoadJob(t *testing.T, s *Server, jobID string, expectedRows 
 				t.Fatalf("unexpected load error: %v", status["errorResult"])
 			}
 			stats := resource["statistics"].(map[string]any)
-			if stats["outputRows"] != expectedRows {
+			if stats["outputRows"] != strconv.FormatInt(expectedRows, 10) {
 				t.Fatalf("expected %v rows, got %v", expectedRows, stats["outputRows"])
 			}
 			return
