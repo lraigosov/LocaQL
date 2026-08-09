@@ -1,6 +1,6 @@
 # Local development plans and temporary notes
 local-support/
-devlog.md
+/devlog.md
 
 # IDEs and Editors
 .vscode/
@@ -34,6 +34,7 @@ vendor/
 coverage.txt
 profile.cov
 
-# Built binaries
-locaql
-locaql-ui
+# Built binaries (repo root only — without the leading slash these would
+# also match the cmd/locaql and cmd/locaql-ui source directories)
+/locaql
+/locaql-ui

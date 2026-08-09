@@ -149,6 +149,14 @@ func (s *Server) handleDatasetsScope(w http.ResponseWriter, r *http.Request, pro
 			s.listTableData(w, r, projectID, datasetID, parts[4])
 			return true
 		}
+		if len(parts) == 6 && parts[5] == "insertAll" {
+			if r.Method != http.MethodPost {
+				writeError(w, http.StatusMethodNotAllowed, "Method not allowed", "methodNotAllowed")
+				return true
+			}
+			s.insertAllTableData(w, r, projectID, datasetID, parts[4])
+			return true
+		}
 		return s.dispatchDatasetSubResource(w, r, projectID, datasetID, parts, s.handleTablesCollection, s.handleTableByID)
 	case "routines":
 		return s.dispatchDatasetSubResource(w, r, projectID, datasetID, parts, s.handleRoutinesCollection, s.handleRoutineByID)
@@ -635,15 +643,26 @@ func (s *Server) insertTable(w http.ResponseWriter, r *http.Request, projectID, 
 			return
 		}
 		schema = parseTableSchemaFields(raw["schema"])
+		skipLeadingRows := parsed.SkipLeadingRows
 		if len(schema) == 0 {
-			writeError(w, http.StatusBadRequest, "schema.fields is required for external tables; autodetect is not supported", "required")
-			return
+			if !parsed.Autodetect {
+				writeError(w, http.StatusBadRequest, "schema.fields is required for external tables unless externalDataConfiguration.autodetect is true", "required")
+				return
+			}
+			detected, detectedSkip, err := detectExternalTableSchema(parsed)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, fmt.Sprintf("schema autodetect failed: %s", err.Error()), "invalid")
+				return
+			}
+			schema = detected
+			skipLeadingRows = detectedSkip
 		}
 		external = &externalTableConfig{
 			SourceURIs:      parsed.SourceURIs,
 			SourceFormat:    parsed.SourceFormat,
 			FieldDelimiter:  parsed.FieldDelimiter,
-			SkipLeadingRows: parsed.SkipLeadingRows,
+			SkipLeadingRows: skipLeadingRows,
+			Autodetect:      parsed.Autodetect,
 		}
 	}
 
@@ -1180,6 +1199,9 @@ func renderTableResource(t *tableRecord) map[string]any {
 		if t.External.SkipLeadingRows > 0 {
 			external["skipLeadingRows"] = t.External.SkipLeadingRows
 		}
+		if t.External.Autodetect {
+			external["autodetect"] = true
+		}
 		resp["externalDataConfiguration"] = external
 	} else if t.View != nil && t.View.Materialized {
 		resp["type"] = "MATERIALIZED_VIEW"
@@ -1198,6 +1220,7 @@ type externalDataConfigParsed struct {
 	SourceFormat    string
 	FieldDelimiter  string
 	SkipLeadingRows int
+	Autodetect      bool
 }
 
 // parseExternalDataConfig mirrors parseLoadConfig's flat field layout
@@ -1217,7 +1240,39 @@ func parseExternalDataConfig(raw map[string]any) externalDataConfigParsed {
 	if value, ok := parseFlexibleInt64FromAny(raw["skipLeadingRows"]); ok && value >= 0 {
 		out.SkipLeadingRows = int(value)
 	}
+	if value, ok := raw["autodetect"].(bool); ok {
+		out.Autodetect = value
+	}
 	return out
+}
+
+// detectExternalTableSchema samples only the first sourceUri to autodetect a
+// schema for an external table — a declared, bounded choice (matching
+// autodetectSampleLimit's row cap for CSV/NDJSON): if later files in a
+// multi-file external table have different or wider columns, provide
+// schema.fields explicitly instead of relying on autodetect. The returned
+// skipLeadingRows already folds in any CSV header row consumed during
+// detection, on top of whatever the caller had already configured — callers
+// must store it back onto the external table config so the real,
+// live-re-read query path (resolveTableRowsVisiting) skips the same rows
+// autodetect did.
+func detectExternalTableSchema(parsed externalDataConfigParsed) (schema []tableField, skipLeadingRows int, err error) {
+	if len(parsed.SourceURIs) == 0 {
+		return nil, 0, fmt.Errorf("sourceUris is empty")
+	}
+	path, err := resolveLocalFilePath(parsed.SourceURIs[0])
+	if err != nil {
+		return nil, 0, err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to read sourceUri %q: %w", parsed.SourceURIs[0], err)
+	}
+	result, err := detectSchemaFromBytes(parsed.SourceFormat, data, parsed.FieldDelimiter, parsed.SkipLeadingRows, "")
+	if err != nil {
+		return nil, 0, err
+	}
+	return result.Schema, parsed.SkipLeadingRows + result.HeaderRowsDetected, nil
 }
 
 func (s *Server) listJobs(w http.ResponseWriter, r *http.Request, projectID string) {
@@ -1289,6 +1344,7 @@ func (s *Server) insertJob(w http.ResponseWriter, r *http.Request, projectID str
 	loadFieldDelimiter := ""
 	loadSkipLeadingRows := 0
 	loadCompression := ""
+	loadAutodetect := false
 	extractSourceTable := tableReference{}
 	extractDestinationURIs := []string(nil)
 	extractDestinationFormat := ""
@@ -1342,6 +1398,7 @@ func (s *Server) insertJob(w http.ResponseWriter, r *http.Request, projectID str
 							loadFieldDelimiter = parsed.FieldDelimiter
 							loadSkipLeadingRows = parsed.SkipLeadingRows
 							loadCompression = parsed.Compression
+							loadAutodetect = parsed.Autodetect
 							createDisposition = parsed.CreateDisposition
 							writeDisposition = parsed.WriteDisposition
 						}
@@ -1435,6 +1492,7 @@ func (s *Server) insertJob(w http.ResponseWriter, r *http.Request, projectID str
 		LoadFieldDelimiter:       loadFieldDelimiter,
 		LoadSkipLeadingRows:      loadSkipLeadingRows,
 		LoadCompression:          loadCompression,
+		LoadAutodetect:           loadAutodetect,
 		ExtractSourceTable:       extractSourceTable,
 		ExtractDestinationURIs:   extractDestinationURIs,
 		ExtractDestinationFormat: extractDestinationFormat,
@@ -1956,6 +2014,7 @@ type loadConfigParsed struct {
 	Compression       string
 	CreateDisposition string
 	WriteDisposition  string
+	Autodetect        bool
 }
 
 func parseLoadConfig(loadCfg map[string]any, projectID string) loadConfigParsed {
@@ -1983,6 +2042,9 @@ func parseLoadConfig(loadCfg map[string]any, projectID string) loadConfigParsed 
 	}
 	if value, ok := loadCfg["writeDisposition"].(string); ok {
 		out.WriteDisposition = value
+	}
+	if value, ok := loadCfg["autodetect"].(bool); ok {
+		out.Autodetect = value
 	}
 	return out
 }
@@ -2553,6 +2615,37 @@ func (s *Server) executeCopyJob(job *jobRecord) (jobStatistics, error) {
 	return jobStatistics{Executor: "copy", Simulated: false, TotalSlotMs: 30, ProcessedBytes: int64(outputRows * 128), OutputRows: int64(outputRows)}, nil
 }
 
+// detectLoadJobSchema samples the job's own inline upload, or otherwise only
+// the first sourceUri, to autodetect a schema — the same declared, bounded
+// choice as detectExternalTableSchema: a multi-file load with divergent
+// schemas across files should provide schema.fields explicitly. The
+// returned skipLeadingRows folds in any CSV header row consumed during
+// detection; the caller must apply it back onto the job before the real
+// row-reading pass, which shares the same skipLeadingRows-driven CSV reader.
+func detectLoadJobSchema(job *jobRecord) (schema []tableField, skipLeadingRows int, err error) {
+	var data []byte
+	if job.LoadInline {
+		data = job.LoadInlineData
+	} else {
+		if len(job.LoadSourceURIs) == 0 {
+			return nil, 0, fmt.Errorf("sourceUris is empty")
+		}
+		path, err := resolveLocalFilePath(job.LoadSourceURIs[0])
+		if err != nil {
+			return nil, 0, err
+		}
+		data, err = os.ReadFile(path)
+		if err != nil {
+			return nil, 0, fmt.Errorf("failed to read sourceUri %q: %w", job.LoadSourceURIs[0], err)
+		}
+	}
+	result, err := detectSchemaFromBytes(job.LoadSourceFormat, data, job.LoadFieldDelimiter, job.LoadSkipLeadingRows, job.LoadCompression)
+	if err != nil {
+		return nil, 0, err
+	}
+	return result.Schema, job.LoadSkipLeadingRows + result.HeaderRowsDetected, nil
+}
+
 func (s *Server) executeLoadJob(job *jobRecord) (jobStatistics, error) {
 	if strings.TrimSpace(job.TargetDataset) == "" || strings.TrimSpace(job.TargetTable) == "" {
 		return jobStatistics{Executor: "load", Simulated: false}, fmt.Errorf("destinationTable is required")
@@ -2581,7 +2674,15 @@ func (s *Server) executeLoadJob(job *jobRecord) (jobStatistics, error) {
 	}
 
 	if len(schema) == 0 {
-		return jobStatistics{Executor: "load", Simulated: false}, fmt.Errorf("schema.fields is required to ingest uploaded media or rows from sourceUris")
+		if !job.LoadAutodetect {
+			return jobStatistics{Executor: "load", Simulated: false}, fmt.Errorf("schema.fields is required to ingest uploaded media or rows from sourceUris unless configuration.load.autodetect is true")
+		}
+		detected, detectedSkip, err := detectLoadJobSchema(job)
+		if err != nil {
+			return jobStatistics{Executor: "load", Simulated: false}, fmt.Errorf("schema autodetect failed: %w", err)
+		}
+		schema = detected
+		job.LoadSkipLeadingRows = detectedSkip
 	}
 
 	var rows [][]string

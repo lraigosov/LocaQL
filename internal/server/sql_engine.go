@@ -479,11 +479,11 @@ func (s *Server) executeRealSQLQueryVisitingWithParams(projectID, queryText stri
 // logical partitions; physical column pruning and billing parity remain out of
 // scope for this metric.
 func (s *Server) executeRealSQLQueryVisitingWithParamsAndStats(projectID, queryText string, visiting map[string]bool, sess *sessionRecord, paramMode string, params []storedQueryParameter) ([]tableField, [][]string, int64, error) {
-	db, processedBytes, err := s.openMaterializedSQLDatabase(projectID, queryText, visiting, sess, nil, true)
+	db, release, processedBytes, err := s.openMaterializedSQLDatabase(projectID, queryText, visiting, sess, nil, true)
 	if err != nil {
 		return nil, nil, 0, err
 	}
-	defer db.Close()
+	defer release()
 
 	args, err := buildQueryArgs(paramMode, params)
 	if err != nil {
@@ -503,19 +503,57 @@ func (s *Server) executeRealSQLQueryVisitingWithParamsAndStats(projectID, queryT
 	return schema, resultRows, processedBytes, err
 }
 
+// expandWildcardTableRefs replaces a wildcard table reference
+// (`dataset.prefix*`, real BigQuery's `_TABLE_SUFFIX` syntax) with the
+// concrete real tables in that dataset whose name starts with prefix, so
+// each one gets materialized individually through the normal per-ref path
+// below. This is not this project's own union logic: the embedded engine
+// (goccy/googlesqlite, see its internal/wildcard_table.go) already resolves
+// a `*`-suffixed table name natively into a `UNION ALL` with a computed
+// `_TABLE_SUFFIX` column, but only once every matching real table already
+// exists in its own catalog for that dataset — LocaQL's job is only to
+// decide, correctly, which real tables that is. Non-wildcard refs pass
+// through unchanged. Views and external tables are never matched: real
+// BigQuery wildcard tables only span native tables. A wildcard matching zero
+// tables is not an error here — the embedded engine reports its own clear
+// error ("failed to find matched tables by wildcard") when the query
+// actually runs against an empty schema, which is more informative than
+// this project fabricating an earlier one from a catalog listing.
+func (s *Server) expandWildcardTableRefs(projectID string, refs []datasetTableRef) []datasetTableRef {
+	out := make([]datasetTableRef, 0, len(refs))
+	for _, ref := range refs {
+		prefix, isWildcard := strings.CutSuffix(ref.tableID, "*")
+		if !isWildcard {
+			out = append(out, ref)
+			continue
+		}
+		for _, t := range s.tables.listAll(projectID, ref.datasetID) {
+			if t.View != nil || t.External != nil {
+				continue
+			}
+			if strings.HasPrefix(t.TableID, prefix) {
+				out = append(out, datasetTableRef{datasetID: ref.datasetID, tableID: t.TableID})
+			}
+		}
+	}
+	return out
+}
+
 // openMaterializedSQLDatabase builds the isolated GoogleSQL database used by
 // both read-only queries and persistent DDL/DML. extraRefs is primarily the
 // mutation target: INSERT/UPDATE/MERGE targets do not necessarily occur after
 // FROM/JOIN, while a CREATE TABLE target needs its dataset schema created even
 // though the table does not exist yet. allowPartitionPruning must remain false
 // for persistent mutations so their materialized source cannot be narrowed.
-func (s *Server) openMaterializedSQLDatabase(projectID, queryText string, visiting map[string]bool, sess *sessionRecord, extraRefs []datasetTableRef, allowPartitionPruning bool) (*sql.DB, int64, error) {
-	db, err := sql.Open("googlesqlite", ":memory:")
+func (s *Server) openMaterializedSQLDatabase(projectID, queryText string, visiting map[string]bool, sess *sessionRecord, extraRefs []datasetTableRef, allowPartitionPruning bool) (db *sql.DB, release func(), processedBytes int64, err error) {
+	pe, err := s.sqlEngines.acquire()
 	if err != nil {
-		return nil, 0, fmt.Errorf("open real SQL engine: %w", err)
+		return nil, nil, 0, err
 	}
+	db = pe.db
+	release = func() { s.sqlEngines.release(pe) }
 
-	refs := referencedTables(queryText, projectID)
+	refs := s.expandWildcardTableRefs(projectID, referencedTables(queryText, projectID))
 	requireFilterCheck := make(map[datasetTableRef]bool, len(refs)+len(extraRefs))
 	for _, ref := range refs {
 		requireFilterCheck[ref] = true
@@ -535,16 +573,14 @@ func (s *Server) openMaterializedSQLDatabase(projectID, queryText string, visiti
 		seen[ref] = true
 		combined = append(combined, ref)
 	}
-	createdSchemas := map[string]bool{}
-	var processedBytes int64
 	for _, ref := range combined {
 		var catalogTable *tableRecord
 		if requireFilterCheck[ref] && !strings.EqualFold(ref.datasetID, sessionDatasetName) {
 			if table, ok, _ := s.tables.get(projectID, ref.datasetID, ref.tableID); ok {
 				catalogTable = table
 				if table.RequirePartitionFilter && !queryHasPartitionFilter(queryText, table) {
-					db.Close()
-					return nil, 0, fmt.Errorf("cannot query over table %s.%s without a filter on its partitioning column", ref.datasetID, ref.tableID)
+					s.sqlEngines.release(pe)
+					return nil, nil, 0, fmt.Errorf("cannot query over table %s.%s without a filter on its partitioning column", ref.datasetID, ref.tableID)
 				}
 			}
 		}
@@ -565,18 +601,26 @@ func (s *Server) openMaterializedSQLDatabase(projectID, queryText string, visiti
 			var ok bool
 			fields, rows, ok, err = s.resolveTableRowsVisiting(projectID, ref.datasetID, ref.tableID, visiting)
 			if err != nil {
-				db.Close()
-				return nil, 0, err
+				s.sqlEngines.release(pe)
+				return nil, nil, 0, err
 			}
 			found = ok
 		}
-		if !createdSchemas[ref.datasetID] {
-			if _, err := db.Exec("CREATE SCHEMA " + quoteIdent(ref.datasetID)); err != nil {
-				db.Close()
-				return nil, 0, fmt.Errorf("materialize dataset %s: %w", ref.datasetID, err)
-			}
-			createdSchemas[ref.datasetID] = true
+		if err := pe.ensureSchema(ref.datasetID); err != nil {
+			s.sqlEngines.release(pe)
+			return nil, nil, 0, fmt.Errorf("materialize dataset %s: %w", ref.datasetID, err)
 		}
+		// Marked here, unconditionally, not only after a successful
+		// materializeTable below: a DDL/DML target that does not exist yet
+		// in LocaQL's own catalog (found == false, e.g. a fresh CREATE
+		// TABLE) is never passed to materializeTable, but the statement the
+		// caller runs against this same connection right after
+		// openMaterializedSQLDatabase returns creates it for real on the
+		// engine regardless — release() must drop it before this connection
+		// is reused, or the next reuse's CREATE TABLE for the same name
+		// fails with "table already exists" (a real bug caught by
+		// TestPersistentCreateTableSchemaAndReplace while building this).
+		pe.markTableMaterialized(ref.datasetID, ref.tableID)
 		if !found {
 			continue
 		}
@@ -593,11 +637,11 @@ func (s *Server) openMaterializedSQLDatabase(projectID, queryText string, visiti
 		processedBytes += estimateRowsByteSize(rows)
 		fields, rows = materializeIngestionPseudocolumns(catalogTable, fields, rows)
 		if err := materializeTable(db, ref.datasetID, ref.tableID, fields, rows); err != nil {
-			db.Close()
-			return nil, 0, fmt.Errorf("materialize table %s.%s: %w", ref.datasetID, ref.tableID, err)
+			s.sqlEngines.release(pe)
+			return nil, nil, 0, fmt.Errorf("materialize table %s.%s: %w", ref.datasetID, ref.tableID, err)
 		}
 	}
-	return db, processedBytes, nil
+	return db, release, processedBytes, nil
 }
 
 // rewriteIngestionPseudocolumns replaces public pseudocolumn identifiers only
