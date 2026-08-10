@@ -8,6 +8,8 @@ import (
 	"sync"
 
 	storagepb "cloud.google.com/go/bigquery/storage/apiv1/storagepb"
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/linkedin/goavro/v2"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -28,9 +30,11 @@ const storageReadLocation = "local"
 // ... WHERE ... run through executeRealSQLQuery, not a hand-rolled filter)
 // plus the Avro codec used to binary-encode them for ReadRows.
 type storageReadStream struct {
-	fields []tableField
-	rows   [][]string
-	codec  *goavro.Codec
+	fields      []tableField
+	rows        [][]string
+	dataFormat  storagepb.DataFormat
+	codec       *goavro.Codec // set when dataFormat == AVRO
+	arrowSchema *arrow.Schema // set when dataFormat == ARROW
 }
 
 // storageReadService implements storagepb.BigQueryReadServer: the bounded
@@ -106,6 +110,55 @@ func buildStorageReadQuery(datasetID, tableID string, selectedFields []string, r
 	return query
 }
 
+// parseStorageReadOptions extracts CreateReadSessionRequest's column
+// projection/push-down filter and rejects an Arrow buffer-compression
+// request explicitly (not implemented — see configureArrowReadStream).
+func parseStorageReadOptions(rs *storagepb.ReadSession) (selectedFields []string, rowRestriction string, err error) {
+	opts := rs.GetReadOptions()
+	if opts == nil {
+		return nil, "", nil
+	}
+	if arrowOpts := opts.GetArrowSerializationOptions(); arrowOpts != nil &&
+		arrowOpts.GetBufferCompression() != storagepb.ArrowSerializationOptions_COMPRESSION_UNSPECIFIED {
+		return nil, "", status.Error(codes.Unimplemented, "arrow_serialization_options.buffer_compression is not supported yet; leave it unset (no compression)")
+	}
+	return opts.GetSelectedFields(), opts.GetRowRestriction(), nil
+}
+
+// configureAvroReadStream builds the Avro codec for stream's resolved rows
+// and returns the ReadSession.schema oneof value for it.
+func configureAvroReadStream(stream *storageReadStream, fields []tableField) (*storagepb.ReadSession_AvroSchema, error) {
+	if err := rejectNestedFields("the Storage Read API (Avro)", fields); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	schemaJSON, err := buildAvroSchemaJSON(fields)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "build avro schema: %v", err)
+	}
+	codec, err := goavro.NewCodec(schemaJSON)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "build avro codec: %v", err)
+	}
+	stream.codec = codec
+	return &storagepb.ReadSession_AvroSchema{AvroSchema: &storagepb.AvroSchema{Schema: schemaJSON}}, nil
+}
+
+// configureArrowReadStream builds the real Arrow schema for stream's
+// resolved rows and returns the ReadSession.schema oneof value for it. See
+// arrowFieldType/buildArrowSchema for the exact bounded type mapping.
+func configureArrowReadStream(stream *storageReadStream, fields []tableField) (*storagepb.ReadSession_ArrowSchema, error) {
+	arrowSchema, err := buildArrowSchema(fields)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	schemaMsg, err := serializeArrowSchemaMessage(arrowSchema, memory.DefaultAllocator)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "build arrow schema message: %v", err)
+	}
+	stream.arrowSchema = arrowSchema
+	return &storagepb.ReadSession_ArrowSchema{ArrowSchema: &storagepb.ArrowSchema{SerializedSchema: schemaMsg}}, nil
+}
+
 func (s *storageReadService) CreateReadSession(_ context.Context, req *storagepb.CreateReadSessionRequest) (*storagepb.ReadSession, error) {
 	rs := req.GetReadSession()
 	if rs == nil {
@@ -120,14 +173,9 @@ func (s *storageReadService) CreateReadSession(_ context.Context, req *storagepb
 		return nil, status.Errorf(codes.NotFound, "table not found: %s.%s", datasetID, tableID)
 	}
 
-	var selectedFields []string
-	var rowRestriction string
-	if opts := rs.GetReadOptions(); opts != nil {
-		selectedFields = opts.GetSelectedFields()
-		rowRestriction = opts.GetRowRestriction()
-		if opts.GetArrowSerializationOptions() != nil {
-			return nil, status.Error(codes.Unimplemented, "Arrow framing is not supported yet; this emulator only supports Avro (DATA_FORMAT_AVRO) — leave output_format_serialization_options unset or set avro_serialization_options")
-		}
+	selectedFields, rowRestriction, err := parseStorageReadOptions(rs)
+	if err != nil {
+		return nil, err
 	}
 
 	queryText := buildStorageReadQuery(datasetID, tableID, selectedFields, rowRestriction)
@@ -135,17 +183,25 @@ func (s *storageReadService) CreateReadSession(_ context.Context, req *storagepb
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "resolve read session: %v", err)
 	}
-	if err := rejectNestedFields("the Storage Read API", fields); err != nil {
-		return nil, status.Error(codes.InvalidArgument, err.Error())
+
+	dataFormat := rs.GetDataFormat()
+	if dataFormat == storagepb.DataFormat_DATA_FORMAT_UNSPECIFIED {
+		dataFormat = storagepb.DataFormat_AVRO // real BigQuery's own default
 	}
 
-	schemaJSON, err := buildAvroSchemaJSON(fields)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "build avro schema: %v", err)
+	stream := &storageReadStream{fields: fields, rows: rows, dataFormat: dataFormat}
+	var avroSchemaField *storagepb.ReadSession_AvroSchema
+	var arrowSchemaField *storagepb.ReadSession_ArrowSchema
+	switch dataFormat {
+	case storagepb.DataFormat_AVRO:
+		avroSchemaField, err = configureAvroReadStream(stream, fields)
+	case storagepb.DataFormat_ARROW:
+		arrowSchemaField, err = configureArrowReadStream(stream, fields)
+	default:
+		err = status.Errorf(codes.InvalidArgument, "unsupported data_format %s; use DATA_FORMAT_AVRO or DATA_FORMAT_ARROW", dataFormat)
 	}
-	codec, err := goavro.NewCodec(schemaJSON)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "build avro codec: %v", err)
+		return nil, err
 	}
 
 	s.mu.Lock()
@@ -155,17 +211,23 @@ func (s *storageReadService) CreateReadSession(_ context.Context, req *storagepb
 	streamID := "stream_" + strconv.FormatInt(s.counter, 10)
 	sessionName := fmt.Sprintf("projects/%s/locations/%s/sessions/%s", projectID, storageReadLocation, sessionID)
 	streamName := fmt.Sprintf("%s/streams/%s", sessionName, streamID)
-	s.streams[streamName] = &storageReadStream{fields: fields, rows: rows, codec: codec}
+	s.streams[streamName] = stream
 	s.mu.Unlock()
 
-	return &storagepb.ReadSession{
+	resp := &storagepb.ReadSession{
 		Name:              sessionName,
-		DataFormat:        storagepb.DataFormat_AVRO,
-		Schema:            &storagepb.ReadSession_AvroSchema{AvroSchema: &storagepb.AvroSchema{Schema: schemaJSON}},
+		DataFormat:        dataFormat,
 		Table:             rs.GetTable(),
 		Streams:           []*storagepb.ReadStream{{Name: streamName}},
 		EstimatedRowCount: int64(len(rows)),
-	}, nil
+	}
+	if avroSchemaField != nil {
+		resp.Schema = avroSchemaField
+	}
+	if arrowSchemaField != nil {
+		resp.Schema = arrowSchemaField
+	}
+	return resp, nil
 }
 
 func (s *storageReadService) ReadRows(req *storagepb.ReadRowsRequest, stream storagepb.BigQueryRead_ReadRowsServer) error {
@@ -182,19 +244,27 @@ func (s *storageReadService) ReadRows(req *storagepb.ReadRowsRequest, stream sto
 	}
 
 	remaining := st.rows[offset:]
-	if len(remaining) == 0 {
+	if st.dataFormat == storagepb.DataFormat_ARROW {
+		return sendArrowReadRowsResponse(stream, st, remaining)
+	}
+	return sendAvroReadRowsResponse(stream, st, remaining)
+}
+
+// sendAvroReadRowsResponse encodes and sends all remaining rows as a single
+// Avro response. All rows in a single response: this emulator is
+// local-dev-sized, not BigQuery-scale (same convention already used for
+// materializeNestedRows and Load/Extract), so the real 128 MiB-per-response
+// limit is never exercised here.
+func sendAvroReadRowsResponse(stream storagepb.BigQueryRead_ReadRowsServer, st *storageReadStream, rows [][]string) error {
+	if len(rows) == 0 {
 		return stream.Send(&storagepb.ReadRowsResponse{
 			Rows:     &storagepb.ReadRowsResponse_AvroRows{AvroRows: &storagepb.AvroRows{}},
 			RowCount: 0,
 		})
 	}
 
-	// All rows in a single response: this emulator is local-dev-sized, not
-	// BigQuery-scale (same convention already used for materializeNestedRows
-	// and Load/Extract), so the real 128 MiB-per-response limit is never
-	// exercised here.
 	var binary []byte
-	for _, row := range remaining {
+	for _, row := range rows {
 		record := make(map[string]any, len(st.fields))
 		for i, field := range st.fields {
 			if i >= len(row) {
@@ -213,10 +283,47 @@ func (s *storageReadService) ReadRows(req *storagepb.ReadRowsRequest, stream sto
 	return stream.Send(&storagepb.ReadRowsResponse{
 		Rows: &storagepb.ReadRowsResponse_AvroRows{AvroRows: &storagepb.AvroRows{
 			SerializedBinaryRows: binary,
-			RowCount:             int64(len(remaining)),
+			RowCount:             int64(len(rows)),
 		}},
-		RowCount: int64(len(remaining)),
+		RowCount: int64(len(rows)),
 		Schema:   &storagepb.ReadRowsResponse_AvroSchema{AvroSchema: &storagepb.AvroSchema{Schema: st.codec.Schema()}},
+	})
+}
+
+// sendArrowReadRowsResponse mirrors sendAvroReadRowsResponse for
+// DATA_FORMAT_ARROW: all remaining rows as one Arrow record batch message,
+// with the schema echoed on every response the same way the Avro path
+// already does.
+func sendArrowReadRowsResponse(stream storagepb.BigQueryRead_ReadRowsServer, st *storageReadStream, rows [][]string) error {
+	if len(rows) == 0 {
+		return stream.Send(&storagepb.ReadRowsResponse{
+			Rows:     &storagepb.ReadRowsResponse_ArrowRecordBatch{ArrowRecordBatch: &storagepb.ArrowRecordBatch{}},
+			RowCount: 0,
+		})
+	}
+
+	rec, err := buildArrowRecord(memory.DefaultAllocator, st.arrowSchema, st.fields, rows)
+	if err != nil {
+		return status.Errorf(codes.Internal, "encode arrow record batch: %v", err)
+	}
+	defer rec.Release()
+
+	batchMsg, err := serializeArrowRecordBatchMessage(rec, memory.DefaultAllocator)
+	if err != nil {
+		return status.Errorf(codes.Internal, "serialize arrow record batch: %v", err)
+	}
+	schemaMsg, err := serializeArrowSchemaMessage(st.arrowSchema, memory.DefaultAllocator)
+	if err != nil {
+		return status.Errorf(codes.Internal, "serialize arrow schema: %v", err)
+	}
+
+	return stream.Send(&storagepb.ReadRowsResponse{
+		Rows: &storagepb.ReadRowsResponse_ArrowRecordBatch{ArrowRecordBatch: &storagepb.ArrowRecordBatch{
+			SerializedRecordBatch: batchMsg,
+			RowCount:              int64(len(rows)),
+		}},
+		RowCount: int64(len(rows)),
+		Schema:   &storagepb.ReadRowsResponse_ArrowSchema{ArrowSchema: &storagepb.ArrowSchema{SerializedSchema: schemaMsg}},
 	})
 }
 

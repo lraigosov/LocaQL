@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	storagepb "cloud.google.com/go/bigquery/storage/apiv1/storagepb"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
@@ -80,6 +81,34 @@ func encodeTestProtoRow(t *testing.T, desc *descriptorpb.DescriptorProto, values
 		t.Fatalf("marshal test proto row: %v", err)
 	}
 	return data
+}
+
+// encodeTestArrowBatch builds a real Arrow record from fields/rows (the same
+// buildArrowRecord this project's Storage Read Arrow path uses) and
+// serializes its schema and record batch into the two standalone IPC
+// messages a real client would send as AppendRowsRequest.ArrowRows.
+func encodeTestArrowBatch(t *testing.T, fields []tableField, rows [][]string) (schemaMsg, batchMsg []byte) {
+	t.Helper()
+	mem := memory.NewGoAllocator()
+	schema, err := buildArrowSchema(fields)
+	if err != nil {
+		t.Fatalf("buildArrowSchema: %v", err)
+	}
+	rec, err := buildArrowRecord(mem, schema, fields, rows)
+	if err != nil {
+		t.Fatalf("buildArrowRecord: %v", err)
+	}
+	defer rec.Release()
+
+	schemaMsg, err = serializeArrowSchemaMessage(schema, mem)
+	if err != nil {
+		t.Fatalf("serializeArrowSchemaMessage: %v", err)
+	}
+	batchMsg, err = serializeArrowRecordBatchMessage(rec, mem)
+	if err != nil {
+		t.Fatalf("serializeArrowRecordBatchMessage: %v", err)
+	}
+	return schemaMsg, batchMsg
 }
 
 func writeStreamName(datasetID, tableID, streamID string) string {
@@ -417,5 +446,154 @@ func TestStorageWriteAppendRowsRejectsRepeatedProtoField(t *testing.T) {
 	}
 	if len(resp.GetRowErrors()) == 0 {
 		t.Fatalf("expected a row error for the repeated proto field, got %v", resp)
+	}
+}
+
+// TestStorageWriteDefaultStreamAppendsArrowRowsImmediately mirrors
+// TestStorageWriteDefaultStreamAppendsRowsImmediately for
+// AppendRowsRequest.ArrowRows: a real Arrow-encoded batch, appended to the
+// `_default` stream, visible in the catalog immediately.
+func TestStorageWriteDefaultStreamAppendsArrowRowsImmediately(t *testing.T) {
+	s := newTestServer()
+	loadCSVTable(t, s, "analytics", "write_arrow_default", idNameFields(), "id,name\n1,alpha\n")
+
+	client := newTestStorageWriteClient(t, s)
+	ctx := context.Background()
+	appendClient, err := client.AppendRows(ctx)
+	if err != nil {
+		t.Fatalf("AppendRows: %v", err)
+	}
+
+	fields := []tableField{
+		{Name: "id", Type: "INT64", Mode: "REQUIRED"},
+		{Name: "name", Type: "STRING", Mode: "NULLABLE"},
+	}
+	schemaMsg, batchMsg := encodeTestArrowBatch(t, fields, [][]string{{"2", "beta"}})
+
+	req := &storagepb.AppendRowsRequest{
+		WriteStream: writeStreamName("analytics", "write_arrow_default", storageWriteDefaultStreamID),
+		Rows: &storagepb.AppendRowsRequest_ArrowRows{ArrowRows: &storagepb.AppendRowsRequest_ArrowData{
+			WriterSchema: &storagepb.ArrowSchema{SerializedSchema: schemaMsg},
+			Rows:         &storagepb.ArrowRecordBatch{SerializedRecordBatch: batchMsg},
+		}},
+	}
+	if err := appendClient.Send(req); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	resp, err := appendClient.Recv()
+	if err != nil {
+		t.Fatalf("Recv: %v", err)
+	}
+	if resp.GetError() != nil {
+		t.Fatalf("expected a successful append, got error: %v", resp.GetError())
+	}
+	_ = appendClient.CloseSend()
+
+	_, rows, ok := s.tables.getData("p1", "analytics", "write_arrow_default")
+	if !ok {
+		t.Fatalf("expected table to exist")
+	}
+	if len(rows) != 2 {
+		t.Fatalf("expected 2 rows (1 loaded + 1 appended), got %d: %v", len(rows), rows)
+	}
+	found := false
+	for _, r := range rows {
+		if len(r) >= 2 && r[1] == "beta" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected the appended Arrow row (name=beta) to be visible immediately, got %v", rows)
+	}
+}
+
+// TestStorageWritePendingStreamBuffersArrowRowsUntilCommit mirrors the
+// proto_rows PENDING-stream commit flow, using Arrow rows instead, proving
+// the two encodings converge on the same buffered-until-commit behavior.
+func TestStorageWritePendingStreamBuffersArrowRowsUntilCommit(t *testing.T) {
+	s := newTestServer()
+	loadCSVTable(t, s, "analytics", "write_arrow_pending", idNameFields(), "id,name\n1,alpha\n")
+
+	writeClient := newTestStorageWriteClient(t, s)
+	ctx := context.Background()
+
+	created, err := writeClient.CreateWriteStream(ctx, &storagepb.CreateWriteStreamRequest{
+		Parent:      "projects/p1/datasets/analytics/tables/write_arrow_pending",
+		WriteStream: &storagepb.WriteStream{Type: storagepb.WriteStream_PENDING},
+	})
+	if err != nil {
+		t.Fatalf("CreateWriteStream: %v", err)
+	}
+
+	appendClient, err := writeClient.AppendRows(ctx)
+	if err != nil {
+		t.Fatalf("AppendRows: %v", err)
+	}
+	fields := []tableField{
+		{Name: "id", Type: "INT64", Mode: "REQUIRED"},
+		{Name: "name", Type: "STRING", Mode: "NULLABLE"},
+	}
+	schemaMsg, batchMsg := encodeTestArrowBatch(t, fields, [][]string{{"2", "beta"}})
+	if err := appendClient.Send(&storagepb.AppendRowsRequest{
+		WriteStream: created.GetName(),
+		Rows: &storagepb.AppendRowsRequest_ArrowRows{ArrowRows: &storagepb.AppendRowsRequest_ArrowData{
+			WriterSchema: &storagepb.ArrowSchema{SerializedSchema: schemaMsg},
+			Rows:         &storagepb.ArrowRecordBatch{SerializedRecordBatch: batchMsg},
+		}},
+	}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if _, err := appendClient.Recv(); err != nil {
+		t.Fatalf("Recv: %v", err)
+	}
+	_ = appendClient.CloseSend()
+
+	if _, rows, ok := s.tables.getData("p1", "analytics", "write_arrow_pending"); ok && len(rows) != 1 {
+		t.Fatalf("expected the buffered Arrow row not yet visible before commit, got %d rows", len(rows))
+	}
+
+	if _, err := writeClient.FinalizeWriteStream(ctx, &storagepb.FinalizeWriteStreamRequest{Name: created.GetName()}); err != nil {
+		t.Fatalf("FinalizeWriteStream: %v", err)
+	}
+	if _, err := writeClient.BatchCommitWriteStreams(ctx, &storagepb.BatchCommitWriteStreamsRequest{
+		Parent:       "projects/p1/datasets/analytics/tables/write_arrow_pending",
+		WriteStreams: []string{created.GetName()},
+	}); err != nil {
+		t.Fatalf("BatchCommitWriteStreams: %v", err)
+	}
+
+	_, rows, ok := s.tables.getData("p1", "analytics", "write_arrow_pending")
+	if !ok || len(rows) != 2 {
+		t.Fatalf("expected 2 rows after commit, got %d: %v", len(rows), rows)
+	}
+}
+
+// TestStorageWriteArrowRowsRequiresWriterSchema documents that arrow_rows
+// without a writer_schema fails explicitly, mirroring proto_rows' equivalent
+// requirement.
+func TestStorageWriteArrowRowsRequiresWriterSchema(t *testing.T) {
+	s := newTestServer()
+	loadCSVTable(t, s, "analytics", "write_arrow_no_schema", idNameFields(), "id,name\n1,alpha\n")
+
+	client := newTestStorageWriteClient(t, s)
+	appendClient, err := client.AppendRows(context.Background())
+	if err != nil {
+		t.Fatalf("AppendRows: %v", err)
+	}
+	_, batchMsg := encodeTestArrowBatch(t, []tableField{
+		{Name: "id", Type: "INT64", Mode: "REQUIRED"},
+		{Name: "name", Type: "STRING", Mode: "NULLABLE"},
+	}, [][]string{{"2", "beta"}})
+
+	if err := appendClient.Send(&storagepb.AppendRowsRequest{
+		WriteStream: writeStreamName("analytics", "write_arrow_no_schema", storageWriteDefaultStreamID),
+		Rows: &storagepb.AppendRowsRequest_ArrowRows{ArrowRows: &storagepb.AppendRowsRequest_ArrowData{
+			Rows: &storagepb.ArrowRecordBatch{SerializedRecordBatch: batchMsg},
+		}},
+	}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if _, err := appendClient.Recv(); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("expected InvalidArgument for missing writer_schema, got %v", err)
 	}
 }

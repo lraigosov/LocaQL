@@ -25,6 +25,7 @@ This repository currently implements incremental scope from the master plan:
 - [Query Engine: Real GoogleSQL via an Embedded SQLite Backend](#query-engine-real-googlesql-via-an-embedded-sqlite-backend)
 - [Persistent DDL and DML](#persistent-ddl-and-dml)
 - [bq CLI: a hand-written discovery document](#bq-cli-a-hand-written-discovery-document)
+- [dbt and SQLMesh: Real Adapter/Engine Compatibility](#dbt-and-sqlmesh-real-adapterengine-compatibility)
 - [Streaming Inserts (tabledata.insertAll)](#streaming-inserts-tabledatainsertall)
 - [Concurrency and Isolation Notes](#concurrency-and-isolation-notes)
 - [Job State Model](#job-state-model)
@@ -42,7 +43,7 @@ This repository currently implements incremental scope from the master plan:
 - [Schema Autodetect (NDJSON / CSV / Avro / Parquet)](#schema-autodetect-ndjson--csv--avro--parquet)
 - [Views and Materialized Views: Real Resources Backed by the Query Engine](#views-and-materialized-views-real-resources-backed-by-the-query-engine)
 - [Sessions and Multi-Statement Transactions](#sessions-and-multi-statement-transactions)
-- [BigQuery Storage API: Real gRPC Read Sessions (Avro) and Write Streams (Protobuf)](#bigquery-storage-api-real-grpc-read-sessions-avro-and-write-streams-protobuf)
+- [BigQuery Storage API: Real gRPC Read Sessions (Avro/Arrow) and Write Streams (Protobuf/Arrow)](#bigquery-storage-api-real-grpc-read-sessions-avroarrow-and-write-streams-protobufarrow)
 - [Fake GCS: A Real Cloud Storage JSON API, Locally](#fake-gcs-a-real-cloud-storage-json-api-locally)
 - [Conformance Baseline](#conformance-baseline)
 - [Test](#test)
@@ -104,10 +105,10 @@ Registry file:
 | Opaque pagination tokens | Supported | `nextPageToken` is opaque; legacy numeric token input remains accepted |
 | Jobs lifecycle | Supported | `PENDING -> RUNNING -> DONE`, cancel before/during run |
 | requestId idempotency | Partial | Implemented for `jobs.insert` and `projects.queries` with TTL |
-| Job executors (query/load/extract/copy) | Partial | Query jobs execute real GoogleSQL — including persistent `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `TRUNCATE TABLE`, `CREATE [OR REPLACE] TABLE [AS SELECT]` and `DROP TABLE` — with target-table serialization, atomic version-checked catalog commits, query parameters and BigQuery-shaped DML statistics. `SELECT`, copy, load and extract retain their existing real execution paths; `totalSlotMs` stays synthetic by design. See [Persistent DDL and DML](#persistent-ddl-and-dml) for the precise transaction/script limits. |
+| Job executors (query/load/extract/copy) | Partial | Query jobs execute real GoogleSQL — including persistent `INSERT`, `UPDATE`, `DELETE`, `MERGE` (bare or derived-table `USING` source), `TRUNCATE TABLE`, `CREATE [OR REPLACE] TABLE [AS SELECT]`, `DROP TABLE`, `CREATE`/`DROP [MATERIALIZED] VIEW`, `CREATE SCHEMA` and `ALTER TABLE ADD COLUMN` — with target-table serialization, atomic version-checked catalog commits, query parameters and BigQuery-shaped DML statistics. `SELECT`, copy, load and extract retain their existing real execution paths; `totalSlotMs` stays synthetic by design. See [Persistent DDL and DML](#persistent-ddl-and-dml) for the precise transaction/script limits. |
 | Routines and Models | Supported | `routines`/`models` `insert`/`get`/`list`/`patch`/`delete` are metadata-only (no SQL execution or ML training/inference backend exists; nothing is fabricated beyond stored fields) |
 | External tables | Partial | `tables.insert` accepts `externalDataConfiguration` (`NEWLINE_DELIMITED_JSON`/`CSV`/`AVRO`/`PARQUET`, explicit schema or `autodetect: true`); `sourceUris` are read fresh from disk/fake-GCS on every query/`tabledata.list`/copy/extract access rather than materialized at creation. Patching `externalDataConfiguration`, Hive partitioning and compression options are not supported |
-| Views and Materialized Views | Partial | `tables.insert` accepts `view.query`/`materializedView.query`, validated and schema-derived by executing the query through the real query engine at creation; every access re-executes the stored query live (see [Views and Materialized Views](#views-and-materialized-views-real-resources-backed-by-the-query-engine)). No patch-based redefinition; materialized views are not actually cached/refreshed |
+| Views and Materialized Views | Partial | `tables.insert` accepts `view.query`/`materializedView.query`, and `CREATE`/`DROP [MATERIALIZED] VIEW` SQL DDL reaches the identical machinery (see [Persistent DDL and DML](#persistent-ddl-and-dml)); both validate and derive schema by executing the query through the real query engine at creation, and every access re-executes the stored query live (see [Views and Materialized Views](#views-and-materialized-views-real-resources-backed-by-the-query-engine)). No patch-based redefinition; materialized views are not actually cached/refreshed |
 | Nested schemas and column evolution | Partial | `schema.fields` supports real `mode` (`NULLABLE`/`REQUIRED`/`REPEATED`) and nested `fields` (`RECORD`/`STRUCT`), rendered end-to-end with BigQuery's real nested REST shape; `tables.patch` can append `NULLABLE` columns and relax `REQUIRED`→`NULLABLE` (see [Nested Schemas](#nested-schemas-structrecord-and-arrayrepeated)). Real nested load/extract is `NEWLINE_DELIMITED_JSON`-only; `CSV`/`AVRO`/`PARQUET` reject nested fields explicitly |
 | Partitioning and clustering | Partial | `tables.insert/get/list/patch/update` persist and validate time-unit, ingestion-time and integer-range partitioning, up to four clustering fields, partition expiration and `requirePartitionFilter`; `_PARTITIONTIME`/`_PARTITIONDATE` are executable, hidden from `SELECT *`, read-only and supported by required filters/DML. Read-only equality predicates use AST-proven logical partition pruning and reduce `totalBytesProcessed`; partition rows remain observable through `INFORMATION_SCHEMA.PARTITIONS`/`COLUMNS`/`TABLE_OPTIONS`. No range-predicate/parameter/OR pruning, physical column-cost model, SQL `PARTITION BY` DDL, or clustering optimizer yet |
 | Fake GCS JSON API | Partial | Buckets (insert/list/get) and objects (insert via media or multipart upload, get/download/list/delete) on the real endpoint paths, backed by `LOCAQL_FAKE_GCS_ROOT`; upload verified against `cloud.google.com/go/storage`, and full/ranged downloads verified against `google-cloud-storage 3.13.1`. No resumable uploads, IAM, versioning, lifecycle rules, notifications, or signed URLs |
@@ -119,7 +120,7 @@ Registry file:
 | Catalog snapshot atomicity | Partial | Optional persisted state uses temp file replace to avoid partial commits |
 | INFORMATION_SCHEMA priority | Partial | `SCHEMATA`, `SCHEMATA_OPTIONS`, `TABLES`, `COLUMNS`, `TABLE_OPTIONS`, `JOBS`, `JOBS_BY_PROJECT`, `JOBS_BY_USER`, `PARTITIONS`, `ROUTINES`, `PARAMETERS`, `MODELS`, `VIEWS`, `MATERIALIZED_VIEWS` and `SESSIONS_BY_USER` are served from the in-memory catalog; none support column projection yet (a `SELECT` with an explicit column list still returns every column). `SESSIONS_BY_PROJECT` is not implemented, matching real BigQuery |
 | Sessions and transactions | Partial | `createSession`/`connectionProperties` (`session_id`) on `jobs.query`/`jobs.insert`, idle-expiring; session-scoped `` _SESSION.<table> `` temp tables (`CREATE TEMP TABLE ... AS SELECT` only) and `BEGIN`/`COMMIT`/`ROLLBACK TRANSACTION` implemented in LocaQL's own catalog rather than passed through to the query engine (see [Sessions and Multi-Statement Transactions](#sessions-and-multi-statement-transactions)); a transaction's atomicity never extends to real base tables |
-| BigQuery Storage API (gRPC) | Partial | Real `CreateReadSession`/`ReadRows` and `CreateWriteStream`/`AppendRows`/`FinalizeWriteStream`/`BatchCommitWriteStreams` on a separate plaintext gRPC listener (`--storage-grpc-addr`, default `:9060`); Read: column projection/`row_restriction` run through the real SQL engine, Avro framing only, one stream per session, no `SplitReadStream`/Arrow. Write: real protobuf row decoding via `dynamicpb`, `_default`/COMMITTED/PENDING streams with atomic `BatchCommitWriteStreams` and real offset/exactly-once semantics, no BUFFERED streams/`FlushRows` (see [BigQuery Storage API](#bigquery-storage-api-real-grpc-read-sessions-avro-and-write-streams-protobuf)) |
+| BigQuery Storage API (gRPC) | Partial | Real `CreateReadSession`/`ReadRows` and `CreateWriteStream`/`AppendRows`/`FinalizeWriteStream`/`BatchCommitWriteStreams` on a separate plaintext gRPC listener (`--storage-grpc-addr`, default `:9060`); Read: column projection/`row_restriction` run through the real SQL engine, real Avro and Arrow framing (core scalars + `DATE`/`DATETIME`/`TIME`/`TIMESTAMP`; `NUMERIC`/`BIGNUMERIC`/`RECORD`/`REPEATED` rejected explicitly), one stream per session, no `SplitReadStream`. Write: real protobuf and Arrow row decoding (`proto_rows`/`arrow_rows`), `_default`/COMMITTED/PENDING streams with atomic `BatchCommitWriteStreams` and real offset/exactly-once semantics, no BUFFERED streams/`FlushRows` (see [BigQuery Storage API](#bigquery-storage-api-real-grpc-read-sessions-avroarrow-and-write-streams-protobufarrow)) |
 | Workspace validation | Supported | `locaql workspace validate` checks required portable workspace structure before promotion |
 | Workspace planning and diff | Supported | `locaql workspace plan` and `locaql workspace diff` provide portable inventory and deterministic source-target delta |
 | Workspace apply dry-run | Supported | `locaql workspace apply --dry-run=true` returns planned actions without mutating target |
@@ -203,7 +204,7 @@ Supported `parameterType.type` values: `STRING`, `INT64`, `FLOAT64`, `BOOL`, `BY
 
 ### Persistent DDL and DML
 
-Query jobs now persist real catalog mutations instead of executing them in a disposable engine and losing the result. Supported single-statement forms are `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `TRUNCATE TABLE`, `CREATE TABLE`, `CREATE TABLE AS SELECT`, `CREATE OR REPLACE TABLE` and `DROP TABLE` (including `IF [NOT] EXISTS`). Named and positional query parameters work in DML through the same binding path as `SELECT`.
+Query jobs now persist real catalog mutations instead of executing them in a disposable engine and losing the result. Supported single-statement forms are `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `TRUNCATE TABLE`, `CREATE TABLE`, `CREATE TABLE AS SELECT`, `CREATE OR REPLACE TABLE`, `DROP TABLE`, `CREATE`/`DROP [MATERIALIZED] VIEW`, `CREATE SCHEMA` and `ALTER TABLE ADD COLUMN` (including `IF [NOT] EXISTS` throughout). Named and positional query parameters work in DML through the same binding path as `SELECT`. A target identifier is accepted in any of the three quoting styles real tools emit — bare (`dataset.table`), a single pair of backticks around the whole dotted name, or a backtick around each segment individually (`` `project`.`dataset`.`table` ``, dbt-bigquery's default DDL style) — and `MERGE`'s `USING` clause accepts either a bare table or a derived table/subquery (dbt's default incremental-merge strategy always emits the latter).
 
 Execution is statement-atomic: LocaQL materializes the referenced tables into an isolated GoogleSQL database, runs the statement, validates the final schema/`REQUIRED` cells, then commits the final table image only if the catalog version analyzed by the job is still current. Query jobs targeting the same `project:dataset.table` share the existing resource lock and storage-write backpressure limiter; a concurrent direct REST write causes an explicit retryable conflict instead of a lost update. Polling a pending mutation never executes it early or twice.
 
@@ -216,13 +217,36 @@ Job resources expose `statistics.query.statementType` and `numDmlAffectedRows`; 
 - A request body sent with `Content-Encoding: gzip` (the official Java client compresses large `POST` bodies by default) was never decompressed, so it silently produced a job with an empty query and a fake result instead of running the real statement — now transparently decompressed by a single middleware ahead of every handler.
 - A query job never populated `configuration.query.destinationTable`, unlike real BigQuery which always assigns one (user-specified or anonymous). Python/Node.js/Go/Java all fetch results by polling `jobs.getQueryResults`, so none of their tests needed it; the official Ruby client's `QueryJob#data` reads it directly and calls `tabledata.list` against it instead, raising a bare `NoMethodError` without it — now populated with a virtual per-job destination table that `tabledata.list` resolves straight back to the job's own cached result set. That path then surfaced a second gap: `tabledata.list`'s existing 2-row default page size (real-table default, unrelated to this fix) silently truncated a 3-row result the Ruby client expected whole, since its `list_tabledata` call omits `maxResults` entirely rather than defaulting it client-side, matching real BigQuery's own convention — the new anonymous-table path now defaults to the same page size `jobs.getQueryResults` already uses (20, capped at 1000).
 
-Declared limits: cross-project mutation targets, DML against views/external tables, DML targeting `_SESSION`, and persistent DDL/DML while a session transaction is open fail explicitly. Multi-statement script execution is not yet an atomic persistent transaction. `ALTER TABLE`/procedural SQL are not part of this increment.
+Declared limits: cross-project mutation targets, DML against views/external tables, DML targeting `_SESSION`, and persistent DDL/DML while a session transaction is open fail explicitly. Multi-statement script execution is not yet an atomic persistent transaction. `ALTER TABLE` only supports `ADD COLUMN` (a parameterized type or a `STRUCT`/`ARRAY` type is not recognized; every other `ALTER TABLE` action fails explicitly); `CREATE SCHEMA` has no `DROP SCHEMA` counterpart yet; procedural SQL is not part of this increment. See [Known Divergences](KNOWN-DIVERGENCES.md) for the full, current bounded scope of each.
 
 ### bq CLI: a hand-written discovery document
 
 Unlike every other official client library (Python, Node.js, Go, Java), the official `bq` CLI is built on the older `apitools`/Discovery-API-driven generator: before issuing any real API call it fetches `GET /$discovery/rest?version=v2`, a JSON document describing the entire API surface it can call. LocaQL serves its own, deliberately scoped version of that document (`internal/server/discovery.go`, `internal/server/assets/bigquery_discovery_v2.json`) covering only the `jobs.*` resource (`insert`/`get`/`list`/`query`/`getQueryResults`/`cancel`) — real BigQuery's actual discovery document is roughly 570KB describing its full API; writing a smaller one scoped to what LocaQL actually implements keeps the same capability-transparency stance as [Known Divergences](KNOWN-DIVERGENCES.md) and `capabilities/registry.yaml` rather than bundling and relabeling Google's document. `rootUrl`/`baseUrl`/`mtlsRootUrl` are rewritten to the request's own `Host` at serve time so `bq`'s subsequent calls come back to LocaQL instead of real Google infrastructure.
 
 This makes `bq query` (including the same persistent CREATE/INSERT/UPDATE/MERGE/DELETE/SELECT sequence the other five clients' conformance tests run — `test/clients/bq/persistent_ddl_dml.sh`), `bq show -j`, `bq cancel`, and `bq ls -j` work against LocaQL. `bq` subcommands that depend on datasets/tables/tabledata resources (`mk`, `ls` for datasets/tables, `load`, `extract`, `cp`, `insert`) are not yet supported, since those resources are deliberately not described in the document — see `rest.discovery_document` in `capabilities/registry.yaml` for the exact scope. `bq` also refuses to run at all without a locally "active account" configured even against an anonymous-only local server; set `CLOUDSDK_AUTH_ACCESS_TOKEN` to any non-empty value to satisfy that check without real `gcloud auth login`, as the conformance test and its CI job both do.
+
+### dbt and SQLMesh: Real Adapter/Engine Compatibility
+
+The official `dbt-bigquery` adapter connects to LocaQL exactly as it would to any BigQuery-compatible endpoint, no code changes or monkeypatching involved — `profiles.yml`'s `method: oauth-secrets` accepts a literal, non-refreshable `token` (never a real OAuth handshake), and `dbt-bigquery`'s own `BigQueryCredentials` carries a real, if undocumented, `api_endpoint` field that reaches `google.cloud.bigquery.Client`'s `client_options` directly:
+
+```yaml
+# profiles.yml
+my_project:
+  target: dev
+  outputs:
+    dev:
+      type: bigquery
+      method: oauth-secrets
+      token: locaql-fake-token
+      project: p1
+      dataset: analytics
+      api_endpoint: http://127.0.0.1:9050
+      threads: 1
+```
+
+`test/clients/dbt` (wired into CI as its own job) runs the real, unmodified `dbt` CLI against three models covering the materializations that matter most for schema-evolving pipelines — `view`, `table` (CTAS) and `incremental` with `incremental_strategy='merge'` — each executed twice (a fresh create, then a real replace/merge against existing data) plus once more with `--full-refresh`. Getting there closed five real gaps dbt's default DDL macros exercise that no hand-written test in this project's own suite had ever hit: per-segment backtick-quoted target identifiers, `CREATE`/`DROP VIEW` as SQL DDL (previously only reachable via `tables.insert`'s `view.query`), a real concurrency bug in the early-poll guard meant to stop a pending job's mutation from running twice, a `MERGE ... USING (<subquery>)` derived-table source (the embedded engine's own MERGE only resolves a bare table reference there), and `CREATE SCHEMA`/`ALTER TABLE ADD COLUMN` as real DDL — see [Known Divergences](KNOWN-DIVERGENCES.md) for the full account of each.
+
+SQLMesh's BigQuery engine adapter was investigated with the same rigor and connects the same way (`method: oauth-secrets` plus a fake token; `BIGQUERY_EMULATOR_HOST=http://127.0.0.1:9050` for the endpoint, read directly by `google-cloud-bigquery`'s own client constructor rather than any SQLMesh-specific config field) — its own internal state-migration DDL now runs successfully as a direct result of the `CREATE SCHEMA`/`ALTER TABLE ADD COLUMN` work above. A full `sqlmesh plan`/`run` is not yet possible end-to-end: `google-cloud-bigquery`'s dataframe-fetch path unconditionally attempts the real BigQuery Storage Read API with no local-endpoint override in that library, and SQLMesh's own snapshot-diffing step issues an `INFORMATION_SCHEMA` query (a `WITH` CTE joined against a second `INFORMATION_SCHEMA` view, with aliased result columns) shaped beyond what this project's current fixed-schema `INFORMATION_SCHEMA` builders parse. Both are documented in [Known Divergences](KNOWN-DIVERGENCES.md) rather than left silently broken.
 
 ### Streaming Inserts (`tabledata.insertAll`)
 
@@ -687,6 +711,8 @@ curl -X POST http://localhost:9050/bigquery/v2/projects/p1/datasets/analytics/ta
 - A materialized view is **not actually cached**: it is recomputed live on every access exactly like a plain view. Real BigQuery's periodic background refresh, `enableRefresh`/`refreshIntervalMs`/`lastRefreshTime` are not modeled.
 - A 3-part `project.dataset.table` reference inside a view's query only resolves against the project that created the view (see [Query Engine](#query-engine-real-googlesql-via-an-embedded-sqlite-backend)).
 
+The identical resource is also reachable through plain SQL DDL — `CREATE [OR REPLACE] [MATERIALIZED] VIEW ... AS <select>` and `DROP [MATERIALIZED] VIEW` (see [Persistent DDL and DML](#persistent-ddl-and-dml)) — needed because real tools' default DDL (dbt's `view` materialization, notably) emit exactly this rather than calling `tables.insert` directly. Both entry points land on the same `viewConfig`/live-re-execution machinery described above.
+
 ## Sessions and Multi-Statement Transactions
 
 `jobs.query` and `jobs.insert` (`configuration.query`) accept `createSession: true` (mints a new session, returned as `sessionInfo.sessionId`) or `connectionProperties: [{"key": "session_id", "value": "..."}]` (continues an existing one — an unknown or idle-expired session fails the request explicitly with `400`, never silently). Sessions idle-expire lazily on next use (24h default, `LOCAQL_SESSION_IDLE_TIMEOUT_SECONDS` to override for local testing).
@@ -738,7 +764,7 @@ Known limitations, declared explicitly:
 - Only the single-statement `CREATE TEMP TABLE <name> AS <select>` form is recognized; a separate `CREATE TEMP TABLE (schema...)` followed by standalone `INSERT` statements is not.
 - A session transaction's atomicity covers only that session's own temp tables. Base-table DDL/DML is persistent outside a transaction, but is rejected explicitly while a session transaction is open so `ROLLBACK` can never claim to undo a catalog mutation it did not actually govern.
 
-## BigQuery Storage API: Real gRPC Read Sessions (Avro) and Write Streams (Protobuf)
+## BigQuery Storage API: Real gRPC Read Sessions (Avro/Arrow) and Write Streams (Protobuf/Arrow)
 
 Unlike everything else in this document, the BigQuery Storage API is a real **gRPC** service in BigQuery, not part of the JSON REST surface — so LocaQL exposes it on its own plaintext listener, separate from the REST/HTTP port, using Google's own generated protobuf/gRPC stubs (`cloud.google.com/go/bigquery/storage/apiv1/storagepb`) rather than hand-rolled message types:
 
@@ -750,31 +776,33 @@ Like the rest of this emulator, the gRPC listener is plaintext with no TLS and n
 
 ### Storage Read
 
-`CreateReadSession` and `ReadRows` (`google.cloud.bigquery.storage.v1.BigQueryRead`) are real: column projection (`TableReadOptions.selected_fields`) and the push-down filter (`TableReadOptions.row_restriction`) are rendered as a genuine `SELECT ... WHERE ...` and executed through the same real GoogleSQL engine every other query in this project uses (see [Query Engine](#query-engine-real-googlesql-via-an-embedded-sqlite-backend)) — not a hand-rolled column/filter interpreter, so `row_restriction` gets exactly the same WHERE-clause correctness as any other query. Rows are returned Avro-framed (`AvroRows.SerializedBinaryRows`, real raw binary encoding, reusing the same Avro codec already used by [Load](#load-jobs-real-row-ingestion-ndjson--csv--avro--parquet)/[Extract](#extract-jobs-real-table-export-ndjson--csv--avro--parquet) jobs), matching the real API's message shape exactly.
+`CreateReadSession` and `ReadRows` (`google.cloud.bigquery.storage.v1.BigQueryRead`) are real: column projection (`TableReadOptions.selected_fields`) and the push-down filter (`TableReadOptions.row_restriction`) are rendered as a genuine `SELECT ... WHERE ...` and executed through the same real GoogleSQL engine every other query in this project uses (see [Query Engine](#query-engine-real-googlesql-via-an-embedded-sqlite-backend)) — not a hand-rolled column/filter interpreter, so `row_restriction` gets exactly the same WHERE-clause correctness as any other query. `ReadSession.data_format` selects the wire framing: `DATA_FORMAT_AVRO` (the default when unset, matching real BigQuery) returns `AvroRows.SerializedBinaryRows`, reusing the same Avro codec already used by [Load](#load-jobs-real-row-ingestion-ndjson--csv--avro--parquet)/[Extract](#extract-jobs-real-table-export-ndjson--csv--avro--parquet) jobs; `DATA_FORMAT_ARROW` returns real Arrow-framed `ArrowRecordBatch`/`ArrowSchema` messages (see below), both matching the real API's message shape exactly.
 
 ```mermaid
 flowchart LR
-	Client["gRPC client\n(google-cloud-go, etc.)"] -->|CreateReadSession| Session["Resolve table via real SQL engine\n(selected_fields + row_restriction -> SELECT ... WHERE ...)"]
-	Session --> Stream["1 ReadStream\n(Avro schema + rows snapshotted)"]
+	Client["gRPC client\n(google-cloud-go, etc.)"] -->|"CreateReadSession\n(data_format: AVRO or ARROW)"| Session["Resolve table via real SQL engine\n(selected_fields + row_restriction -> SELECT ... WHERE ...)"]
+	Session --> Stream["1 ReadStream\n(schema + rows snapshotted)"]
 	Client -->|ReadRows stream_name| Stream
-	Stream -->|AvroRows.SerializedBinaryRows| Client
+	Stream -->|AvroRows or ArrowRecordBatch| Client
 ```
 
 Deliberately bounded, confirmed with the user before building it:
 
-- **Avro only.** Requesting Arrow framing (`arrow_serialization_options`) returns an explicit `Unimplemented` gRPC status rather than silently ignoring it or producing wrong bytes.
+- **Arrow covers `BOOL`/`INT64`/`FLOAT64`/`BYTES`/`STRING`/`DATE`/`DATETIME`/`TIME`/`TIMESTAMP`** — real BigQuery's own documented BigQuery-to-Arrow type mapping, built with [`apache/arrow-go`](https://github.com/apache/arrow-go). `NUMERIC`/`BIGNUMERIC` (real BigQuery maps these to Arrow `Decimal128`/`Decimal256`, not built here), `RECORD`/`REPEATED`, `GEOGRAPHY`, `JSON` and `RANGE` fail `CreateReadSession` explicitly rather than silently downgrading to a string column; request `DATA_FORMAT_AVRO` instead for those. `arrow_serialization_options.buffer_compression` is `Unimplemented`.
 - **Exactly one stream per session**, regardless of `max_stream_count`/`preferred_min_stream_count`. `SplitReadStream` returns `Unimplemented` explicitly — there's nothing to split.
-- **A table with a `RECORD`/`REPEATED` schema field is rejected explicitly** at `CreateReadSession` (same `rejectNestedFields` convention already used by CSV/AVRO/PARQUET load/extract), not silently flattened or corrupted.
+- **A table with a `RECORD`/`REPEATED` schema field is rejected explicitly** at `CreateReadSession` for either format (same `rejectNestedFields` convention already used by CSV/AVRO/PARQUET load/extract), not silently flattened or corrupted.
 - **Sessions never expire** — real BigQuery auto-expires a session after 6 hours; not modeled, since there's no cleanup pressure in a local, single-process emulator.
+
+Verified beyond this project's own tests: the official `cloud.google.com/go/bigquery` client's `Table.Read()` — which, once `Client.EnableStorageReadClient` succeeds, always requests `DATA_FORMAT_ARROW` internally, unconditionally, per that client's own source — reads real rows back correctly against LocaQL (`test/clients/go/storage_arrow`, wired into CI's `go-client` job).
 
 ### Storage Write
 
-`CreateWriteStream`, `AppendRows` (bidi-streaming), `GetWriteStream`, `FinalizeWriteStream` and `BatchCommitWriteStreams` (`google.cloud.bigquery.storage.v1.BigQueryWrite`) are real. Unlike Read, the Write API's rows are always **protobuf**-encoded, never Avro/Arrow: a client sends a raw `DescriptorProto` (`ProtoSchema.proto_descriptor`) once per destination, and LocaQL wraps it in a synthetic, self-contained `FileDescriptorProto`, resolves it into a real `protoreflect.MessageDescriptor`, and decodes every row through real runtime protobuf reflection (`google.golang.org/protobuf/types/dynamicpb`) — no generated Go struct or compiled `.proto` file involved on either side. Decoded fields are matched to the destination table's columns by name and appended for real.
+`CreateWriteStream`, `AppendRows` (bidi-streaming), `GetWriteStream`, `FinalizeWriteStream` and `BatchCommitWriteStreams` (`google.cloud.bigquery.storage.v1.BigQueryWrite`) are real. `AppendRowsRequest` accepts either encoding real BigQuery supports: `proto_rows` (a client sends a raw `DescriptorProto` once per destination, wrapped in a synthetic self-contained `FileDescriptorProto` and resolved into a real `protoreflect.MessageDescriptor`, then every row is decoded through real runtime protobuf reflection — `google.golang.org/protobuf/types/dynamicpb`) or `arrow_rows` (a record batch decoded against its `writer_schema` using the same real Arrow support Storage Read uses). Both decode paths match fields to the destination table's columns by name, not position or wire order.
 
 ```mermaid
 flowchart LR
 	Client["gRPC client"] -->|"CreateWriteStream\n(COMMITTED or PENDING)"| Stream["Write stream state"]
-	Client -->|"AppendRows\n(ProtoSchema + ProtoRows)"| Decode["dynamicpb decode\nby field name"]
+	Client -->|"AppendRows\n(proto_rows or arrow_rows)"| Decode["Decode by field/column name\n(dynamicpb or Arrow)"]
 	Decode -->|COMMITTED / _default| Catalog["Real table catalog\n(visible immediately)"]
 	Decode -->|PENDING| Buffer["Buffered in memory"]
 	Client -->|FinalizeWriteStream| Stream
@@ -782,13 +810,14 @@ flowchart LR
 	Buffer --> Commit
 ```
 
-The `_default` stream (implicit, no `CreateWriteStream` needed — every table already has one) and explicit **COMMITTED** streams append straight into the real catalog, visible immediately, reusing the same `upsertCopyDestination` helper `jobs.copy` already uses (`WRITE_APPEND` + `CREATE_NEVER` — Storage Write never creates a table, matching real BigQuery). Explicit **PENDING** streams buffer rows in server memory until `BatchCommitWriteStreams` applies every named, finalized stream's buffer to the catalog in one call — genuinely atomic (all rows from all streams land together, or none do). Explicit streams also get real offset-based exactly-once semantics: an `AppendRowsRequest.offset` behind the stream's current end returns `ALREADY_EXISTS`, ahead of it returns `OUT_OF_RANGE` — both embedded in the per-request `AppendRowsResponse`, matching the real API's own retry contract, not a top-level RPC error.
+The `_default` stream (implicit, no `CreateWriteStream` needed — every table already has one) and explicit **COMMITTED** streams append straight into the real catalog, visible immediately, reusing the same `upsertCopyDestination` helper `jobs.copy` already uses (`WRITE_APPEND` + `CREATE_NEVER` — Storage Write never creates a table, matching real BigQuery). Explicit **PENDING** streams buffer rows in server memory until `BatchCommitWriteStreams` applies every named, finalized stream's buffer to the catalog in one call — genuinely atomic (all rows from all streams land together, or none do), for either row encoding. Explicit streams also get real offset-based exactly-once semantics: an `AppendRowsRequest.offset` behind the stream's current end returns `ALREADY_EXISTS`, ahead of it returns `OUT_OF_RANGE` — both embedded in the per-request `AppendRowsResponse`, matching the real API's own retry contract, not a top-level RPC error.
 
 Deliberately bounded, confirmed with the user before building it:
 
 - **BUFFERED streams are not supported.** `CreateWriteStream` with `type: BUFFERED` returns an explicit `Unimplemented` status; `FlushRows` (which only ever applies to BUFFERED streams) is likewise `Unimplemented`.
-- **A repeated or nested-message proto field is rejected per row** (via `RowErrors` on that specific row, not the whole request) rather than silently flattened or corrupted; a destination table with a `RECORD`/`REPEATED` schema field is rejected even earlier, at stream creation.
-- **`missing_value_interpretations` and mid-stream schema updates are not implemented** — an absent nullable proto field is SQL `NULL`, an absent `REQUIRED` field is a row error, and the destination schema is read once, not re-checked mid-stream.
+- **A repeated or nested-message `proto_rows` field is rejected per row** (via `RowErrors` on that specific row, not the whole request) rather than silently flattened or corrupted; a destination table with a `RECORD`/`REPEATED` schema field is rejected even earlier, at stream creation, for both `proto_rows` and `arrow_rows`. A malformed `arrow_rows` batch fails the whole request instead — a columnar batch's validity is a property of the whole batch, not an individual row.
+- **`arrow_rows` shares Storage Read's Arrow type scope** (core scalars plus `DATE`/`DATETIME`/`TIME`/`TIMESTAMP`; `NUMERIC`/`BIGNUMERIC`/`RECORD`/`REPEATED` rejected explicitly).
+- **`missing_value_interpretations` and mid-stream schema updates are not implemented** — an absent nullable field is SQL `NULL`, an absent `REQUIRED` field is an error, and the destination schema is read once, not re-checked mid-stream.
 
 Verified beyond the in-memory test suite: a disposable throwaway Go client (deleted after use) drove `CreateWriteStream`/`AppendRows` over a **real TCP network connection** against a running `locaql` binary, confirming genuine wire-protocol interoperability, not just the bufconn-based unit tests.
 
@@ -1034,6 +1063,7 @@ Every push and pull request to `main`/`dev` runs [`.github/workflows/ci.yml`](.g
 | `java-client` | ubuntu-latest | Official `com.google.cloud:google-cloud-bigquery` client exercises the same mutations and streaming inserts (`test/clients/java/`) |
 | `bq-client` | ubuntu-latest | Official `bq` CLI, served a hand-written discovery document, exercises the same persistent SQL mutations (`test/clients/bq/persistent_ddl_dml.sh`) |
 | `ruby-client` | ubuntu-latest | Official `google-cloud-bigquery` Ruby gem exercises the same mutations and streaming inserts (`test/clients/ruby/`) |
+| `dbt-client` | ubuntu-latest | Pinned official `dbt-bigquery` adapter runs real `dbt debug`/`dbt run`/`dbt run --full-refresh` against view/table/incremental models (`test/clients/dbt/`, see [dbt and SQLMesh](#dbt-and-sqlmesh-real-adapterengine-compatibility)) |
 | `native` | windows-latest, macos-latest | `go build`/`go vet`/`go test ./...` natively on each OS; `go test` is `continue-on-error` (see below) |
 | `cross-build` | ubuntu-latest (5-way matrix) | `CGO_ENABLED=0 go build` for `locaql`/`locaql-ui` across every `make build-all` target: `linux/amd64`, `linux/arm64`, `windows/amd64`, `darwin/amd64`, `darwin/arm64` |
 | `vulnerability-scan` | ubuntu-latest | `govulncheck -scan package ./...` (see [Security](#security)) |

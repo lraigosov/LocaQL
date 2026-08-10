@@ -158,6 +158,21 @@ func (s *Server) handleDatasetsScope(w http.ResponseWriter, r *http.Request, pro
 			s.insertAllTableData(w, r, projectID, datasetID, parts[4])
 			return true
 		}
+		// The anonymous query-results dataset (see anonymousQueryResultsDatasetID)
+		// deliberately never exists as a real, listable dataset — so the
+		// requireDatasetExists gate inside dispatchDatasetSubResource would 404
+		// tables.get on it before ever reaching handleTableByID's own _anon
+		// handling. Route a GET-by-ID request straight there instead. Found by
+		// dbt-bigquery's Python client, which calls get_table on a query job's
+		// destination table after running it.
+		if datasetID == anonymousQueryResultsDatasetID && len(parts) == 5 {
+			if r.Method != http.MethodGet {
+				writeError(w, http.StatusMethodNotAllowed, "Method not allowed", "methodNotAllowed")
+				return true
+			}
+			s.getTable(w, r, projectID, datasetID, parts[4])
+			return true
+		}
 		return s.dispatchDatasetSubResource(w, r, projectID, datasetID, parts, s.handleTablesCollection, s.handleTableByID)
 	case "routines":
 		return s.dispatchDatasetSubResource(w, r, projectID, datasetID, parts, s.handleRoutinesCollection, s.handleRoutineByID)
@@ -791,6 +806,11 @@ func (s *Server) insertTable(w http.ResponseWriter, r *http.Request, projectID, 
 }
 
 func (s *Server) getTable(w http.ResponseWriter, r *http.Request, projectID, datasetID, tableID string) {
+	if datasetID == anonymousQueryResultsDatasetID {
+		s.getAnonymousQueryResultsTable(w, projectID, tableID)
+		return
+	}
+
 	item, ok, version := s.tables.get(projectID, datasetID, tableID)
 	if !ok {
 		writeError(w, http.StatusNotFound, fmt.Sprintf("Not found: Table %s:%s.%s", projectID, datasetID, tableID), "notFound")
@@ -801,6 +821,39 @@ func (s *Server) getTable(w http.ResponseWriter, r *http.Request, projectID, dat
 		return
 	}
 	writeJSON(w, http.StatusOK, renderTableResource(item))
+}
+
+// getAnonymousQueryResultsTable serves tables.get against a query/script
+// job's virtual anonymous destination table (see
+// anonymousQueryResultsTableID), the same resolve-back-to-the-job mechanism
+// listAnonymousQueryResultsTableData already uses for tabledata.list —
+// required because official clients (the Ruby client, and now dbt-bigquery's
+// Python client underneath, calling get_table on a query job's destination)
+// call tables.get on it too, not only tabledata.list. Real BigQuery's own
+// anonymous destination table is a real, if hidden and short-lived, managed
+// table; this renders the same shape (schema + numRows/numBytes) derived
+// from the job's own cached result rather than a real second catalog entry.
+func (s *Server) getAnonymousQueryResultsTable(w http.ResponseWriter, projectID, tableID string) {
+	jobID := strings.TrimPrefix(tableID, "anon")
+	j, ok := s.jobs.get(projectID, jobID)
+	if !ok || (j.JobType != "query" && j.JobType != "script") {
+		writeError(w, http.StatusNotFound, fmt.Sprintf("Not found: Table %s:%s.%s", projectID, anonymousQueryResultsDatasetID, tableID), "notFound")
+		return
+	}
+	schema, rows, err := s.computeQueryJobResultRows(projectID, j)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error(), "invalid")
+		return
+	}
+	updatedAt := j.EndedAt
+	if updatedAt.IsZero() {
+		updatedAt = j.CreatedAt
+	}
+	synthetic := &tableRecord{
+		ProjectID: projectID, DatasetID: anonymousQueryResultsDatasetID, TableID: tableID,
+		Schema: schema, Rows: rows, CreatedAt: j.CreatedAt, UpdatedAt: updatedAt, Version: 1,
+	}
+	writeJSON(w, http.StatusOK, renderTableResource(synthetic))
 }
 
 func (s *Server) patchTable(w http.ResponseWriter, r *http.Request, projectID, datasetID, tableID string) {
@@ -1725,11 +1778,21 @@ func (s *Server) computeQueryJobResultRows(projectID string, j *jobRecord) ([]ta
 	// Preserve the existing early-result behavior for side-effect-free
 	// SELECTs, but never execute DDL/DML or session control merely because a
 	// PENDING/RUNNING job was polled. A mutation must run exactly once after
-	// its job acquires the target-table lock.
+	// its job acquires the target-table lock. Every persistent-statement
+	// parser is checked here, not just parsePersistentSQLStatement: each of
+	// CREATE/DROP [MATERIALIZED] VIEW, CREATE SCHEMA and ALTER TABLE ADD
+	// COLUMN is recognized by its own dedicated parser, and a statement type
+	// missing from this guard is a real, previously-hit bug (see CREATE
+	// VIEW's history in devlog.md) — a getQueryResults poll landing while the
+	// async job was still PENDING/RUNNING re-runs the statement a second
+	// time, racing the job's own execution over the same catalog version.
 	_, mutating, _ := parsePersistentSQLStatement(projectID, j.QueryText)
+	_, viewMutating, _ := parsePersistentViewStatement(projectID, j.QueryText)
+	_, _, createSchemaMutating := parseCreateSchemaStatement(j.QueryText)
+	_, alterTableMutating, _ := parsePersistentAlterTableAddColumns(projectID, j.QueryText)
 	trimmedQuery := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(j.QueryText), ";"))
 	sessionControl := sessionBeginPattern.MatchString(trimmedQuery) || sessionCommitPattern.MatchString(trimmedQuery) || sessionRollbackPattern.MatchString(trimmedQuery) || sessionCreateTempTablePattern.MatchString(trimmedQuery)
-	if mutating || sessionControl {
+	if mutating || viewMutating || createSchemaMutating || alterTableMutating || sessionControl {
 		return []tableField{}, [][]string{}, nil
 	}
 	return s.simulateQueryResultTable(projectID, j.SessionID, j.QueryText, j.UserEmail, j.ParameterMode, j.QueryParameters)
@@ -1818,6 +1881,15 @@ func (s *Server) executeQueryStatement(projectID, sessionID, queryText, callingU
 	lower := strings.ToLower(trimmed)
 	if schema, rows, ok := s.simulateInformationSchemaQuery(projectID, trimmed, lower, callingUserEmail); ok {
 		return persistentSQLResult{schema: flatSchemaToTableFields(schema), rows: rows, statementType: "SELECT"}, nil
+	}
+	if result, handled, err := s.executePersistentViewStatement(projectID, trimmed, sess); handled {
+		return result, err
+	}
+	if result, handled, err := s.executePersistentCreateSchemaStatement(projectID, trimmed); handled {
+		return result, err
+	}
+	if result, handled, err := s.executePersistentAlterTableAddColumnsStatement(projectID, trimmed); handled {
+		return result, err
 	}
 	if result, handled, err := s.executePersistentSQLStatement(projectID, trimmed, sess, paramMode, params); handled {
 		return result, err
