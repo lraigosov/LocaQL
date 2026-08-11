@@ -34,10 +34,10 @@ jobs:
     needs: resolve
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.resolve.outputs.tag }}
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
       - run: go build ./...
@@ -54,7 +54,7 @@ jobs:
       IMAGE_NAME: ${{ github.repository }}
       TAG: ${{ needs.resolve.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.resolve.outputs.tag }}
       - name: Compute build metadata
@@ -62,23 +62,35 @@ jobs:
         run: |
           echo "commit=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
           echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       # Tags produced for a release tag v1.2.3: 1.2.3, 1.2, latest.
       - id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=semver,pattern={{version}},value=${{ env.TAG }}
             type=semver,pattern={{major}}.{{minor}},value=${{ env.TAG }}
             type=raw,value=latest
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
+        env:
+          # Disables buildx's GitHub Actions build-summary/record-archive
+          # upload. That upload uses the Actions cache API, which issues a
+          # read-only token for pull_request-triggered runs (a GitHub-side
+          # security policy no `permissions:` block can override) — this
+          # workflow can run that way via auto-tag-release.yml's
+          # pull_request trigger, where the attempt always fails with
+          # "Cache reservation failed: cache write denied: token has no
+          # writable scopes". Non-fatal either way (the image build/push
+          # itself still succeeds), but disabled outright since the summary
+          # can never actually be produced on that trigger.
+          DOCKER_BUILD_SUMMARY: false
         with:
           context: .
           platforms: linux/amd64,linux/arm64
@@ -99,10 +111,10 @@ jobs:
     env:
       TAG: ${{ needs.resolve.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.resolve.outputs.tag }}
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
       - run: make build-all VERSION=${{ env.TAG }}
