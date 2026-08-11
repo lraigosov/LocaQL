@@ -368,9 +368,21 @@ func appendDatasetTableRef(parts []string, projectID string, seen map[datasetTab
 	}
 }
 
-// stripProjectPrefix rewrites project.dataset.table references (bare or
-// backtick-wrapped) down to dataset.table, since the real engine models one
-// schema per dataset and has no concept of a project level.
+// stripProjectPrefix rewrites project.dataset.table references down to
+// dataset.table, since the real engine models one schema per dataset and has
+// no concept of a project level. Three quoting styles are handled: bare, a
+// single pair of backticks around the whole reference, and a pair around
+// each segment individually (dbt-bigquery's default DDL macros emit this
+// last style — a backtick around each of project, dataset and table
+// individually. Leaving that style
+// unstripped is not just a cosmetic miss: a 3-part project-qualified
+// CREATE/REPLACE reaching the embedded engine directly was found to leave
+// its catalog in a state where a same-named 2-part table materialized fresh
+// afterward (this project's own re-materialize-per-statement pattern, see
+// pooledEngine.reset) silently retained the earlier statement's row(s)
+// alongside the new ones — a real, reproducible upstream duplication bug
+// (see this project's own test coverage and devlog) triggered specifically
+// by that unstripped 3-part form, not merely an unsupported syntax error.
 func stripProjectPrefix(queryText, projectID string) string {
 	if projectID == "" {
 		return queryText
@@ -381,6 +393,12 @@ func stripProjectPrefix(queryText, projectID string) string {
 	// only the opening tick and left an invalid trailing tick behind.
 	wholeQuoted := regexp.MustCompile("(?i)`" + project + "\\.([A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+)`")
 	queryText = wholeQuoted.ReplaceAllString(queryText, "$1")
+	// Per-segment quoting: the project's own backticks are consumed together
+	// with the following dot; the dataset/table segments are left exactly as
+	// spelled (still individually backtick-quoted or not) since that part of
+	// the reference is already a form the engine accepts natively.
+	perSegmentQuoted := regexp.MustCompile("(?i)`" + project + "`\\.(`?[A-Za-z0-9_-]+`?\\.`?[A-Za-z0-9_-]+`?)")
+	queryText = perSegmentQuoted.ReplaceAllString(queryText, "$1")
 	bare := regexp.MustCompile("(?i)\\b" + project + "\\.([A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+)\\b")
 	return bare.ReplaceAllString(queryText, "$1")
 }
@@ -807,6 +825,92 @@ func directPseudocolumnProjectionCounts(queryText string) (timeCount, dateCount 
 		}
 	}
 	return timeCount, dateCount
+}
+
+// findMatchingParen returns the index of the ')' matching the '(' at
+// openIdx, skipping over quoted literals the same way findTopLevelSQLKeyword
+// does. Returns -1 if the parens are unbalanced from openIdx onward.
+func findMatchingParen(sqlText string, openIdx int) int {
+	depth := 0
+	for i := openIdx; i < len(sqlText); {
+		switch sqlText[i] {
+		case '\'', '"', '`':
+			quote := sqlText[i]
+			i++
+			for i < len(sqlText) {
+				if sqlText[i] == quote {
+					i++
+					if i < len(sqlText) && sqlText[i] == quote {
+						i++
+						continue
+					}
+					break
+				}
+				i++
+			}
+		case '(':
+			depth++
+			i++
+		case ')':
+			depth--
+			if depth == 0 {
+				return i
+			}
+			i++
+		default:
+			i++
+		}
+	}
+	return -1
+}
+
+// rewriteMergeUsingSubquery works around a real limitation in the embedded
+// GoogleSQL engine (goccy/googlesqlite): its MERGE implementation only
+// accepts a bare table reference as the USING source, rejecting a derived
+// table with "MERGE: source must be a single-table reference" (see that
+// module's internal/analyzer.go, newMergeStmtAction — a deliberate, documented
+// scope limit in the engine itself, not a parsing bug). Real BigQuery has no
+// such restriction, and dbt-bigquery's default incremental "merge" strategy
+// always emits `USING (<select>) AS DBT_INTERNAL_SOURCE`, so every dbt
+// incremental model would fail here otherwise. The subquery is materialized
+// into a real table in the same engine connection under a name the caller's
+// statement cannot already reference, the USING clause is rewritten to name
+// it directly, and the returned cleanup func drops it once the caller is done
+// with the (already-executed) MERGE. A statement without a parenthesized
+// USING source, or one whose parenthesized source is not itself a query
+// (e.g. `USING other_table AS x`, already a bare table reference the engine
+// accepts natively), is returned unchanged with a nil cleanup.
+func (s *Server) rewriteMergeUsingSubquery(db *sql.DB, datasetID, engineStatement string) (string, func(), error) {
+	usingAt := findTopLevelSQLKeyword(engineStatement, 0, "USING")
+	if usingAt < 0 {
+		return engineStatement, nil, nil
+	}
+	afterKeyword := usingAt + len("USING")
+	trimmed := strings.TrimLeft(engineStatement[afterKeyword:], " \t\r\n")
+	openAt := afterKeyword + (len(engineStatement[afterKeyword:]) - len(trimmed))
+	if openAt >= len(engineStatement) || engineStatement[openAt] != '(' {
+		return engineStatement, nil, nil
+	}
+	closeAt := findMatchingParen(engineStatement, openAt)
+	if closeAt < 0 {
+		return engineStatement, nil, nil
+	}
+	subquery := strings.TrimSpace(engineStatement[openAt+1 : closeAt])
+	upperSubquery := strings.ToUpper(subquery)
+	if !strings.HasPrefix(upperSubquery, "SELECT") && !strings.HasPrefix(upperSubquery, "WITH") {
+		return engineStatement, nil, nil
+	}
+
+	ephemeralName := fmt.Sprintf("__locaql_merge_src_%d", s.mergeSourceCounter.Add(1))
+	qualified := quoteIdent(datasetID) + "." + quoteIdent(ephemeralName)
+	if _, err := db.Exec(fmt.Sprintf("CREATE TABLE %s AS (%s)", qualified, subquery)); err != nil {
+		return "", nil, fmt.Errorf("MERGE: failed to materialize USING subquery: %w", err)
+	}
+	cleanup := func() {
+		_, _ = db.Exec("DROP TABLE " + qualified)
+	}
+	rewritten := engineStatement[:openAt] + qualified + engineStatement[closeAt+1:]
+	return rewritten, cleanup, nil
 }
 
 func findTopLevelSQLKeyword(sqlText string, start int, keyword string) int {

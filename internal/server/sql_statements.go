@@ -32,7 +32,15 @@ type persistentSQLResult struct {
 	processedBytes  int64
 }
 
-const persistentTargetExpression = "`?([A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+){1,2})`?"
+// persistentTargetExpression matches a dataset.table or project.dataset.table
+// target, accepting three quoting styles real tools emit: no backticks,
+// a single pair around the whole dotted identifier, and a pair around each
+// segment individually — a backtick around each of project, dataset and
+// table on its own, what dbt-bigquery's
+// default table/incremental DDL macros generate). Backticks are stripped per
+// segment in parsePersistentTarget rather than assumed to wrap the whole
+// match.
+const persistentTargetExpression = "(`?[A-Za-z0-9_-]+`?(?:\\.`?[A-Za-z0-9_-]+`?){1,2})"
 
 var (
 	insertTargetPattern            = regexp.MustCompile("(?is)^\\s*INSERT\\s+(?:INTO\\s+)?" + persistentTargetExpression + "(?:\\s|\\()")
@@ -42,8 +50,14 @@ var (
 	truncateTargetPattern          = regexp.MustCompile("(?is)^\\s*TRUNCATE\\s+TABLE\\s+" + persistentTargetExpression + "(?:\\s|$)")
 	createTargetPattern            = regexp.MustCompile("(?is)^\\s*CREATE\\s+(OR\\s+REPLACE\\s+)?TABLE\\s+(IF\\s+NOT\\s+EXISTS\\s+)?" + persistentTargetExpression + "(?:\\s|\\(|$)")
 	dropTargetPattern              = regexp.MustCompile("(?is)^\\s*DROP\\s+TABLE\\s+(IF\\s+EXISTS\\s+)?" + persistentTargetExpression + "\\s*$")
+	createViewTargetPattern        = regexp.MustCompile("(?is)^\\s*CREATE\\s+(OR\\s+REPLACE\\s+)?(MATERIALIZED\\s+)?VIEW\\s+(IF\\s+NOT\\s+EXISTS\\s+)?" + persistentTargetExpression + "\\s*")
+	dropViewTargetPattern          = regexp.MustCompile("(?is)^\\s*DROP\\s+(MATERIALIZED\\s+)?VIEW\\s+(IF\\s+EXISTS\\s+)?" + persistentTargetExpression + "\\s*$")
+	viewAsClausePattern            = regexp.MustCompile(`(?is)^AS\s+(.+)$`)
+	createSchemaTargetPattern      = regexp.MustCompile("(?is)^\\s*CREATE\\s+SCHEMA\\s+(IF\\s+NOT\\s+EXISTS\\s+)?`?([A-Za-z0-9_-]+)`?\\s*$")
+	alterTableTargetPattern        = regexp.MustCompile("(?is)^\\s*ALTER\\s+TABLE\\s+(IF\\s+EXISTS\\s+)?" + persistentTargetExpression + "\\s+(.+)$")
+	addColumnClausePattern         = regexp.MustCompile("(?is)^ADD\\s+COLUMN\\s+(IF\\s+NOT\\s+EXISTS\\s+)?`?([A-Za-z_][A-Za-z0-9_]*)`?\\s+([A-Za-z][A-Za-z0-9_]*)$")
 	persistentLeadPattern          = regexp.MustCompile(`(?is)^\s*(INSERT|UPDATE|DELETE|MERGE|TRUNCATE|CREATE\s+(?:OR\s+REPLACE\s+)?TABLE|DROP\s+TABLE)\b`)
-	unsupportedMutationLeadPattern = regexp.MustCompile(`(?is)^\s*(ALTER\s+TABLE|CREATE\s+(?:OR\s+REPLACE\s+)?(?:(?:MATERIALIZED\s+)?VIEW|TEMP(?:ORARY)?\s+TABLE|(?:TEMP(?:ORARY)?\s+)?(?:SCHEMA|FUNCTION|PROCEDURE|MODEL))|DROP\s+(?:MATERIALIZED\s+)?VIEW|DROP\s+(?:SCHEMA|FUNCTION|PROCEDURE|MODEL)|CALL|GRANT|REVOKE|EXPORT\s+DATA|LOAD\s+DATA|BEGIN|START\s+TRANSACTION|COMMIT|ROLLBACK)\b`)
+	unsupportedMutationLeadPattern = regexp.MustCompile(`(?is)^\s*(ALTER\s+TABLE|CREATE\s+(?:OR\s+REPLACE\s+)?(?:TEMP(?:ORARY)?\s+TABLE|(?:TEMP(?:ORARY)?\s+)?(?:SCHEMA|FUNCTION|PROCEDURE|MODEL))|DROP\s+(?:SCHEMA|FUNCTION|PROCEDURE|MODEL)|CALL|GRANT|REVOKE|EXPORT\s+DATA|LOAD\s+DATA|BEGIN|START\s+TRANSACTION|COMMIT|ROLLBACK)\b`)
 )
 
 // parsePersistentSQLStatement recognizes catalog-mutating single statements.
@@ -96,7 +110,7 @@ func parsePersistentSQLStatement(projectID, queryText string) (persistentSQLStat
 		return out, true, nil
 	}
 	if persistentLeadPattern.MatchString(stmt) {
-		return persistentSQLStatement{}, true, fmt.Errorf("unsupported DDL/DML target syntax; use dataset.table or project.dataset.table, optionally enclosed in one pair of backticks")
+		return persistentSQLStatement{}, true, fmt.Errorf("unsupported DDL/DML target syntax; use dataset.table or project.dataset.table, with backticks either around the whole identifier or around each segment")
 	}
 	if unsupportedMutationLeadPattern.MatchString(stmt) {
 		return persistentSQLStatement{}, true, fmt.Errorf("unsupported persistent SQL statement; supported single-statement mutations are INSERT, UPDATE, DELETE, MERGE, TRUNCATE TABLE, CREATE [OR REPLACE] TABLE [AS SELECT], and DROP TABLE")
@@ -131,6 +145,9 @@ func trimLeadingSQLComments(queryText string) string {
 
 func parsePersistentTarget(defaultProjectID, raw string) (tableReference, error) {
 	parts := strings.Split(strings.TrimSpace(raw), ".")
+	for i, p := range parts {
+		parts[i] = strings.Trim(strings.TrimSpace(p), "`")
+	}
 	switch len(parts) {
 	case 2:
 		return tableReference{ProjectID: defaultProjectID, DatasetID: parts[0], TableID: parts[1]}, nil
@@ -139,6 +156,357 @@ func parsePersistentTarget(defaultProjectID, raw string) (tableReference, error)
 	default:
 		return tableReference{}, fmt.Errorf("invalid DDL/DML target %q: expected dataset.table or project.dataset.table", raw)
 	}
+}
+
+// persistentViewStatement is CREATE/DROP [MATERIALIZED] VIEW's parsed shape —
+// deliberately separate from persistentSQLStatement because a view is never
+// executed through the embedded SQL engine (googlesqlite has no concept of
+// this project's own view mechanism); it goes straight to the same
+// tables.insert-style validate-and-store path real BigQuery's REST
+// tables.insert with view.query already uses (see bigquery.go).
+type persistentViewStatement struct {
+	target       tableReference
+	materialized bool
+	orReplace    bool
+	ifNotExists  bool
+	ifExists     bool
+	drop         bool
+	selectBody   string
+}
+
+// parsePersistentViewStatement recognizes CREATE [OR REPLACE] [MATERIALIZED]
+// VIEW ... AS <select> and DROP [MATERIALIZED] VIEW, the two DDL forms real
+// tools (dbt's default "view" materialization, notably) emit that this
+// project previously rejected outright with "unsupported persistent SQL
+// statement" even though views are otherwise a real, supported resource via
+// REST. A trailing OPTIONS(...) clause between the target and AS is
+// recognized and discarded (bounded scope, declared explicitly: no field
+// inside it — description, labels, expiration — is applied), rather than
+// causing a parse failure.
+func parsePersistentViewStatement(projectID, queryText string) (persistentViewStatement, bool, error) {
+	stmt := trimLeadingSQLComments(queryText)
+	stmt = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(stmt), ";"))
+
+	if m := dropViewTargetPattern.FindStringSubmatch(stmt); m != nil {
+		target, err := parsePersistentTarget(projectID, m[3])
+		if err != nil {
+			return persistentViewStatement{}, true, err
+		}
+		return persistentViewStatement{
+			target:       target,
+			materialized: strings.TrimSpace(m[1]) != "",
+			ifExists:     strings.TrimSpace(m[2]) != "",
+			drop:         true,
+		}, true, nil
+	}
+
+	m := createViewTargetPattern.FindStringSubmatch(stmt)
+	if m == nil {
+		return persistentViewStatement{}, false, nil
+	}
+	target, err := parsePersistentTarget(projectID, m[4])
+	if err != nil {
+		return persistentViewStatement{}, true, err
+	}
+	rest := strings.TrimSpace(stmt[len(m[0]):])
+	rest = stripLeadingOptionsClause(rest)
+	asMatch := viewAsClausePattern.FindStringSubmatch(rest)
+	if asMatch == nil {
+		return persistentViewStatement{}, true, fmt.Errorf("invalid CREATE VIEW statement: expected AS <select> after the view name/options")
+	}
+	return persistentViewStatement{
+		target:       target,
+		materialized: strings.TrimSpace(m[2]) != "",
+		orReplace:    strings.TrimSpace(m[1]) != "",
+		ifNotExists:  strings.TrimSpace(m[3]) != "",
+		selectBody:   strings.TrimSpace(asMatch[1]),
+	}, true, nil
+}
+
+// stripLeadingOptionsClause removes a leading "OPTIONS(...)" clause (as
+// BigQuery's own CREATE VIEW syntax allows between the view name and AS),
+// matching parentheses by depth rather than a non-nesting regex so option
+// values that themselves contain parens (e.g. labels=[("k","v")]) don't
+// truncate the strip early. Returns text unchanged if it doesn't start with
+// OPTIONS(.
+func stripLeadingOptionsClause(text string) string {
+	const prefix = "options"
+	trimmed := strings.TrimSpace(text)
+	if len(trimmed) <= len(prefix) || !strings.EqualFold(trimmed[:len(prefix)], prefix) {
+		return text
+	}
+	rest := strings.TrimSpace(trimmed[len(prefix):])
+	if !strings.HasPrefix(rest, "(") {
+		return text
+	}
+	depth := 0
+	for i, r := range rest {
+		switch r {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return strings.TrimSpace(rest[i+1:])
+			}
+		}
+	}
+	return text
+}
+
+// executePersistentViewStatement runs a recognized CREATE/DROP [MATERIALIZED]
+// VIEW statement, reusing exactly the same schema-derivation/validation
+// tables.insert's view.query path already applies at REST creation time —
+// the query is executed once for real to both validate it and infer its
+// schema, never accepted as an unverifiable definition.
+func (s *Server) executePersistentViewStatement(projectID, queryText string, sess *sessionRecord) (persistentSQLResult, bool, error) {
+	stmt, handled, err := parsePersistentViewStatement(projectID, queryText)
+	if !handled || err != nil {
+		return persistentSQLResult{}, handled, err
+	}
+	if !strings.EqualFold(stmt.target.ProjectID, projectID) {
+		return persistentSQLResult{}, true, fmt.Errorf("cross-project DDL target %s.%s.%s is not supported", stmt.target.ProjectID, stmt.target.DatasetID, stmt.target.TableID)
+	}
+	if sess != nil && sess.inTransaction() {
+		return persistentSQLResult{}, true, fmt.Errorf("persistent DDL inside a session transaction is not supported yet; rollback or commit the transaction first")
+	}
+
+	statementType := "CREATE_VIEW"
+	if stmt.materialized {
+		statementType = "CREATE_MATERIALIZED_VIEW"
+	}
+	existing, exists, version := s.tables.get(projectID, stmt.target.DatasetID, stmt.target.TableID)
+
+	if stmt.drop {
+		statementType = "DROP_VIEW"
+		if stmt.materialized {
+			statementType = "DROP_MATERIALIZED_VIEW"
+		}
+		if !exists {
+			if stmt.ifExists {
+				return persistentSQLResult{schema: []tableField{}, rows: [][]string{}, statementType: statementType}, true, nil
+			}
+			return persistentSQLResult{}, true, fmt.Errorf("table not found: %s.%s", stmt.target.DatasetID, stmt.target.TableID)
+		}
+		if existing.View == nil {
+			return persistentSQLResult{}, true, fmt.Errorf("%s.%s is not a view", stmt.target.DatasetID, stmt.target.TableID)
+		}
+		if err := s.tables.deleteIfVersion(projectID, stmt.target.DatasetID, stmt.target.TableID, version); err != nil {
+			return persistentSQLResult{}, true, err
+		}
+		return persistentSQLResult{schema: []tableField{}, rows: [][]string{}, statementType: statementType}, true, nil
+	}
+
+	if exists && stmt.ifNotExists {
+		return persistentSQLResult{schema: []tableField{}, rows: [][]string{}, statementType: statementType}, true, nil
+	}
+	if exists && !stmt.orReplace {
+		return persistentSQLResult{}, true, fmt.Errorf("table already exists: %s.%s", stmt.target.DatasetID, stmt.target.TableID)
+	}
+	if !s.datasets.exists(projectID, stmt.target.DatasetID) {
+		return persistentSQLResult{}, true, fmt.Errorf("dataset not found: %s", stmt.target.DatasetID)
+	}
+
+	derivedSchema, _, err := s.executeRealSQLQuery(projectID, stmt.selectBody, nil)
+	if err != nil {
+		return persistentSQLResult{}, true, fmt.Errorf("invalid view query: %w", err)
+	}
+
+	if exists {
+		if err := s.tables.replaceViewIfVersion(projectID, stmt.target.DatasetID, stmt.target.TableID, version, derivedSchema, stmt.selectBody, stmt.materialized); err != nil {
+			return persistentSQLResult{}, true, err
+		}
+	} else {
+		insert := tableInsert{
+			ProjectID: projectID, DatasetID: stmt.target.DatasetID, TableID: stmt.target.TableID,
+			Schema: derivedSchema, View: &viewConfig{Query: stmt.selectBody, Materialized: stmt.materialized},
+		}
+		if _, created := s.tables.insert(insert); !created {
+			return persistentSQLResult{}, true, fmt.Errorf("table %s.%s was created concurrently; retry the statement", stmt.target.DatasetID, stmt.target.TableID)
+		}
+	}
+	return persistentSQLResult{schema: []tableField{}, rows: [][]string{}, statementType: statementType}, true, nil
+}
+
+// parseCreateSchemaStatement recognizes CREATE SCHEMA [IF NOT EXISTS]
+// dataset_id, split out from executePersistentCreateSchemaStatement so
+// computeQueryJobResultRows' early-poll mutating-statement guard can reuse
+// the exact same recognition rather than drifting from it.
+func parseCreateSchemaStatement(queryText string) (datasetID string, ifNotExists, handled bool) {
+	stmt := trimLeadingSQLComments(queryText)
+	stmt = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(stmt), ";"))
+	m := createSchemaTargetPattern.FindStringSubmatch(stmt)
+	if m == nil {
+		return "", false, false
+	}
+	return m[2], strings.TrimSpace(m[1]) != "", true
+}
+
+// executePersistentCreateSchemaStatement runs a recognized
+// CREATE SCHEMA [IF NOT EXISTS] dataset_id statement — real BigQuery's SQL
+// spelling of dataset creation, otherwise only reachable via the REST
+// datasets.insert call. SQLMesh's own state-store bootstrap (creating its
+// "sqlmesh" dataset) issues exactly this before this project supported it,
+// failing with the generic "unsupported persistent SQL statement" error.
+// Anything beyond the bare name — an OPTIONS(...) clause, DEFAULT COLLATE,
+// or CREATE SCHEMA without IF NOT EXISTS colliding with DROP SCHEMA support
+// — is intentionally left unhandled, falling through to the existing
+// unsupportedMutationLeadPattern rejection rather than silently accepted and
+// ignored.
+func (s *Server) executePersistentCreateSchemaStatement(projectID, queryText string) (persistentSQLResult, bool, error) {
+	datasetID, ifNotExists, handled := parseCreateSchemaStatement(queryText)
+	if !handled {
+		return persistentSQLResult{}, false, nil
+	}
+	if s.datasets.exists(projectID, datasetID) {
+		if ifNotExists {
+			return persistentSQLResult{schema: []tableField{}, rows: [][]string{}, statementType: "CREATE_SCHEMA"}, true, nil
+		}
+		return persistentSQLResult{}, true, fmt.Errorf("dataset already exists: %s", datasetID)
+	}
+	if _, created := s.datasets.insert(datasetInsert{ProjectID: projectID, DatasetID: datasetID}); !created {
+		return persistentSQLResult{}, true, fmt.Errorf("dataset %s was created concurrently; retry the statement", datasetID)
+	}
+	return persistentSQLResult{schema: []tableField{}, rows: [][]string{}, statementType: "CREATE_SCHEMA"}, true, nil
+}
+
+// alterTableAddColumnClause is one parsed "ADD COLUMN [IF NOT EXISTS] name
+// type" clause; ifNotExists means a column already present under that name
+// is silently kept as-is rather than rejected as a conflict.
+type alterTableAddColumnClause struct {
+	field       tableField
+	ifNotExists bool
+}
+
+// persistentAlterTableAddColumns is ALTER TABLE ADD COLUMN's parsed shape.
+// Only one or more comma-separated ADD COLUMN clauses naming a plain scalar
+// type are recognized — DROP COLUMN, RENAME COLUMN, ALTER COLUMN and SET
+// OPTIONS are explicitly out of scope and fall through to the existing
+// generic "ALTER TABLE" rejection rather than being silently ignored.
+type persistentAlterTableAddColumns struct {
+	target   tableReference
+	ifExists bool
+	clauses  []alterTableAddColumnClause
+}
+
+// parsePersistentAlterTableAddColumns recognizes
+// ALTER TABLE [IF EXISTS] target ADD COLUMN [IF NOT EXISTS] name type
+// [, ADD COLUMN ...] — real BigQuery DDL for schema evolution that SQLMesh's
+// own migration framework issues against its state tables, and that dbt's
+// "on_schema_change: append_new_columns" incremental setting issues against
+// user tables. A column type with parameters (e.g. STRING(10), NUMERIC(10,2))
+// or a STRUCT/ARRAY type is intentionally not accepted — a bounded scope
+// declared explicitly rather than mishandled.
+func parsePersistentAlterTableAddColumns(projectID, queryText string) (persistentAlterTableAddColumns, bool, error) {
+	stmt := trimLeadingSQLComments(queryText)
+	stmt = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(stmt), ";"))
+	m := alterTableTargetPattern.FindStringSubmatch(stmt)
+	if m == nil {
+		return persistentAlterTableAddColumns{}, false, nil
+	}
+	target, err := parsePersistentTarget(projectID, m[2])
+	if err != nil {
+		return persistentAlterTableAddColumns{}, true, err
+	}
+	var clauses []alterTableAddColumnClause
+	for _, clause := range strings.Split(m[3], ",") {
+		cm := addColumnClausePattern.FindStringSubmatch(strings.TrimSpace(clause))
+		if cm == nil {
+			return persistentAlterTableAddColumns{}, false, nil
+		}
+		clauses = append(clauses, alterTableAddColumnClause{
+			field: tableField{
+				Name: cm[2],
+				Type: normalizeAlterTableColumnType(cm[3]),
+				Mode: "NULLABLE",
+			},
+			ifNotExists: strings.TrimSpace(cm[1]) != "",
+		})
+	}
+	if len(clauses) == 0 {
+		return persistentAlterTableAddColumns{}, false, nil
+	}
+	return persistentAlterTableAddColumns{
+		target:   target,
+		ifExists: strings.TrimSpace(m[1]) != "",
+		clauses:  clauses,
+	}, true, nil
+}
+
+// normalizeAlterTableColumnType maps the handful of alternate spellings real
+// BigQuery DDL accepts as synonyms onto this project's canonical schema type
+// names; anything else passes through unchanged.
+func normalizeAlterTableColumnType(t string) string {
+	switch strings.ToUpper(t) {
+	case "BOOLEAN":
+		return "BOOL"
+	case "INTEGER":
+		return "INT64"
+	case "FLOAT":
+		return "FLOAT64"
+	default:
+		return strings.ToUpper(t)
+	}
+}
+
+// executePersistentAlterTableAddColumnsStatement runs a recognized
+// ALTER TABLE ADD COLUMN statement, appending the new nullable column(s) to
+// the table's schema and a NULL cell to every existing row — schema
+// evolution, not a full CREATE OR REPLACE, so partitioning/clustering/view
+// identity are left untouched (see tables_service.go's addColumnsIfVersion).
+func (s *Server) executePersistentAlterTableAddColumnsStatement(projectID, queryText string) (persistentSQLResult, bool, error) {
+	stmt, handled, err := parsePersistentAlterTableAddColumns(projectID, queryText)
+	if !handled || err != nil {
+		return persistentSQLResult{}, handled, err
+	}
+	if !strings.EqualFold(stmt.target.ProjectID, projectID) {
+		return persistentSQLResult{}, true, fmt.Errorf("cross-project DDL target %s.%s.%s is not supported", stmt.target.ProjectID, stmt.target.DatasetID, stmt.target.TableID)
+	}
+	existing, exists, version := s.tables.get(projectID, stmt.target.DatasetID, stmt.target.TableID)
+	if !exists {
+		if stmt.ifExists {
+			return persistentSQLResult{schema: []tableField{}, rows: [][]string{}, statementType: "ALTER_TABLE"}, true, nil
+		}
+		return persistentSQLResult{}, true, fmt.Errorf("table not found: %s.%s", stmt.target.DatasetID, stmt.target.TableID)
+	}
+	if existing.View != nil {
+		return persistentSQLResult{}, true, fmt.Errorf("ALTER TABLE target %s.%s is a view", stmt.target.DatasetID, stmt.target.TableID)
+	}
+	newFields, err := resolveAlterTableNewFields(existing.Schema, stmt.clauses)
+	if err != nil {
+		return persistentSQLResult{}, true, err
+	}
+	if len(newFields) == 0 {
+		return persistentSQLResult{schema: []tableField{}, rows: [][]string{}, statementType: "ALTER_TABLE"}, true, nil
+	}
+	if err := s.tables.addColumnsIfVersion(projectID, stmt.target.DatasetID, stmt.target.TableID, version, newFields); err != nil {
+		return persistentSQLResult{}, true, err
+	}
+	return persistentSQLResult{schema: []tableField{}, rows: [][]string{}, statementType: "ALTER_TABLE"}, true, nil
+}
+
+// resolveAlterTableNewFields filters each ADD COLUMN clause against the
+// table's current schema: a clause naming an already-present column is
+// dropped silently when it carries IF NOT EXISTS, or rejected otherwise.
+func resolveAlterTableNewFields(existingSchema []tableField, clauses []alterTableAddColumnClause) ([]tableField, error) {
+	newFields := make([]tableField, 0, len(clauses))
+	for _, clause := range clauses {
+		alreadyExists := false
+		for _, existingField := range existingSchema {
+			if strings.EqualFold(existingField.Name, clause.field.Name) {
+				alreadyExists = true
+				break
+			}
+		}
+		if alreadyExists {
+			if clause.ifNotExists {
+				continue
+			}
+			return nil, fmt.Errorf("column already exists: %s", clause.field.Name)
+		}
+		newFields = append(newFields, clause.field)
+	}
+	return newFields, nil
 }
 
 // executePersistentSQLStatement runs a recognized DDL/DML statement against
@@ -171,6 +539,9 @@ func (s *Server) executePersistentSQLStatement(projectID, queryText string, sess
 				return persistentSQLResult{schema: []tableField{}, rows: [][]string{}, statementType: stmt.statementType}, true, nil
 			}
 			return persistentSQLResult{}, true, fmt.Errorf("table not found: %s.%s", stmt.target.DatasetID, stmt.target.TableID)
+		}
+		if existing.View != nil {
+			return persistentSQLResult{}, true, fmt.Errorf("DROP TABLE target %s.%s is a view; use DROP VIEW", stmt.target.DatasetID, stmt.target.TableID)
 		}
 		if err := s.tables.deleteIfVersion(projectID, stmt.target.DatasetID, stmt.target.TableID, version); err != nil {
 			return persistentSQLResult{}, true, err
@@ -214,6 +585,16 @@ func (s *Server) executePersistentSQLStatement(projectID, queryText string, sess
 		engineStatement = addImplicitInsertColumns(engineStatement, existing.Schema)
 	}
 	engineStatement = rewriteIngestionPseudocolumns(engineStatement)
+	if stmt.statementType == "MERGE" {
+		rewritten, cleanup, mergeErr := s.rewriteMergeUsingSubquery(db, stmt.target.DatasetID, engineStatement)
+		if mergeErr != nil {
+			return persistentSQLResult{}, true, mergeErr
+		}
+		engineStatement = rewritten
+		if cleanup != nil {
+			defer cleanup()
+		}
+	}
 	result, err := db.Exec(engineStatement, args...)
 	if err != nil {
 		return persistentSQLResult{}, true, err

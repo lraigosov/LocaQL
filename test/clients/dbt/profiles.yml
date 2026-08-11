@@ -1,0 +1,11 @@
+locaql_conformance:
+  target: dev
+  outputs:
+    dev:
+      type: bigquery
+      method: oauth-secrets
+      token: locaql-fake-token
+      project: p1
+      dataset: analytics
+      api_endpoint: "{{ env_var('LOCAQL_ENDPOINT', 'http://127.0.0.1:19130') }}"
+      threads: 1

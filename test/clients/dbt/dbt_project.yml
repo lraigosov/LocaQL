@@ -1,0 +1,4 @@
+name: locaql_conformance
+version: "1.0.0"
+profile: locaql_conformance
+model-paths: ["models"]

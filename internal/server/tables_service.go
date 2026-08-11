@@ -529,6 +529,71 @@ func (s *tableService) replaceTableIfVersion(projectID, datasetID, tableID strin
 	return nil
 }
 
+// replaceViewIfVersion commits CREATE OR REPLACE [MATERIALIZED] VIEW over an
+// existing resource (of any kind — managed table, external table, or another
+// view), mirroring replaceTableIfVersion's "DDL replaces the whole
+// definition" semantics but for a view/materialized-view identity: the
+// derived schema replaces the old one and any previous data/external/
+// partitioning identity is cleared, matching real BigQuery's own "OR REPLACE
+// changes the resource kind" behavior.
+func (s *tableService) replaceViewIfVersion(projectID, datasetID, tableID string, expectedVersion int, schema []tableField, query string, materialized bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tables := s.ensureDatasetLocked(projectID, datasetID)
+	t := tables[tableID]
+	if t == nil {
+		return fmt.Errorf("table not found: %s.%s", datasetID, tableID)
+	}
+	if t.Version != expectedVersion {
+		return fmt.Errorf("table %s.%s changed concurrently; retry the statement", datasetID, tableID)
+	}
+	t.Schema = cloneTableFields(schema)
+	t.Rows = nil
+	t.View = &viewConfig{Query: query, Materialized: materialized}
+	t.External = nil
+	t.TimePartitioning = nil
+	t.RangePartitioning = nil
+	t.Clustering = nil
+	t.RequirePartitionFilter = false
+	t.IngestionPartitions = nil
+	t.UpdatedAt = s.now().UTC()
+	t.Version++
+	s.datasetVersions[s.datasetKey(projectID, datasetID)]++
+	return nil
+}
+
+// addColumnsIfVersion commits ALTER TABLE ADD COLUMN: unlike
+// replaceTableIfVersion/replaceViewIfVersion, this is additive schema
+// evolution, not a full redefinition, so partitioning, clustering, view
+// identity and every other attribute besides Schema/Rows are left exactly as
+// they were. newFields must not already exist on the table's schema — the
+// caller (executePersistentAlterTableAddColumnsStatement) checks that.
+func (s *tableService) addColumnsIfVersion(projectID, datasetID, tableID string, expectedVersion int, newFields []tableField) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tables := s.ensureDatasetLocked(projectID, datasetID)
+	t := tables[tableID]
+	if t == nil {
+		return fmt.Errorf("table not found: %s.%s", datasetID, tableID)
+	}
+	if t.Version != expectedVersion {
+		return fmt.Errorf("table %s.%s changed concurrently; retry the statement", datasetID, tableID)
+	}
+	t.Schema = append(cloneTableFields(t.Schema), cloneTableFields(newFields)...)
+	for i, row := range t.Rows {
+		for range newFields {
+			row = append(row, storedNullCell)
+		}
+		t.Rows[i] = row
+	}
+	t.UpdatedAt = s.now().UTC()
+	t.Version++
+	s.datasetVersions[s.datasetKey(projectID, datasetID)]++
+	return nil
+}
+
 func (s *tableService) upsertCopyDestination(dest tableReference, schema []tableField, rows [][]string, createDisposition, writeDisposition string) (int, error) {
 	projectID := strings.TrimSpace(dest.ProjectID)
 	datasetID := strings.TrimSpace(dest.DatasetID)
