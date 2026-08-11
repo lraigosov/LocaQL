@@ -21,8 +21,8 @@ jobs:
     name: Sustained load against locaql start --self-restart
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
 
@@ -63,7 +63,7 @@ jobs:
         if: always()
         run: grep -E "exited unexpectedly|restart" /tmp/locaql-soak.log || echo "no restarts observed this run (the crash is not deterministic — see docs/benchmarks.md)"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: soak-report
