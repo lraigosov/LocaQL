@@ -1789,7 +1789,7 @@ func (s *Server) computeQueryJobResultRows(projectID string, j *jobRecord) ([]ta
 	_, mutating, _ := parsePersistentSQLStatement(projectID, j.QueryText)
 	_, viewMutating, _ := parsePersistentViewStatement(projectID, j.QueryText)
 	_, _, createSchemaMutating := parseCreateSchemaStatement(j.QueryText)
-	_, alterTableMutating, _ := parsePersistentAlterTableAddColumns(projectID, j.QueryText)
+	alterTableMutating := isPersistentAlterTableStatement(projectID, j.QueryText)
 	trimmedQuery := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(j.QueryText), ";"))
 	sessionControl := sessionBeginPattern.MatchString(trimmedQuery) || sessionCommitPattern.MatchString(trimmedQuery) || sessionRollbackPattern.MatchString(trimmedQuery) || sessionCreateTempTablePattern.MatchString(trimmedQuery)
 	if mutating || viewMutating || createSchemaMutating || alterTableMutating || sessionControl {
@@ -1888,7 +1888,7 @@ func (s *Server) executeQueryStatement(projectID, sessionID, queryText, callingU
 	if result, handled, err := s.executePersistentCreateSchemaStatement(projectID, trimmed); handled {
 		return result, err
 	}
-	if result, handled, err := s.executePersistentAlterTableAddColumnsStatement(projectID, trimmed); handled {
+	if result, handled, err := s.executePersistentAlterTableStatement(projectID, trimmed); handled {
 		return result, err
 	}
 	if result, handled, err := s.executePersistentSQLStatement(projectID, trimmed, sess, paramMode, params); handled {

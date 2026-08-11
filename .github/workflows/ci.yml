@@ -261,6 +261,42 @@ jobs:
           done
           (cd test/clients/ruby && bundle exec ruby persistent_ddl_dml.rb --endpoint=http://127.0.0.1:19055)
 
+  php-client:
+    name: Official PHP client (BigQuery)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+          extensions: curl, mbstring, dom, xml, bcmath
+      - name: Install the pinned official client
+        run: composer install --no-interaction --no-progress
+        working-directory: test/clients/php
+      - name: Exercise persistent SQL mutations and streaming inserts
+        run: |
+          go build -o /tmp/locaql-php-client-server ./cmd/locaql
+          /tmp/locaql-php-client-server start \
+            --addr 127.0.0.1:19058 \
+            --storage-grpc-addr 127.0.0.1:19068 \
+            --capabilities "$PWD/capabilities/registry.yaml" &
+          server_pid=$!
+          trap 'kill "$server_pid"' EXIT
+          for attempt in $(seq 1 40); do
+            if curl --fail --silent http://127.0.0.1:19058/_emulator/health >/dev/null; then
+              break
+            fi
+            if [ "$attempt" -eq 40 ]; then
+              echo "LocaQL did not become healthy" >&2
+              exit 1
+            fi
+            sleep 0.25
+          done
+          php test/clients/php/persistent_ddl_dml.php --endpoint=http://127.0.0.1:19058
+
   dbt-client:
     name: Official dbt-bigquery adapter
     runs-on: ubuntu-latest

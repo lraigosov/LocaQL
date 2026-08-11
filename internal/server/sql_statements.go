@@ -56,6 +56,10 @@ var (
 	createSchemaTargetPattern      = regexp.MustCompile("(?is)^\\s*CREATE\\s+SCHEMA\\s+(IF\\s+NOT\\s+EXISTS\\s+)?`?([A-Za-z0-9_-]+)`?\\s*$")
 	alterTableTargetPattern        = regexp.MustCompile("(?is)^\\s*ALTER\\s+TABLE\\s+(IF\\s+EXISTS\\s+)?" + persistentTargetExpression + "\\s+(.+)$")
 	addColumnClausePattern         = regexp.MustCompile("(?is)^ADD\\s+COLUMN\\s+(IF\\s+NOT\\s+EXISTS\\s+)?`?([A-Za-z_][A-Za-z0-9_]*)`?\\s+([A-Za-z][A-Za-z0-9_]*)$")
+	dropColumnClausePattern        = regexp.MustCompile("(?is)^DROP\\s+COLUMN\\s+(IF\\s+EXISTS\\s+)?`?([A-Za-z_][A-Za-z0-9_]*)`?$")
+	renameColumnClausePattern      = regexp.MustCompile("(?is)^RENAME\\s+COLUMN\\s+(IF\\s+EXISTS\\s+)?`?([A-Za-z_][A-Za-z0-9_]*)`?\\s+TO\\s+`?([A-Za-z_][A-Za-z0-9_]*)`?$")
+	renameTableToPattern           = regexp.MustCompile("(?is)^RENAME\\s+TO\\s+`?([A-Za-z0-9_-]+)`?$")
+	setOptionsLeadPattern          = regexp.MustCompile(`(?is)^SET\s+OPTIONS\s*\(`)
 	persistentLeadPattern          = regexp.MustCompile(`(?is)^\s*(INSERT|UPDATE|DELETE|MERGE|TRUNCATE|CREATE\s+(?:OR\s+REPLACE\s+)?TABLE|DROP\s+TABLE)\b`)
 	unsupportedMutationLeadPattern = regexp.MustCompile(`(?is)^\s*(ALTER\s+TABLE|CREATE\s+(?:OR\s+REPLACE\s+)?(?:TEMP(?:ORARY)?\s+TABLE|(?:TEMP(?:ORARY)?\s+)?(?:SCHEMA|FUNCTION|PROCEDURE|MODEL))|DROP\s+(?:SCHEMA|FUNCTION|PROCEDURE|MODEL)|CALL|GRANT|REVOKE|EXPORT\s+DATA|LOAD\s+DATA|BEGIN|START\s+TRANSACTION|COMMIT|ROLLBACK)\b`)
 )
@@ -373,6 +377,38 @@ func (s *Server) executePersistentCreateSchemaStatement(projectID, queryText str
 // alterTableAddColumnClause is one parsed "ADD COLUMN [IF NOT EXISTS] name
 // type" clause; ifNotExists means a column already present under that name
 // is silently kept as-is rather than rejected as a conflict.
+// alterTableLead is the shared "target" prefix of every ALTER TABLE action
+// this project recognizes (ADD/DROP/RENAME COLUMN, RENAME TO, SET OPTIONS)
+// — factored out so each action-specific parser below only deals with its
+// own action grammar, not target/IF EXISTS parsing repeated for each one.
+// Real BigQuery grammar allows several actions comma-separated in a single
+// ALTER TABLE; that compound form is intentionally not supported here — one
+// action kind per statement — and falls through to the generic unsupported-
+// ALTER-TABLE rejection like any other unrecognized shape.
+type alterTableLead struct {
+	target   tableReference
+	ifExists bool
+	rest     string
+}
+
+func matchAlterTableLead(projectID, queryText string) (alterTableLead, bool, error) {
+	stmt := trimLeadingSQLComments(queryText)
+	stmt = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(stmt), ";"))
+	m := alterTableTargetPattern.FindStringSubmatch(stmt)
+	if m == nil {
+		return alterTableLead{}, false, nil
+	}
+	target, err := parsePersistentTarget(projectID, m[2])
+	if err != nil {
+		return alterTableLead{}, true, err
+	}
+	return alterTableLead{
+		target:   target,
+		ifExists: strings.TrimSpace(m[1]) != "",
+		rest:     strings.TrimSpace(m[3]),
+	}, true, nil
+}
+
 type alterTableAddColumnClause struct {
 	field       tableField
 	ifNotExists bool
@@ -380,9 +416,9 @@ type alterTableAddColumnClause struct {
 
 // persistentAlterTableAddColumns is ALTER TABLE ADD COLUMN's parsed shape.
 // Only one or more comma-separated ADD COLUMN clauses naming a plain scalar
-// type are recognized — DROP COLUMN, RENAME COLUMN, ALTER COLUMN and SET
-// OPTIONS are explicitly out of scope and fall through to the existing
-// generic "ALTER TABLE" rejection rather than being silently ignored.
+// type are recognized — ALTER COLUMN is the one action this project has no
+// support for at all (see the sibling parsers below for DROP/RENAME COLUMN,
+// RENAME TO and SET OPTIONS).
 type persistentAlterTableAddColumns struct {
 	target   tableReference
 	ifExists bool
@@ -398,18 +434,12 @@ type persistentAlterTableAddColumns struct {
 // or a STRUCT/ARRAY type is intentionally not accepted — a bounded scope
 // declared explicitly rather than mishandled.
 func parsePersistentAlterTableAddColumns(projectID, queryText string) (persistentAlterTableAddColumns, bool, error) {
-	stmt := trimLeadingSQLComments(queryText)
-	stmt = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(stmt), ";"))
-	m := alterTableTargetPattern.FindStringSubmatch(stmt)
-	if m == nil {
-		return persistentAlterTableAddColumns{}, false, nil
-	}
-	target, err := parsePersistentTarget(projectID, m[2])
-	if err != nil {
-		return persistentAlterTableAddColumns{}, true, err
+	lead, handled, err := matchAlterTableLead(projectID, queryText)
+	if !handled || err != nil {
+		return persistentAlterTableAddColumns{}, handled, err
 	}
 	var clauses []alterTableAddColumnClause
-	for _, clause := range strings.Split(m[3], ",") {
+	for _, clause := range strings.Split(lead.rest, ",") {
 		cm := addColumnClausePattern.FindStringSubmatch(strings.TrimSpace(clause))
 		if cm == nil {
 			return persistentAlterTableAddColumns{}, false, nil
@@ -427,10 +457,134 @@ func parsePersistentAlterTableAddColumns(projectID, queryText string) (persisten
 		return persistentAlterTableAddColumns{}, false, nil
 	}
 	return persistentAlterTableAddColumns{
-		target:   target,
-		ifExists: strings.TrimSpace(m[1]) != "",
+		target:   lead.target,
+		ifExists: lead.ifExists,
 		clauses:  clauses,
 	}, true, nil
+}
+
+type alterTableDropColumnClause struct {
+	name     string
+	ifExists bool
+}
+
+type persistentAlterTableDropColumns struct {
+	target   tableReference
+	ifExists bool
+	clauses  []alterTableDropColumnClause
+}
+
+// parsePersistentAlterTableDropColumns recognizes
+// ALTER TABLE [IF EXISTS] target DROP COLUMN [IF EXISTS] name [, DROP COLUMN ...].
+func parsePersistentAlterTableDropColumns(projectID, queryText string) (persistentAlterTableDropColumns, bool, error) {
+	lead, handled, err := matchAlterTableLead(projectID, queryText)
+	if !handled || err != nil {
+		return persistentAlterTableDropColumns{}, handled, err
+	}
+	var clauses []alterTableDropColumnClause
+	for _, clause := range strings.Split(lead.rest, ",") {
+		cm := dropColumnClausePattern.FindStringSubmatch(strings.TrimSpace(clause))
+		if cm == nil {
+			return persistentAlterTableDropColumns{}, false, nil
+		}
+		clauses = append(clauses, alterTableDropColumnClause{
+			name:     cm[2],
+			ifExists: strings.TrimSpace(cm[1]) != "",
+		})
+	}
+	if len(clauses) == 0 {
+		return persistentAlterTableDropColumns{}, false, nil
+	}
+	return persistentAlterTableDropColumns{target: lead.target, ifExists: lead.ifExists, clauses: clauses}, true, nil
+}
+
+type alterTableRenameColumnClause struct {
+	oldName  string
+	newName  string
+	ifExists bool
+}
+
+type persistentAlterTableRenameColumns struct {
+	target   tableReference
+	ifExists bool
+	clauses  []alterTableRenameColumnClause
+}
+
+// parsePersistentAlterTableRenameColumns recognizes
+// ALTER TABLE [IF EXISTS] target RENAME COLUMN [IF EXISTS] old TO new
+// [, RENAME COLUMN ...].
+func parsePersistentAlterTableRenameColumns(projectID, queryText string) (persistentAlterTableRenameColumns, bool, error) {
+	lead, handled, err := matchAlterTableLead(projectID, queryText)
+	if !handled || err != nil {
+		return persistentAlterTableRenameColumns{}, handled, err
+	}
+	var clauses []alterTableRenameColumnClause
+	for _, clause := range strings.Split(lead.rest, ",") {
+		cm := renameColumnClausePattern.FindStringSubmatch(strings.TrimSpace(clause))
+		if cm == nil {
+			return persistentAlterTableRenameColumns{}, false, nil
+		}
+		clauses = append(clauses, alterTableRenameColumnClause{
+			ifExists: strings.TrimSpace(cm[1]) != "",
+			oldName:  cm[2],
+			newName:  cm[3],
+		})
+	}
+	if len(clauses) == 0 {
+		return persistentAlterTableRenameColumns{}, false, nil
+	}
+	return persistentAlterTableRenameColumns{target: lead.target, ifExists: lead.ifExists, clauses: clauses}, true, nil
+}
+
+type persistentAlterTableRenameTo struct {
+	target     tableReference
+	ifExists   bool
+	newTableID string
+}
+
+// parsePersistentAlterTableRenameTo recognizes
+// ALTER TABLE [IF EXISTS] target RENAME TO new_table_name — a single action,
+// not a comma-separated clause list like the column-level actions above.
+func parsePersistentAlterTableRenameTo(projectID, queryText string) (persistentAlterTableRenameTo, bool, error) {
+	lead, handled, err := matchAlterTableLead(projectID, queryText)
+	if !handled || err != nil {
+		return persistentAlterTableRenameTo{}, handled, err
+	}
+	m := renameTableToPattern.FindStringSubmatch(lead.rest)
+	if m == nil {
+		return persistentAlterTableRenameTo{}, false, nil
+	}
+	return persistentAlterTableRenameTo{target: lead.target, ifExists: lead.ifExists, newTableID: m[1]}, true, nil
+}
+
+type persistentAlterTableSetOptions struct {
+	target   tableReference
+	ifExists bool
+}
+
+// parsePersistentAlterTableSetOptions recognizes
+// ALTER TABLE [IF EXISTS] target SET OPTIONS(...) — the option key/value
+// pairs are matched (balanced-paren, so a value containing its own parens
+// doesn't truncate the match early) and discarded entirely, the same
+// declared-bounded-scope treatment CREATE VIEW's own OPTIONS(...) clause
+// already gets (see stripLeadingOptionsClause): no field inside it
+// (description, labels, expiration, ...) is applied to the table.
+func parsePersistentAlterTableSetOptions(projectID, queryText string) (persistentAlterTableSetOptions, bool, error) {
+	lead, handled, err := matchAlterTableLead(projectID, queryText)
+	if !handled || err != nil {
+		return persistentAlterTableSetOptions{}, handled, err
+	}
+	if !setOptionsLeadPattern.MatchString(lead.rest) {
+		return persistentAlterTableSetOptions{}, false, nil
+	}
+	afterSet := strings.TrimSpace(lead.rest[len("SET"):])
+	remainder := stripLeadingOptionsClause(afterSet)
+	if strings.TrimSpace(remainder) != "" {
+		// Trailing text after the OPTIONS(...) clause is not part of this
+		// project's bounded grammar for it.
+		return persistentAlterTableSetOptions{}, false, nil
+	}
+	return persistentAlterTableSetOptions{target: lead.target, ifExists: lead.ifExists}, true, nil
 }
 
 // normalizeAlterTableColumnType maps the handful of alternate spellings real
@@ -507,6 +661,219 @@ func resolveAlterTableNewFields(existingSchema []tableField, clauses []alterTabl
 		newFields = append(newFields, clause.field)
 	}
 	return newFields, nil
+}
+
+// resolveAlterTableDropNames filters each DROP COLUMN clause against the
+// table's current schema: a clause naming a column that isn't present is
+// dropped silently when it carries IF EXISTS, or rejected otherwise.
+func resolveAlterTableDropNames(existingSchema []tableField, clauses []alterTableDropColumnClause) ([]string, error) {
+	dropNames := make([]string, 0, len(clauses))
+	for _, clause := range clauses {
+		found := false
+		for _, existingField := range existingSchema {
+			if strings.EqualFold(existingField.Name, clause.name) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			if clause.ifExists {
+				continue
+			}
+			return nil, fmt.Errorf("column not found: %s", clause.name)
+		}
+		dropNames = append(dropNames, clause.name)
+	}
+	return dropNames, nil
+}
+
+// resolveAlterTableRenames filters each RENAME COLUMN clause against the
+// table's current schema: a clause whose old name isn't present is dropped
+// silently when it carries IF EXISTS, or rejected otherwise; a clause whose
+// new name already exists on the table is always rejected, IF EXISTS or not.
+func resolveAlterTableRenames(existingSchema []tableField, clauses []alterTableRenameColumnClause) (map[string]string, error) {
+	renames := make(map[string]string, len(clauses))
+	for _, clause := range clauses {
+		found := false
+		for _, existingField := range existingSchema {
+			if strings.EqualFold(existingField.Name, clause.newName) {
+				return nil, fmt.Errorf("column already exists: %s", clause.newName)
+			}
+			if strings.EqualFold(existingField.Name, clause.oldName) {
+				found = true
+			}
+		}
+		if !found {
+			if clause.ifExists {
+				continue
+			}
+			return nil, fmt.Errorf("column not found: %s", clause.oldName)
+		}
+		renames[clause.oldName] = clause.newName
+	}
+	return renames, nil
+}
+
+// isPersistentAlterTableStatement reports whether queryText matches ANY of
+// this project's recognized ALTER TABLE actions (ADD/DROP/RENAME COLUMN,
+// RENAME TO, SET OPTIONS) — used by computeQueryJobResultRows' early-poll
+// guard, which must recognize every one of them, not just ADD COLUMN, or the
+// same "a getQueryResults poll re-runs a pending mutation early" race this
+// project already fixed once for CREATE VIEW would reopen for whichever
+// ALTER TABLE variant got missed.
+func isPersistentAlterTableStatement(projectID, queryText string) bool {
+	if _, handled, _ := parsePersistentAlterTableAddColumns(projectID, queryText); handled {
+		return true
+	}
+	if _, handled, _ := parsePersistentAlterTableDropColumns(projectID, queryText); handled {
+		return true
+	}
+	if _, handled, _ := parsePersistentAlterTableRenameColumns(projectID, queryText); handled {
+		return true
+	}
+	if _, handled, _ := parsePersistentAlterTableRenameTo(projectID, queryText); handled {
+		return true
+	}
+	_, handled, _ := parsePersistentAlterTableSetOptions(projectID, queryText)
+	return handled
+}
+
+// executePersistentAlterTableStatement is ALTER TABLE's single entry point,
+// trying each action-specific parser in turn (ADD COLUMN, DROP COLUMN,
+// RENAME COLUMN, RENAME TO, SET OPTIONS) and dispatching to whichever one
+// actually recognizes the statement. An ALTER TABLE that matches none of
+// them (ALTER COLUMN, a compound multi-action statement, or any other
+// shape) returns handled=false, falling through to the generic
+// unsupported-ALTER-TABLE rejection in executePersistentSQLStatement.
+func (s *Server) executePersistentAlterTableStatement(projectID, queryText string) (persistentSQLResult, bool, error) {
+	if result, handled, err := s.executePersistentAlterTableAddColumnsStatement(projectID, queryText); handled {
+		return result, true, err
+	}
+	if result, handled, err := s.executePersistentAlterTableDropColumnsStatement(projectID, queryText); handled {
+		return result, true, err
+	}
+	if result, handled, err := s.executePersistentAlterTableRenameColumnsStatement(projectID, queryText); handled {
+		return result, true, err
+	}
+	if result, handled, err := s.executePersistentAlterTableRenameToStatement(projectID, queryText); handled {
+		return result, true, err
+	}
+	return s.executePersistentAlterTableSetOptionsStatement(projectID, queryText)
+}
+
+// executePersistentAlterTableDropColumnsStatement runs a recognized
+// ALTER TABLE DROP COLUMN statement: removes the named column(s) from the
+// table's schema and the corresponding cell from every existing row.
+func (s *Server) executePersistentAlterTableDropColumnsStatement(projectID, queryText string) (persistentSQLResult, bool, error) {
+	stmt, handled, err := parsePersistentAlterTableDropColumns(projectID, queryText)
+	if !handled || err != nil {
+		return persistentSQLResult{}, handled, err
+	}
+	if !strings.EqualFold(stmt.target.ProjectID, projectID) {
+		return persistentSQLResult{}, true, fmt.Errorf("cross-project DDL target %s.%s.%s is not supported", stmt.target.ProjectID, stmt.target.DatasetID, stmt.target.TableID)
+	}
+	existing, exists, version := s.tables.get(projectID, stmt.target.DatasetID, stmt.target.TableID)
+	if !exists {
+		if stmt.ifExists {
+			return persistentSQLResult{schema: []tableField{}, rows: [][]string{}, statementType: "ALTER_TABLE"}, true, nil
+		}
+		return persistentSQLResult{}, true, fmt.Errorf("table not found: %s.%s", stmt.target.DatasetID, stmt.target.TableID)
+	}
+	if existing.View != nil {
+		return persistentSQLResult{}, true, fmt.Errorf("ALTER TABLE target %s.%s is a view", stmt.target.DatasetID, stmt.target.TableID)
+	}
+	dropNames, err := resolveAlterTableDropNames(existing.Schema, stmt.clauses)
+	if err != nil {
+		return persistentSQLResult{}, true, err
+	}
+	if len(dropNames) == 0 {
+		return persistentSQLResult{schema: []tableField{}, rows: [][]string{}, statementType: "ALTER_TABLE"}, true, nil
+	}
+	if err := s.tables.dropColumnsIfVersion(projectID, stmt.target.DatasetID, stmt.target.TableID, version, dropNames); err != nil {
+		return persistentSQLResult{}, true, err
+	}
+	return persistentSQLResult{schema: []tableField{}, rows: [][]string{}, statementType: "ALTER_TABLE"}, true, nil
+}
+
+// executePersistentAlterTableRenameColumnsStatement runs a recognized
+// ALTER TABLE RENAME COLUMN statement: only the schema field's Name changes,
+// since renaming never moves data between columns.
+func (s *Server) executePersistentAlterTableRenameColumnsStatement(projectID, queryText string) (persistentSQLResult, bool, error) {
+	stmt, handled, err := parsePersistentAlterTableRenameColumns(projectID, queryText)
+	if !handled || err != nil {
+		return persistentSQLResult{}, handled, err
+	}
+	if !strings.EqualFold(stmt.target.ProjectID, projectID) {
+		return persistentSQLResult{}, true, fmt.Errorf("cross-project DDL target %s.%s.%s is not supported", stmt.target.ProjectID, stmt.target.DatasetID, stmt.target.TableID)
+	}
+	existing, exists, version := s.tables.get(projectID, stmt.target.DatasetID, stmt.target.TableID)
+	if !exists {
+		if stmt.ifExists {
+			return persistentSQLResult{schema: []tableField{}, rows: [][]string{}, statementType: "ALTER_TABLE"}, true, nil
+		}
+		return persistentSQLResult{}, true, fmt.Errorf("table not found: %s.%s", stmt.target.DatasetID, stmt.target.TableID)
+	}
+	if existing.View != nil {
+		return persistentSQLResult{}, true, fmt.Errorf("ALTER TABLE target %s.%s is a view", stmt.target.DatasetID, stmt.target.TableID)
+	}
+	renames, err := resolveAlterTableRenames(existing.Schema, stmt.clauses)
+	if err != nil {
+		return persistentSQLResult{}, true, err
+	}
+	if len(renames) == 0 {
+		return persistentSQLResult{schema: []tableField{}, rows: [][]string{}, statementType: "ALTER_TABLE"}, true, nil
+	}
+	if err := s.tables.renameColumnsIfVersion(projectID, stmt.target.DatasetID, stmt.target.TableID, version, renames); err != nil {
+		return persistentSQLResult{}, true, err
+	}
+	return persistentSQLResult{schema: []tableField{}, rows: [][]string{}, statementType: "ALTER_TABLE"}, true, nil
+}
+
+// executePersistentAlterTableRenameToStatement runs a recognized
+// ALTER TABLE RENAME TO statement: the table moves to a new name within the
+// same dataset, keeping its schema/rows/partitioning/view identity intact.
+func (s *Server) executePersistentAlterTableRenameToStatement(projectID, queryText string) (persistentSQLResult, bool, error) {
+	stmt, handled, err := parsePersistentAlterTableRenameTo(projectID, queryText)
+	if !handled || err != nil {
+		return persistentSQLResult{}, handled, err
+	}
+	if !strings.EqualFold(stmt.target.ProjectID, projectID) {
+		return persistentSQLResult{}, true, fmt.Errorf("cross-project DDL target %s.%s.%s is not supported", stmt.target.ProjectID, stmt.target.DatasetID, stmt.target.TableID)
+	}
+	_, exists, version := s.tables.get(projectID, stmt.target.DatasetID, stmt.target.TableID)
+	if !exists {
+		if stmt.ifExists {
+			return persistentSQLResult{schema: []tableField{}, rows: [][]string{}, statementType: "ALTER_TABLE"}, true, nil
+		}
+		return persistentSQLResult{}, true, fmt.Errorf("table not found: %s.%s", stmt.target.DatasetID, stmt.target.TableID)
+	}
+	if err := s.tables.renameTableIfVersion(projectID, stmt.target.DatasetID, stmt.target.TableID, stmt.newTableID, version); err != nil {
+		return persistentSQLResult{}, true, err
+	}
+	return persistentSQLResult{schema: []tableField{}, rows: [][]string{}, statementType: "ALTER_TABLE"}, true, nil
+}
+
+// executePersistentAlterTableSetOptionsStatement runs a recognized
+// ALTER TABLE SET OPTIONS statement. The options themselves are parsed and
+// discarded (see parsePersistentAlterTableSetOptions); the only real effect
+// is validating the target exists, matching the "syntax accepted, bounded
+// scope declared" treatment already used for CREATE VIEW's own OPTIONS(...).
+func (s *Server) executePersistentAlterTableSetOptionsStatement(projectID, queryText string) (persistentSQLResult, bool, error) {
+	stmt, handled, err := parsePersistentAlterTableSetOptions(projectID, queryText)
+	if !handled || err != nil {
+		return persistentSQLResult{}, handled, err
+	}
+	if !strings.EqualFold(stmt.target.ProjectID, projectID) {
+		return persistentSQLResult{}, true, fmt.Errorf("cross-project DDL target %s.%s.%s is not supported", stmt.target.ProjectID, stmt.target.DatasetID, stmt.target.TableID)
+	}
+	_, exists, _ := s.tables.get(projectID, stmt.target.DatasetID, stmt.target.TableID)
+	if !exists {
+		if stmt.ifExists {
+			return persistentSQLResult{schema: []tableField{}, rows: [][]string{}, statementType: "ALTER_TABLE"}, true, nil
+		}
+		return persistentSQLResult{}, true, fmt.Errorf("table not found: %s.%s", stmt.target.DatasetID, stmt.target.TableID)
+	}
+	return persistentSQLResult{schema: []tableField{}, rows: [][]string{}, statementType: "ALTER_TABLE"}, true, nil
 }
 
 // executePersistentSQLStatement runs a recognized DDL/DML statement against
