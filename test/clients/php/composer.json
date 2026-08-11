@@ -1,0 +1,9 @@
+{
+    "name": "locaql/php-client-conformance",
+    "description": "Official google/cloud-bigquery smoke test against LocaQL, pinned for reproducible CI runs.",
+    "type": "project",
+    "license": "proprietary",
+    "require": {
+        "google/cloud-bigquery": "^1.39"
+    }
+}
