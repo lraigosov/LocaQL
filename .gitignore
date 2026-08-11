@@ -48,3 +48,4 @@ test/clients/java/target/
 /locaql
 /locaql-ui
 /locaql-bench
+test/clients/dbt/target/

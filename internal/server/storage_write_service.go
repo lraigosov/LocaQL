@@ -11,6 +11,7 @@ import (
 	"time"
 
 	storagepb "cloud.google.com/go/bigquery/storage/apiv1/storagepb"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
@@ -376,6 +377,46 @@ func protoScalarValueToString(kind protoreflect.Kind, v protoreflect.Value) stri
 	}
 }
 
+// decodeProtoRows unmarshals AppendRowsRequest.ProtoRows' serialized rows
+// against msgDesc and converts each to a stored row, matched by column name.
+// A row that fails to unmarshal or convert is reported as a RowError at its
+// original index rather than failing the whole batch — matching real
+// BigQuery's own per-row error model for proto_rows.
+func decodeProtoRows(protoData *storagepb.AppendRowsRequest_ProtoData, msgDesc protoreflect.MessageDescriptor, fields []tableField) ([][]string, []*storagepb.RowError) {
+	serializedRows := protoData.GetRows().GetSerializedRows()
+	rows := make([][]string, 0, len(serializedRows))
+	var rowErrors []*storagepb.RowError
+	for i, raw := range serializedRows {
+		msg := dynamicpb.NewMessage(msgDesc)
+		if unmarshalErr := proto.Unmarshal(raw, msg); unmarshalErr != nil {
+			rowErrors = append(rowErrors, &storagepb.RowError{Index: int64(i), Message: unmarshalErr.Error()})
+			continue
+		}
+		row, convErr := protoMessageToRow(msg, fields)
+		if convErr != nil {
+			rowErrors = append(rowErrors, &storagepb.RowError{Index: int64(i), Message: convErr.Error()})
+			continue
+		}
+		rows = append(rows, row)
+	}
+	return rows, rowErrors
+}
+
+// decodeArrowAppendRows decodes AppendRowsRequest.ArrowRows' serialized
+// record batch against its writer schema and converts it to stored rows.
+// Unlike proto_rows, a decode failure here fails the whole batch rather than
+// reporting per-row errors: Arrow's columnar layout means a malformed batch
+// (a type mismatch, a missing REQUIRED column) is a property of the whole
+// batch, not an individual row.
+func decodeArrowAppendRows(schemaBytes []byte, batch *storagepb.ArrowRecordBatch, fields []tableField) ([][]string, error) {
+	rec, err := decodeArrowRecordBatch(schemaBytes, batch.GetSerializedRecordBatch(), memory.DefaultAllocator)
+	if err != nil {
+		return nil, err
+	}
+	defer rec.Release()
+	return arrowRecordToRows(rec, fields)
+}
+
 // AppendRows is the bidi-streaming heart of the Write API: each request may
 // switch destination stream, (re)declare its writer_schema, and carry a
 // batch of protobuf-serialized rows. Rows for the `_default` stream are
@@ -390,6 +431,7 @@ func (s *storageWriteService) AppendRows(stream storagepb.BigQueryWrite_AppendRo
 		explicitStream    *storageWriteStream
 		fields            []tableField
 		msgDesc           protoreflect.MessageDescriptor
+		arrowSchemaBytes  []byte
 	)
 
 	for {
@@ -429,50 +471,49 @@ func (s *storageWriteService) AppendRows(stream storagepb.BigQueryWrite_AppendRo
 			}
 			currentStreamName = ws
 			msgDesc = nil // a destination switch requires a fresh writer_schema, per the real API's own contract
+			arrowSchemaBytes = nil
 		}
 		if currentStreamName == "" {
 			return status.Error(codes.InvalidArgument, "write_stream is required on the first AppendRows request")
 		}
 
-		protoData := req.GetProtoRows()
-		if protoData == nil {
-			if req.GetArrowRows() != nil {
-				return status.Error(codes.Unimplemented, "arrow_rows is not supported for AppendRows; only proto_rows")
+		var rows [][]string
+		switch {
+		case req.GetProtoRows() != nil:
+			protoData := req.GetProtoRows()
+			if schema := protoData.GetWriterSchema(); schema != nil {
+				md, buildErr := buildDynamicMessageDescriptor(schema.GetProtoDescriptor())
+				if buildErr != nil {
+					return status.Errorf(codes.InvalidArgument, "invalid writer_schema: %v", buildErr)
+				}
+				msgDesc = md
 			}
-			return status.Error(codes.InvalidArgument, "proto_rows is required")
-		}
-		if schema := protoData.GetWriterSchema(); schema != nil {
-			md, buildErr := buildDynamicMessageDescriptor(schema.GetProtoDescriptor())
-			if buildErr != nil {
-				return status.Errorf(codes.InvalidArgument, "invalid writer_schema: %v", buildErr)
+			if msgDesc == nil {
+				return status.Error(codes.InvalidArgument, "writer_schema must be specified before the first row is sent for a destination")
 			}
-			msgDesc = md
-		}
-		if msgDesc == nil {
-			return status.Error(codes.InvalidArgument, "writer_schema must be specified before the first row is sent for a destination")
-		}
-
-		serializedRows := protoData.GetRows().GetSerializedRows()
-		rows := make([][]string, 0, len(serializedRows))
-		var rowErrors []*storagepb.RowError
-		for i, raw := range serializedRows {
-			msg := dynamicpb.NewMessage(msgDesc)
-			if unmarshalErr := proto.Unmarshal(raw, msg); unmarshalErr != nil {
-				rowErrors = append(rowErrors, &storagepb.RowError{Index: int64(i), Message: unmarshalErr.Error()})
+			decoded, rowErrors := decodeProtoRows(protoData, msgDesc, fields)
+			if len(rowErrors) > 0 {
+				if sendErr := stream.Send(&storagepb.AppendRowsResponse{RowErrors: rowErrors, WriteStream: currentStreamName}); sendErr != nil {
+					return sendErr
+				}
 				continue
 			}
-			row, convErr := protoMessageToRow(msg, fields)
-			if convErr != nil {
-				rowErrors = append(rowErrors, &storagepb.RowError{Index: int64(i), Message: convErr.Error()})
-				continue
+			rows = decoded
+		case req.GetArrowRows() != nil:
+			arrowData := req.GetArrowRows()
+			if schema := arrowData.GetWriterSchema(); schema != nil {
+				arrowSchemaBytes = schema.GetSerializedSchema()
 			}
-			rows = append(rows, row)
-		}
-		if len(rowErrors) > 0 {
-			if sendErr := stream.Send(&storagepb.AppendRowsResponse{RowErrors: rowErrors, WriteStream: currentStreamName}); sendErr != nil {
-				return sendErr
+			if len(arrowSchemaBytes) == 0 {
+				return status.Error(codes.InvalidArgument, "writer_schema must be specified before the first row is sent for a destination")
 			}
-			continue
+			decoded, decodeErr := decodeArrowAppendRows(arrowSchemaBytes, arrowData.GetRows(), fields)
+			if decodeErr != nil {
+				return status.Error(codes.InvalidArgument, decodeErr.Error())
+			}
+			rows = decoded
+		default:
+			return status.Error(codes.InvalidArgument, "proto_rows or arrow_rows is required")
 		}
 
 		if isDefault {

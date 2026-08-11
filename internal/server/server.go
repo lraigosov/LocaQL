@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/lraigosov/LocaQL/internal/capabilities"
@@ -44,6 +45,13 @@ type Server struct {
 
 	streamingInserts *streamingInsertDedupStore
 	sqlEngines       *sqlEnginePool
+
+	// mergeSourceCounter names the ephemeral tables rewriteMergeUsingSubquery
+	// materializes for a MERGE ... USING (<subquery>) whose source the
+	// embedded engine can't resolve directly (see that function). Atomic
+	// because concurrent MERGE jobs on different targets can both be
+	// rewriting at once.
+	mergeSourceCounter atomic.Uint64
 }
 
 func New(reg capabilities.Registry) *Server {
