@@ -137,8 +137,8 @@ func TestUnsupportedMutatingStatementsFailExplicitly(t *testing.T) {
 	s := newTestServer()
 	seedPersistentSQLTable(t, s)
 	for _, query := range []string{
-		"ALTER TABLE analytics.items DROP COLUMN active",
-		"ALTER TABLE analytics.items RENAME TO renamed_items",
+		"ALTER TABLE analytics.items ALTER COLUMN active SET DATA TYPE STRING",
+		"ALTER TABLE analytics.items ADD COLUMN a INT64, DROP COLUMN active",
 		"CREATE TEMP TABLE temporary_items AS SELECT * FROM analytics.items",
 	} {
 		if _, err := s.executeQueryStatement("p1", "", query, "", "", nil); err == nil || !strings.Contains(err.Error(), "unsupported persistent SQL statement") {
@@ -279,6 +279,112 @@ func TestPersistentAlterTableAddColumn(t *testing.T) {
 	fields, _, _ = s.tables.getData("p1", "analytics", "items")
 	if len(fields) != 6 || fields[4].Name != "a" || fields[4].Type != "BOOL" || fields[5].Name != "b" || fields[5].Type != "STRING" {
 		t.Fatalf("expected two more nullable columns with normalized types, got %#v", fields)
+	}
+}
+
+func TestPersistentAlterTableDropColumn(t *testing.T) {
+	s := newTestServer()
+	seedPersistentSQLTable(t, s)
+
+	if _, err := s.executeQueryStatement("p1", "", "ALTER TABLE analytics.items DROP COLUMN active", "", "", nil); err != nil {
+		t.Fatalf("ALTER TABLE DROP COLUMN failed: %v", err)
+	}
+	fields, rows, ok := s.tables.getData("p1", "analytics", "items")
+	if !ok || len(fields) != 2 || fields[0].Name != "id" || fields[1].Name != "name" {
+		t.Fatalf("expected active column gone, got fields %#v", fields)
+	}
+	if !equalStoredRows(rows, [][]string{{"1", "one"}, {"2", storedNullCell}}) {
+		t.Fatalf("expected the active cell dropped from every row, got %#v", rows)
+	}
+
+	if _, err := s.executeQueryStatement("p1", "", "ALTER TABLE analytics.items DROP COLUMN active", "", "", nil); err == nil {
+		t.Fatal("expected DROP COLUMN to reject a name that no longer exists")
+	}
+	if _, err := s.executeQueryStatement("p1", "", "ALTER TABLE analytics.items DROP COLUMN IF EXISTS active", "", "", nil); err != nil {
+		t.Fatalf("DROP COLUMN IF EXISTS should tolerate an already-missing column, got: %v", err)
+	}
+
+	if _, err := s.executeQueryStatement("p1", "", "ALTER TABLE analytics.items DROP COLUMN id, DROP COLUMN name", "", "", nil); err != nil {
+		t.Fatalf("multi-clause DROP COLUMN failed: %v", err)
+	}
+	fields, rows, _ = s.tables.getData("p1", "analytics", "items")
+	if len(fields) != 0 || len(rows) != 2 || len(rows[0]) != 0 {
+		t.Fatalf("expected every column gone but row count preserved, got fields=%#v rows=%#v", fields, rows)
+	}
+}
+
+func TestPersistentAlterTableRenameColumn(t *testing.T) {
+	s := newTestServer()
+	seedPersistentSQLTable(t, s)
+
+	if _, err := s.executeQueryStatement("p1", "", "ALTER TABLE analytics.items RENAME COLUMN name TO label", "", "", nil); err != nil {
+		t.Fatalf("ALTER TABLE RENAME COLUMN failed: %v", err)
+	}
+	fields, rows, ok := s.tables.getData("p1", "analytics", "items")
+	if !ok || fields[1].Name != "label" {
+		t.Fatalf("expected name renamed to label, got fields %#v", fields)
+	}
+	if !equalStoredRows(rows, [][]string{{"1", "one", "true"}, {"2", storedNullCell, "false"}}) {
+		t.Fatalf("renaming a column should never move data, got %#v", rows)
+	}
+
+	if _, err := s.executeQueryStatement("p1", "", "ALTER TABLE analytics.items RENAME COLUMN active TO label", "", "", nil); err == nil {
+		t.Fatal("expected RENAME COLUMN to reject a new name that already exists")
+	}
+	if _, err := s.executeQueryStatement("p1", "", "ALTER TABLE analytics.items RENAME COLUMN does_not_exist TO x", "", "", nil); err == nil {
+		t.Fatal("expected RENAME COLUMN to reject an old name that does not exist")
+	}
+	if _, err := s.executeQueryStatement("p1", "", "ALTER TABLE analytics.items RENAME COLUMN IF EXISTS does_not_exist TO x", "", "", nil); err != nil {
+		t.Fatalf("RENAME COLUMN IF EXISTS should tolerate a missing old name, got: %v", err)
+	}
+}
+
+func TestPersistentAlterTableRenameTo(t *testing.T) {
+	s := newTestServer()
+	seedPersistentSQLTable(t, s)
+
+	if _, err := s.executeQueryStatement("p1", "", "ALTER TABLE analytics.items RENAME TO renamed_items", "", "", nil); err != nil {
+		t.Fatalf("ALTER TABLE RENAME TO failed: %v", err)
+	}
+	if _, ok, _ := s.tables.get("p1", "analytics", "items"); ok {
+		t.Fatal("old table name should no longer exist after RENAME TO")
+	}
+	fields, rows, ok := s.tables.getData("p1", "analytics", "renamed_items")
+	if !ok || len(fields) != 3 {
+		t.Fatalf("expected the table to exist under its new name with its schema intact, got fields=%#v ok=%v", fields, ok)
+	}
+	if !equalStoredRows(rows, [][]string{{"1", "one", "true"}, {"2", storedNullCell, "false"}}) {
+		t.Fatalf("RENAME TO should never change row data, got %#v", rows)
+	}
+
+	if _, err := s.executeQueryStatement("p1", "", "CREATE TABLE analytics.other (id INT64)", "", "", nil); err != nil {
+		t.Fatalf("seed second table failed: %v", err)
+	}
+	if _, err := s.executeQueryStatement("p1", "", "ALTER TABLE analytics.renamed_items RENAME TO other", "", "", nil); err == nil {
+		t.Fatal("expected RENAME TO to reject a name that already exists")
+	}
+	if _, err := s.executeQueryStatement("p1", "", "ALTER TABLE IF EXISTS analytics.does_not_exist RENAME TO whatever", "", "", nil); err != nil {
+		t.Fatalf("ALTER TABLE IF EXISTS RENAME TO on a missing table should be a no-op, got: %v", err)
+	}
+}
+
+func TestPersistentAlterTableSetOptions(t *testing.T) {
+	s := newTestServer()
+	seedPersistentSQLTable(t, s)
+
+	if _, err := s.executeQueryStatement("p1", "", `ALTER TABLE analytics.items SET OPTIONS(description="updated via ALTER TABLE")`, "", "", nil); err != nil {
+		t.Fatalf("ALTER TABLE SET OPTIONS failed: %v", err)
+	}
+	fields, rows, ok := s.tables.getData("p1", "analytics", "items")
+	if !ok || len(fields) != 3 || len(rows) != 2 {
+		t.Fatalf("SET OPTIONS should never change schema/rows, got fields=%#v rows=%#v", fields, rows)
+	}
+
+	if _, err := s.executeQueryStatement("p1", "", "ALTER TABLE analytics.does_not_exist SET OPTIONS(description=\"x\")", "", "", nil); err == nil {
+		t.Fatal("expected SET OPTIONS to fail on a missing table")
+	}
+	if _, err := s.executeQueryStatement("p1", "", "ALTER TABLE IF EXISTS analytics.does_not_exist SET OPTIONS(description=\"x\")", "", "", nil); err != nil {
+		t.Fatalf("ALTER TABLE IF EXISTS SET OPTIONS on a missing table should be a no-op, got: %v", err)
 	}
 }
 

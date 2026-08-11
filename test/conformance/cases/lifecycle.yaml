@@ -1,0 +1,147 @@
+# Declarative REST conformance cases exercising the datasets/tables/streaming
+# insert/persistent-DDL-DML lifecycle directly over the bare REST surface —
+# independent of any one client library. Each case is self-contained (setup
+# builds whatever fixtures it needs, cleanup always tears them down), so the
+# whole file can run repeatedly against a fresh, empty server.
+
+cases:
+  - id: rest_dataset_create_and_get
+    method: POST
+    path: /bigquery/v2/projects/p1/datasets
+    body:
+      datasetReference:
+        datasetId: conformance_ds_create
+    expected_status: 200
+    expected_body_contains:
+      - '"datasetId":"conformance_ds_create"'
+    cleanup:
+      - method: DELETE
+        path: /bigquery/v2/projects/p1/datasets/conformance_ds_create
+
+  - id: rest_dataset_get_existing
+    setup:
+      - method: POST
+        path: /bigquery/v2/projects/p1/datasets
+        body:
+          datasetReference:
+            datasetId: conformance_ds_get
+    method: GET
+    path: /bigquery/v2/projects/p1/datasets/conformance_ds_get
+    expected_status: 200
+    expected_body_contains:
+      - '"datasetId":"conformance_ds_get"'
+    cleanup:
+      - method: DELETE
+        path: /bigquery/v2/projects/p1/datasets/conformance_ds_get
+
+  - id: rest_dataset_delete_missing_404
+    method: DELETE
+    path: /bigquery/v2/projects/p1/datasets/conformance_ds_missing
+    expected_status: 404
+
+  - id: rest_table_create_with_schema
+    setup:
+      - method: POST
+        path: /bigquery/v2/projects/p1/datasets
+        body:
+          datasetReference:
+            datasetId: conformance_ds_tables
+    method: POST
+    path: /bigquery/v2/projects/p1/datasets/conformance_ds_tables/tables
+    body:
+      tableReference:
+        tableId: items
+      schema:
+        fields:
+          - name: id
+            type: INT64
+          - name: name
+            type: STRING
+    expected_status: 200
+    expected_body_contains:
+      - '"tableId":"items"'
+    cleanup:
+      # deleteContents=true, not a per-table delete: touching the tables
+      # sub-resource lazily seeds LocaQL's built-in demo tables into a
+      # dataset on first access (see tableService.ensureDatasetLocked), so
+      # the dataset can hold more than just the one table this case created.
+      - method: DELETE
+        path: /bigquery/v2/projects/p1/datasets/conformance_ds_tables?deleteContents=true
+
+  - id: rest_streaming_insert_then_tabledata_list
+    setup:
+      - method: POST
+        path: /bigquery/v2/projects/p1/datasets
+        body:
+          datasetReference:
+            datasetId: conformance_ds_stream
+      - method: POST
+        path: /bigquery/v2/projects/p1/datasets/conformance_ds_stream/tables
+        body:
+          tableReference:
+            tableId: readings
+          schema:
+            fields:
+              - name: id
+                type: INT64
+              - name: name
+                type: STRING
+      - method: POST
+        path: /bigquery/v2/projects/p1/datasets/conformance_ds_stream/tables/readings/insertAll
+        body:
+          rows:
+            - json:
+                id: 7
+                name: gamma
+    method: GET
+    path: /bigquery/v2/projects/p1/datasets/conformance_ds_stream/tables/readings/data
+    expected_status: 200
+    expected_body_contains:
+      - gamma
+    cleanup:
+      - method: DELETE
+        path: /bigquery/v2/projects/p1/datasets/conformance_ds_stream?deleteContents=true
+
+  - id: rest_queries_create_or_replace_table
+    setup:
+      - method: POST
+        path: /bigquery/v2/projects/p1/datasets
+        body:
+          datasetReference:
+            datasetId: conformance_ds_sql
+    method: POST
+    path: /bigquery/v2/projects/p1/queries
+    body:
+      query: "CREATE OR REPLACE TABLE conformance_ds_sql.widgets AS SELECT 1 AS id, 'first' AS name"
+    expected_status: 200
+    expected_body_contains:
+      - '"jobComplete":true'
+    cleanup:
+      - method: DELETE
+        path: /bigquery/v2/projects/p1/datasets/conformance_ds_sql?deleteContents=true
+
+  - id: rest_queries_select_after_dml
+    setup:
+      - method: POST
+        path: /bigquery/v2/projects/p1/datasets
+        body:
+          datasetReference:
+            datasetId: conformance_ds_dml
+      - method: POST
+        path: /bigquery/v2/projects/p1/queries
+        body:
+          query: "CREATE OR REPLACE TABLE conformance_ds_dml.widgets AS SELECT 1 AS id, 'first' AS name"
+      - method: POST
+        path: /bigquery/v2/projects/p1/queries
+        body:
+          query: "UPDATE conformance_ds_dml.widgets SET name = 'updated' WHERE id = 1"
+    method: POST
+    path: /bigquery/v2/projects/p1/queries
+    body:
+      query: "SELECT name FROM conformance_ds_dml.widgets WHERE id = 1"
+    expected_status: 200
+    expected_body_contains:
+      - updated
+    cleanup:
+      - method: DELETE
+        path: /bigquery/v2/projects/p1/datasets/conformance_ds_dml?deleteContents=true

@@ -594,6 +594,134 @@ func (s *tableService) addColumnsIfVersion(projectID, datasetID, tableID string,
 	return nil
 }
 
+// dropColumnsIfVersion commits ALTER TABLE DROP COLUMN: the named column(s)
+// (matched case-insensitively, dropNames must already exist on the table's
+// schema — the caller checks that) are removed from the schema, and the
+// corresponding cell removed from every existing row at the same index.
+// Additive/subtractive schema evolution only — every other attribute is
+// left exactly as it was, same as addColumnsIfVersion.
+func (s *tableService) dropColumnsIfVersion(projectID, datasetID, tableID string, expectedVersion int, dropNames []string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tables := s.ensureDatasetLocked(projectID, datasetID)
+	t := tables[tableID]
+	if t == nil {
+		return fmt.Errorf("table not found: %s.%s", datasetID, tableID)
+	}
+	if t.Version != expectedVersion {
+		return fmt.Errorf("table %s.%s changed concurrently; retry the statement", datasetID, tableID)
+	}
+	drop := dropColumnIndexSet(t.Schema, dropNames)
+	t.Schema = filterColumns(t.Schema, drop)
+	t.Rows = filterRowColumns(t.Rows, drop)
+	t.UpdatedAt = s.now().UTC()
+	t.Version++
+	s.datasetVersions[s.datasetKey(projectID, datasetID)]++
+	return nil
+}
+
+// dropColumnIndexSet resolves each name (matched case-insensitively) to its
+// column index in schema.
+func dropColumnIndexSet(schema []tableField, dropNames []string) map[int]bool {
+	drop := make(map[int]bool, len(dropNames))
+	for _, name := range dropNames {
+		for i, f := range schema {
+			if strings.EqualFold(f.Name, name) {
+				drop[i] = true
+				break
+			}
+		}
+	}
+	return drop
+}
+
+// filterColumns returns schema with every index in drop removed.
+func filterColumns(schema []tableField, drop map[int]bool) []tableField {
+	out := make([]tableField, 0, len(schema)-len(drop))
+	for i, f := range schema {
+		if !drop[i] {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// filterRowColumns returns rows with the cell at every index in drop removed
+// from each row.
+func filterRowColumns(rows [][]string, drop map[int]bool) [][]string {
+	out := make([][]string, len(rows))
+	for r, row := range rows {
+		newRow := make([]string, 0, len(row)-len(drop))
+		for i, cell := range row {
+			if !drop[i] {
+				newRow = append(newRow, cell)
+			}
+		}
+		out[r] = newRow
+	}
+	return out
+}
+
+// renameColumnsIfVersion commits ALTER TABLE RENAME COLUMN: only each
+// matched field's Name changes (renames keyed by old name, matched
+// case-insensitively — the caller already checked every old name exists and
+// every new name doesn't collide with an existing column). Renaming never
+// moves data between columns, so rows are untouched.
+func (s *tableService) renameColumnsIfVersion(projectID, datasetID, tableID string, expectedVersion int, renames map[string]string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tables := s.ensureDatasetLocked(projectID, datasetID)
+	t := tables[tableID]
+	if t == nil {
+		return fmt.Errorf("table not found: %s.%s", datasetID, tableID)
+	}
+	if t.Version != expectedVersion {
+		return fmt.Errorf("table %s.%s changed concurrently; retry the statement", datasetID, tableID)
+	}
+	for i, f := range t.Schema {
+		for oldName, newName := range renames {
+			if strings.EqualFold(f.Name, oldName) {
+				t.Schema[i].Name = newName
+				break
+			}
+		}
+	}
+	t.UpdatedAt = s.now().UTC()
+	t.Version++
+	s.datasetVersions[s.datasetKey(projectID, datasetID)]++
+	return nil
+}
+
+// renameTableIfVersion commits ALTER TABLE RENAME TO: the table moves to a
+// new tableID within the same project/dataset, keeping every other
+// attribute (schema, rows, partitioning, clustering, view identity)
+// untouched. Fails if newTableID is already taken.
+func (s *tableService) renameTableIfVersion(projectID, datasetID, tableID, newTableID string, expectedVersion int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tables := s.ensureDatasetLocked(projectID, datasetID)
+	t := tables[tableID]
+	if t == nil {
+		return fmt.Errorf("table not found: %s.%s", datasetID, tableID)
+	}
+	if t.Version != expectedVersion {
+		return fmt.Errorf("table %s.%s changed concurrently; retry the statement", datasetID, tableID)
+	}
+	if _, exists := tables[newTableID]; exists {
+		return fmt.Errorf("table already exists: %s.%s", datasetID, newTableID)
+	}
+	delete(tables, tableID)
+	t.TableID = newTableID
+	t.UpdatedAt = s.now().UTC()
+	t.Version++
+	tables[newTableID] = t
+	s.datasetVersions[s.datasetKey(projectID, datasetID)]++
+	return nil
+}
+
 func (s *tableService) upsertCopyDestination(dest tableReference, schema []tableField, rows [][]string, createDisposition, writeDisposition string) (int, error) {
 	projectID := strings.TrimSpace(dest.ProjectID)
 	datasetID := strings.TrimSpace(dest.DatasetID)
