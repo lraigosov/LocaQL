@@ -79,6 +79,18 @@ jobs:
             type=semver,pattern={{major}}.{{minor}},value=${{ env.TAG }}
             type=raw,value=latest
       - uses: docker/build-push-action@v7
+        env:
+          # Disables buildx's GitHub Actions build-summary/record-archive
+          # upload. That upload uses the Actions cache API, which issues a
+          # read-only token for pull_request-triggered runs (a GitHub-side
+          # security policy no `permissions:` block can override) — this
+          # workflow can run that way via auto-tag-release.yml's
+          # pull_request trigger, where the attempt always fails with
+          # "Cache reservation failed: cache write denied: token has no
+          # writable scopes". Non-fatal either way (the image build/push
+          # itself still succeeds), but disabled outright since the summary
+          # can never actually be produced on that trigger.
+          DOCKER_BUILD_SUMMARY: false
         with:
           context: .
           platforms: linux/amd64,linux/arm64
