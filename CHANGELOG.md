@@ -134,7 +134,7 @@ All notable user-facing changes to LocaQL are documented here, in the style of [
 - Automated releases (`.github/workflows/release.yml`, triggered by pushing a `vX.Y.Z` tag): a real multi-arch (`linux/amd64`+`linux/arm64`) image published to `ghcr.io/lraigosov/locaql`, plus a GitHub Release with cross-compiled binaries for every `make build-all` platform and the SBOM attached. See "How releases are cut" below. This is the first release this pipeline has ever produced.
 
 ### Fixed
-- `NOTICE` didn't attribute `google/googlesql` (formerly ZetaSQL), the real Apache-2.0-licensed Google engine the query layer actually transpiles and runs — only the MIT-licensed inspiration project was mentioned. Not a license conflict (Apache-2.0 and MIT are freely combinable, and this project is already Apache-2.0), but a real attribution gap, now corrected with the full dependency chain documented in `NOTICE`.
+- `NOTICE` didn't attribute `google/googlesql` (formerly ZetaSQL), the real Apache-2.0-licensed Google engine the query layer actually transpiles and runs — only the MIT-licensed inspiration project was mentioned. Not a license conflict (Apache-2.0 and MIT are freely combinable, and this project was then licensed under Apache-2.0), but a real attribution gap, now corrected with the full dependency chain documented in `NOTICE`.
 - The `Dockerfile` hardcoded `GOOS=linux` with no `GOARCH` at all, so it always built for the host's native architecture regardless of what was requested — "multi-arch" support didn't actually work. Fixed to consume Docker's `TARGETOS`/`TARGETARCH` build args properly.
 
 ### Known limitations

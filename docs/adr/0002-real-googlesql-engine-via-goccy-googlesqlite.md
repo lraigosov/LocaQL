@@ -46,7 +46,7 @@ falling back to a fabricated `200`.
   inside remains Apache-2.0, Google-authored work — an MIT license on the surrounding tooling doesn't relicense it,
   and none of those repositories shipped a NOTICE file carrying that attribution forward at the time this was
   checked. This is not a license **conflict** — Apache-2.0 and MIT are both permissive and freely combinable, and
-  LocaQL's own license is already Apache-2.0 — but it is a real attribution gap this project's own `NOTICE` file
+  LocaQL's own license was then Apache-2.0 (subsequently transitioned to a proprietary EULA) — but it is a real attribution gap this project's own `NOTICE` file
   didn't originally cover. Fixed by adding an explicit third-party notice to `NOTICE` for `google/googlesql`
   (Apache-2.0) rather than silently depending on upstream `goccy/*` repositories to have already handled it. See
   ADR 0001 for the broader licensing/non-affiliation posture this extends.

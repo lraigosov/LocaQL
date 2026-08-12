@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted (established across Sesiones 59-62 of the project's build log; formalized here in Sesión 86).
+Superseded (licensing decision superseded by the transition to a proprietary EULA in [ADR 0004](0004-transition-to-proprietary-eula-license.md); non-affiliation decision remains accepted).
 
 ## Context
 
@@ -15,8 +15,7 @@ somehow endorsed by Google/BigQuery, neither of which is true.
 
 ## Decision
 
-- LocaQL is licensed under the **Apache License, Version 2.0** (see `LICENSE`), not MIT — a deliberate choice
-  distinct from the MIT-licensed project that inspired its early scope.
+- LocaQL was originally licensed under the **Apache License, Version 2.0** (see `LICENSE`), not MIT — a deliberate choice. This decision has been **superseded** by the transition to a proprietary End User License Agreement (EULA) in [ADR 0004](0004-transition-to-proprietary-eula-license.md).
 - `NOTICE` states the project's origin, the Apache §4(d) attribution requirement for derivative works, and explicit
   non-affiliation with Google LLC / Google Cloud / BigQuery.
 - No per-file copyright headers are added: a single `LICENSE` file at the repository root is legally sufficient for
