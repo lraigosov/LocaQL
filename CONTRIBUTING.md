@@ -110,6 +110,8 @@ This means: **anyone can open a PR against `dev` or `main`, but only the owner's
 
 ## License and Attribution
 
-LocaQL is licensed under the [Apache License, Version 2.0](LICENSE). Read the [`NOTICE`](NOTICE) file before using, deploying, modifying, or forking this project — it explains the attribution you're required to carry forward, and clarifies that LocaQL is not affiliated with Google or BigQuery.
+LocaQL is licensed under a proprietary [End User License Agreement (EULA)](LICENSE). The Software is free to use strictly for academic research, personal education, training, and limited personal local development testing.
 
-By submitting a contribution, you agree it is licensed under the same terms (Apache License, Version 2.0), per [Section 5](LICENSE) of the license.
+Read the [`LICENSE`](LICENSE) file for the full terms, conditions, and strict operational boundaries of "Limited Local Development Testing". Read the [`NOTICE`](NOTICE) file before using, deploying, or building upon this project — it explains the attribution you're required to carry forward, and clarifies that LocaQL is not affiliated with Google or BigQuery.
+
+By submitting a contribution (including code, documentation, bug reports, or suggestions), you agree to assign and transfer all intellectual property and copyright ownership of that contribution to Luis Raigoso, as detailed in [Section 6 (Contributions and Intellectual Property Assignment)](LICENSE) of the EULA, or grant an unrestricted, perpetual, and irrevocable license to the Licensor to use and re-license your contributions under any model.
