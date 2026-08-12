@@ -1778,21 +1778,10 @@ func (s *Server) computeQueryJobResultRows(projectID string, j *jobRecord) ([]ta
 	// Preserve the existing early-result behavior for side-effect-free
 	// SELECTs, but never execute DDL/DML or session control merely because a
 	// PENDING/RUNNING job was polled. A mutation must run exactly once after
-	// its job acquires the target-table lock. Every persistent-statement
-	// parser is checked here, not just parsePersistentSQLStatement: each of
-	// CREATE/DROP [MATERIALIZED] VIEW, CREATE SCHEMA and ALTER TABLE ADD
-	// COLUMN is recognized by its own dedicated parser, and a statement type
-	// missing from this guard is a real, previously-hit bug (see CREATE
-	// VIEW's history in devlog.md) — a getQueryResults poll landing while the
-	// async job was still PENDING/RUNNING re-runs the statement a second
-	// time, racing the job's own execution over the same catalog version.
-	_, mutating, _ := parsePersistentSQLStatement(projectID, j.QueryText)
-	_, viewMutating, _ := parsePersistentViewStatement(projectID, j.QueryText)
-	_, _, createSchemaMutating := parseCreateSchemaStatement(j.QueryText)
-	alterTableMutating := isPersistentAlterTableStatement(projectID, j.QueryText)
-	trimmedQuery := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(j.QueryText), ";"))
-	sessionControl := sessionBeginPattern.MatchString(trimmedQuery) || sessionCommitPattern.MatchString(trimmedQuery) || sessionRollbackPattern.MatchString(trimmedQuery) || sessionCreateTempTablePattern.MatchString(trimmedQuery)
-	if mutating || viewMutating || createSchemaMutating || alterTableMutating || sessionControl {
+	// its job acquires the target-table lock. See
+	// isMutatingOrSessionControlStatement for why every persistent-statement
+	// parser must be checked here, not just parsePersistentSQLStatement.
+	if isMutatingOrSessionControlStatement(projectID, j.QueryText) {
 		return []tableField{}, [][]string{}, nil
 	}
 	return s.simulateQueryResultTable(projectID, j.SessionID, j.QueryText, j.UserEmail, j.ParameterMode, j.QueryParameters)

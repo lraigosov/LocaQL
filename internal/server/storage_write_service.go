@@ -201,7 +201,31 @@ func (s *storageWriteService) CreateWriteStream(_ context.Context, req *storagep
 	return st.toProto(), nil
 }
 
+// GetWriteStream resolves an explicit stream from the streams map, the same
+// way CreateWriteStream registered it. The well-known `_default` stream is
+// never registered there — like AppendRows, it resolves straight against the
+// table's current schema instead — because official clients (e.g.
+// cloud.google.com/go/bigquery/storage/managedwriter, which calls this as
+// part of connection-pool setup for a DefaultStream, before ever appending a
+// row) fetch it before appending, and a NotFound here would otherwise be the
+// only difference between _default working through AppendRows directly and
+// working through a client that validates the stream first.
 func (s *storageWriteService) GetWriteStream(_ context.Context, req *storagepb.GetWriteStreamRequest) (*storagepb.WriteStream, error) {
+	if projectID, datasetID, tableID, _, isDefault, err := parseStorageWriteStreamName(req.GetName()); err == nil && isDefault {
+		rec, ok, _ := s.server.tables.get(projectID, datasetID, tableID)
+		if !ok {
+			return nil, status.Errorf(codes.NotFound, "table not found: %s.%s", datasetID, tableID)
+		}
+		if err := rejectNestedFields("the Storage Write API", rec.Schema); err != nil {
+			return nil, status.Error(codes.InvalidArgument, err.Error())
+		}
+		return &storagepb.WriteStream{
+			Name:        req.GetName(),
+			Type:        storagepb.WriteStream_COMMITTED,
+			TableSchema: tableFieldsToStorageSchema(rec.Schema),
+		}, nil
+	}
+
 	s.mu.Lock()
 	st, ok := s.streams[req.GetName()]
 	s.mu.Unlock()
