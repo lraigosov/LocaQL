@@ -4,6 +4,8 @@ All notable user-facing changes to LocaQL are documented here, in the style of [
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-08-12
+
 ### Added
 - A read-only query whose referenced tables are all still at the exact catalog version they were last materialized at now skips re-materializing them into the embedded query engine entirely, instead reusing an already-materialized connection — including one a *concurrent* read-only query wanting the identical table set is still using. Every table mutation already bumps a per-table version counter as existing internal bookkeeping, giving an exact, already-correct signal for "safe to reuse" with no new plumbing. External tables, views, session-scoped temp tables and any partition-pruned result are never cached, for correctness reasons specific to each (see `docs/benchmarks.md`); a mutating or session-control statement always keeps its own private, exclusively-owned connection, never a shared one. Cuts a repeated 50k-row query from ~1.2s to ~350ms in this project's own benchmark; see [`docs/benchmarks.md`](docs/benchmarks.md#caching-materialized-tables-across-queries) for the full design, the correctness hazards it was built around (each with a regression test), and a real embedded-engine concurrency bug this surfaced and fixed along the way.
 
