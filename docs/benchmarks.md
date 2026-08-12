@@ -23,6 +23,7 @@ Workloads, run sequentially against a freshly started server:
 - `streaming_insert_single_row` — one `tabledata.insertAll` call per row.
 - `streaming_insert_batch_100` — one `tabledata.insertAll` call per 100 rows.
 - `concurrent_sync_queries` — the small-table `COUNT` query, fired from 6 concurrent workers.
+- `sync_query_large_table_where`/`sync_query_large_table_group_by`/`large_table_tabledata_list` — opt-in via `--large-table-rows N` (skipped by default, since seeding tens of thousands of rows adds real time to every run): the same `WHERE`+aggregate and `GROUP BY` shapes as above, but over a table with `N` rows instead of 1,000 — see "Caching materialized tables across queries" below for why this scale matters.
 
 Reproduce it yourself:
 
@@ -93,6 +94,23 @@ Re-materializing a table on every query is wasted work whenever nothing about th
 2. Once (1) was fixed, the benchmark still failed intermittently with `no such table`, this time from inside the embedded engine itself: `goccy/go-googlesql`'s own catalog object is shared by every driver-level connection opened against one `*sql.DB` (which is what makes reuse safe at all), but that shared catalog is not itself safe for *concurrent* access — two goroutines legitimately holding the same shared connection and calling into the driver at the same moment can race inside it. Worked around by capping each pooled connection to exactly one underlying driver connection (`db.SetMaxOpenConns(1)`), which makes Go's own `database/sql` serialize access to it — concurrent holders queue for their turn at the driver instead of ever entering it simultaneously. This does not defeat the point of sharing: the expensive part (materializing rows) still happens once per signature, not once per concurrent reader; only the final SQL execution itself is serialized. With the fix in place, the same benchmark run — under `go test -race`, many parallel workers, hundreds of iterations — passes cleanly.
 
 **Measured concurrent-load effect** (`BenchmarkConcurrentSyncQueriesLargeTable`, 8 parallel workers running the identical query against the 50k-row table): **~186ms/op**, lower than even the single-worker warm-cache number above, since concurrent workers overlap their queued driver turns with other work instead of running fully sequentially.
+
+**Independently confirmed over a real network round trip, not just in-process:** `cmd/locaql-bench --large-table-rows 50000` (the same reproducible client used for the Results table above, extended with this flag specifically to cover the scale this cache targets) seeds a 50,000-row table and runs the same `WHERE`+aggregate and `GROUP BY` shapes as real HTTP requests against a locally running server. Same binary, same host, before and after this change:
+
+| Workload | Before this change | After this change |
+|---|---:|---:|
+| `sync_query_large_table_where` (p50) | 1406ms | **302ms** |
+| `sync_query_large_table_group_by` (p50) | 1506ms | **503ms** |
+
+Reproduce it yourself:
+
+```bash
+# terminal 1
+go run ./cmd/locaql start --addr 127.0.0.1:19050
+
+# terminal 2
+go run ./cmd/locaql-bench --endpoint http://127.0.0.1:19050 --label LocaQL --large-table-rows 50000
+```
 
 ## A crash found by sustained load, not hidden
 
