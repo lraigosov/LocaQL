@@ -37,6 +37,8 @@ type config struct {
 	jsonOut     string
 	timeout     time.Duration
 
+	largeTableRows int
+
 	soakDuration       time.Duration
 	soakConcurrency    int
 	soakMaxOutage      time.Duration
@@ -55,6 +57,7 @@ func parseConfig() config {
 	warmup := fs.Int("warmup", 3, "warmup iterations excluded from reported stats, per workload")
 	jsonOut := fs.String("json", "", "optional path to also write the report as JSON")
 	timeout := fs.Duration("timeout", 30*time.Second, "per-request HTTP client timeout")
+	largeTableRows := fs.Int("large-table-rows", 0, "if > 0, seed an additional table with this many rows and run aggregation workloads against it (COUNT/SUM WHERE, GROUP BY, tabledata.list) — the scale this project's materialized-table cache targets; see docs/benchmarks.md")
 	soakDuration := fs.Duration("soak-duration", 0, "if set, ignore the normal workload report and instead sustain load for this long against a single long-lived server, to validate a supervised process's restart loop over many cycles (see docs/benchmarks.md)")
 	soakConcurrency := fs.Int("soak-concurrency", 6, "concurrent workers hammering the server during --soak-duration")
 	soakMaxOutage := fs.Duration("soak-max-outage", 60*time.Second, "fail immediately if the server produces no successful response for this long continuously during a soak run — a real, unrecovered outage rather than one restart cycle's brief blip")
@@ -64,7 +67,8 @@ func parseConfig() config {
 		endpoint: *endpoint, project: *project, dataset: *dataset, label: *label,
 		iterations: *iterations, insertIters: *insertIters, concurrency: *concurrency,
 		warmup: *warmup, jsonOut: *jsonOut, timeout: *timeout,
-		soakDuration: *soakDuration, soakConcurrency: *soakConcurrency,
+		largeTableRows: *largeTableRows,
+		soakDuration:   *soakDuration, soakConcurrency: *soakConcurrency,
 		soakMaxOutage: *soakMaxOutage, soakReportInterval: *soakReportInterval,
 	}
 }
@@ -108,6 +112,18 @@ func (c *client) projectPath(suffix string) string {
 	return bigQueryV2Prefix + c.project + suffix
 }
 
+// datasetTablesPath is the tables collection endpoint for one dataset
+// (tables.insert/list); tablePath is one specific table's endpoint plus
+// suffix (e.g. "/insertAll", "/data") — both centralize the
+// "/datasets/{id}/tables" path segment shared by every table-scoped call.
+func (c *client) datasetTablesPath(datasetID string) string {
+	return c.projectPath("/datasets/" + datasetID + "/tables")
+}
+
+func (c *client) tablePath(datasetID, tableID, suffix string) string {
+	return c.datasetTablesPath(datasetID) + "/" + tableID + suffix
+}
+
 func (c *client) createDataset(datasetID string) error {
 	body := map[string]any{"datasetReference": map[string]any{"datasetId": datasetID}}
 	data, status, err := c.do(http.MethodPost, c.projectPath("/datasets"), body)
@@ -126,7 +142,7 @@ func (c *client) createTable(datasetID, tableID string, fields []map[string]any)
 		"tableReference": map[string]any{"tableId": tableID},
 		"schema":         map[string]any{"fields": fields},
 	}
-	data, status, err := c.do(http.MethodPost, c.projectPath("/datasets/"+datasetID+"/tables"), body)
+	data, status, err := c.do(http.MethodPost, c.datasetTablesPath(datasetID), body)
 	if err != nil {
 		return err
 	}
@@ -143,7 +159,7 @@ func (c *client) insertAll(datasetID, tableID string, rows []map[string]any) (ti
 	}
 	body := map[string]any{"rows": wrapped}
 	start := time.Now()
-	data, status, err := c.do(http.MethodPost, c.projectPath("/datasets/"+datasetID+"/tables/"+tableID+"/insertAll"), body)
+	data, status, err := c.do(http.MethodPost, c.tablePath(datasetID, tableID, "/insertAll"), body)
 	elapsed := time.Since(start)
 	if err != nil {
 		return elapsed, err
@@ -184,6 +200,38 @@ func (c *client) query(sql string) (time.Duration, error) {
 		}
 	}
 	return elapsed, nil
+}
+
+// tabledataListAll pages through a table's tabledata.list endpoint to
+// completion, returning the total row count read back and how long the full
+// read took — used by the large-table workload (see runLargeTableWorkloads)
+// to measure read-back throughput at scale, separate from query latency.
+func (c *client) tabledataListAll(datasetID, tableID string, pageSize int) (int, time.Duration, error) {
+	start := time.Now()
+	total := 0
+	path := c.tablePath(datasetID, tableID, "/data") + fmt.Sprintf("?maxResults=%d", pageSize)
+	for {
+		data, status, err := c.do(http.MethodGet, path, nil)
+		if err != nil {
+			return total, time.Since(start), err
+		}
+		if status != http.StatusOK {
+			return total, time.Since(start), fmt.Errorf("tabledata.list: status %d: %s", status, data)
+		}
+		var out struct {
+			Rows          []any  `json:"rows"`
+			NextPageToken string `json:"pageToken"`
+		}
+		if err := json.Unmarshal(data, &out); err != nil {
+			return total, time.Since(start), err
+		}
+		total += len(out.Rows)
+		if out.NextPageToken == "" {
+			break
+		}
+		path = c.tablePath(datasetID, tableID, "/data") + fmt.Sprintf("?maxResults=%d&pageToken=%s", pageSize, out.NextPageToken)
+	}
+	return total, time.Since(start), nil
 }
 
 // latencies collects samples for one workload and reports percentiles. Not
@@ -521,6 +569,77 @@ func runSoakCommand(cfg config, c *client) error {
 	return soakErr
 }
 
+// must fails the whole run on a setup error that would make every subsequent
+// workload's results meaningless anyway (e.g. the dataset/table itself never
+// got created) — used by both main's own setup and runLargeTableWorkloads.
+func must(err error) {
+	if err != nil {
+		log.Fatalf("setup: %v", err)
+	}
+}
+
+// runLargeTableWorkloads seeds a dedicated table with cfg.largeTableRows rows
+// and measures aggregation-query latency and read-back throughput at that
+// scale — the shape of query this project's materialized-table cache
+// (openMaterializedSQLDatabase, see docs/benchmarks.md) targets, as opposed
+// to the ~1000-row table the rest of this tool's workloads use. Only run
+// when --large-table-rows > 0, since seeding tens of thousands of rows adds
+// real time to every run and the default workload set stays fast on
+// purpose.
+func runLargeTableWorkloads(cfg config, c *client) []workloadReport {
+	must(c.createTable(cfg.dataset, "bench_large_events", []map[string]any{
+		{"name": "id", "type": "INT64"},
+		{"name": "bucket", "type": "STRING"},
+		{"name": "amount", "type": "FLOAT64"},
+	}))
+
+	const batch = 500
+	seedLat := &latencies{name: "large_table_seed_insert"}
+	inserted := 0
+	for inserted < cfg.largeTableRows {
+		n := batch
+		if inserted+n > cfg.largeTableRows {
+			n = cfg.largeTableRows - inserted
+		}
+		rows := make([]map[string]any, 0, n)
+		for i := 0; i < n; i++ {
+			id := inserted + i
+			rows = append(rows, map[string]any{"id": id, "bucket": fmt.Sprintf("bucket-%d", id%20), "amount": float64(id%1000) * 1.25})
+		}
+		d, err := c.insertAll(cfg.dataset, "bench_large_events", rows)
+		if err != nil {
+			seedLat.errors++
+			log.Printf("[large_table_seed_insert] batch at offset %d: %v", inserted, err)
+		} else {
+			seedLat.add(d)
+		}
+		inserted += n
+	}
+
+	qualified := cfg.dataset + ".bench_large_events"
+	reports := []workloadReport{toReport(seedLat, fmt.Sprintf("%d rows total, %.0f rows/sec", inserted, float64(inserted)/sumSeconds(seedLat)))}
+
+	reports = append(reports, toReport(runSequentialWorkload("sync_query_large_table_where", 20, cfg.warmup, func() (time.Duration, error) {
+		return c.query(fmt.Sprintf("SELECT COUNT(*), SUM(amount) FROM %s WHERE id > %d", qualified, cfg.largeTableRows/2))
+	}), ""))
+
+	reports = append(reports, toReport(runSequentialWorkload("sync_query_large_table_group_by", 20, cfg.warmup, func() (time.Duration, error) {
+		return c.query(fmt.Sprintf("SELECT bucket, COUNT(*), AVG(amount) FROM %s GROUP BY bucket ORDER BY bucket", qualified))
+	}), ""))
+
+	rowsRead, listDur, err := c.tabledataListAll(cfg.dataset, "bench_large_events", 1000)
+	listLat := &latencies{name: "large_table_tabledata_list"}
+	if err != nil {
+		listLat.errors++
+		log.Printf("[large_table_tabledata_list] %v", err)
+	} else {
+		listLat.add(listDur)
+	}
+	reports = append(reports, toReport(listLat, fmt.Sprintf("%d rows read back, %.0f rows/sec", rowsRead, float64(rowsRead)/listDur.Seconds())))
+
+	return reports
+}
+
 func main() {
 	cfg := parseConfig()
 	c := newClient(cfg)
@@ -542,11 +661,6 @@ func main() {
 		{"name": "category", "type": "STRING"},
 	}
 
-	must := func(err error) {
-		if err != nil {
-			log.Fatalf("setup: %v", err)
-		}
-	}
 	must(c.createDataset(cfg.dataset))
 	must(c.createTable(cfg.dataset, "bench_events", eventsFields))
 	must(c.createTable(cfg.dataset, "bench_labels", labelsFields))
@@ -594,6 +708,10 @@ func main() {
 	rep.Workloads = append(rep.Workloads, toReport(runConcurrentWorkload("concurrent_sync_queries", cfg.iterations, cfg.concurrency, func() (time.Duration, error) {
 		return c.query(fmt.Sprintf("SELECT COUNT(*) FROM %s", qualifiedEvents))
 	}), fmt.Sprintf("concurrency=%d", cfg.concurrency)))
+
+	if cfg.largeTableRows > 0 {
+		rep.Workloads = append(rep.Workloads, runLargeTableWorkloads(cfg, c)...)
+	}
 
 	printReportTable(rep)
 
