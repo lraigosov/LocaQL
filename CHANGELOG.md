@@ -4,6 +4,11 @@ All notable user-facing changes to LocaQL are documented here, in the style of [
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-08-12
+
+### Added
+- `cmd/locaql-bench --large-table-rows N` (opt-in, skipped by default) seeds an additional `N`-row table and runs the same `WHERE`+aggregate and `GROUP BY` shapes as the standard 1,000-row workloads, at whatever scale the caller picks — the same reproducible tool now covers the scale the materialized-table cache (`v0.16.0`) targets, not just the small-table baseline. See [`docs/benchmarks.md`](docs/benchmarks.md#caching-materialized-tables-across-queries) for the before/after numbers this produced.
+
 ## [0.16.0] - 2026-08-12
 
 ### Added
