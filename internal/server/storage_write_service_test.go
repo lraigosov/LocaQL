@@ -353,6 +353,48 @@ func TestStorageWriteGetWriteStreamReturnsSchema(t *testing.T) {
 	}
 }
 
+// TestStorageWriteGetWriteStreamResolvesDefaultStream guards against a real
+// regression found via the official cloud.google.com/go/bigquery/storage/
+// managedwriter client: setting up a DefaultStream writer calls
+// GetWriteStream on the well-known `_default` stream as part of its own
+// connection-pool resolution, even though `_default` is never registered via
+// CreateWriteStream (see AppendRows' own isDefault handling). Without this,
+// GetWriteStream 404s and that client can never append to `_default` at all,
+// despite AppendRows itself working for it when called directly.
+func TestStorageWriteGetWriteStreamResolvesDefaultStream(t *testing.T) {
+	s := newTestServer()
+	loadCSVTable(t, s, "analytics", "write_get_default", idNameFields(), "id,name\n1,alpha\n")
+
+	client := newTestStorageWriteClient(t, s)
+	ctx := context.Background()
+
+	name := writeStreamName("analytics", "write_get_default", storageWriteDefaultStreamID)
+	got, err := client.GetWriteStream(ctx, &storagepb.GetWriteStreamRequest{Name: name})
+	if err != nil {
+		t.Fatalf("GetWriteStream(_default): %v", err)
+	}
+	if got.GetName() != name {
+		t.Fatalf("expected name %q, got %q", name, got.GetName())
+	}
+	if got.GetType() != storagepb.WriteStream_COMMITTED {
+		t.Fatalf("expected the _default stream to report COMMITTED semantics, got %v", got.GetType())
+	}
+	if len(got.GetTableSchema().GetFields()) != 2 {
+		t.Fatalf("expected 2 schema fields (id, name), got %v", got.GetTableSchema())
+	}
+}
+
+func TestStorageWriteGetWriteStreamDefaultStreamMissingTableFailsExplicitly(t *testing.T) {
+	s := newTestServer()
+	client := newTestStorageWriteClient(t, s)
+
+	name := writeStreamName("analytics", "does_not_exist", storageWriteDefaultStreamID)
+	_, err := client.GetWriteStream(context.Background(), &storagepb.GetWriteStreamRequest{Name: name})
+	if status.Code(err) != codes.NotFound {
+		t.Fatalf("expected NotFound for a missing table's _default stream, got %v", err)
+	}
+}
+
 func TestStorageWriteFlushRowsIsUnimplemented(t *testing.T) {
 	s := newTestServer()
 	client := newTestStorageWriteClient(t, s)
