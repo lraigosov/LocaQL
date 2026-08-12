@@ -3,7 +3,7 @@
 [![CI](https://github.com/lraigosov/LocaQL/actions/workflows/ci.yml/badge.svg)](https://github.com/lraigosov/LocaQL/actions/workflows/ci.yml)
 [![Go Report Card](https://goreportcard.com/badge/github.com/lraigosov/LocaQL)](https://goreportcard.com/report/github.com/lraigosov/LocaQL)
 [![Latest release](https://img.shields.io/github/v/release/lraigosov/LocaQL)](https://github.com/lraigosov/LocaQL/releases)
-[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![License: Proprietary](https://img.shields.io/badge/license-Proprietary-red.svg)](LICENSE)
 
 LocaQL is a local BigQuery-compatible development platform.
 
@@ -1107,4 +1107,6 @@ See [`SECURITY.md`](SECURITY.md) for supported versions, scope, and how to repor
 
 ## License
 
-LocaQL is licensed under the [Apache License, Version 2.0](LICENSE). Read [`NOTICE`](NOTICE) before using, deploying, modifying, or forking this project: it explains the attribution you must carry forward into any derivative work, and clarifies that LocaQL is not affiliated with Google or BigQuery.
+LocaQL is licensed under a proprietary [End User License Agreement (EULA)](LICENSE). The Software is free to use strictly for academic research, personal education, training, and limited personal local development testing.
+
+Read the [`LICENSE`](LICENSE) file for the full terms, conditions, and strict operational boundaries of "Limited Local Development Testing" (including single-workstation constraints, prohibition of network hosting, prohibition of corporate automated pipelines, and dataset size limits of 100,000 rows/1 GB). Read [`NOTICE`](NOTICE) before using the Software, which contains third-party attributions and clarifies that LocaQL is not affiliated with Google or BigQuery.
