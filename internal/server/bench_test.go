@@ -118,6 +118,23 @@ func BenchmarkSyncQuerySmallTable(b *testing.B) {
 	}
 }
 
+// BenchmarkSyncQueryLargeTable measures the same WHERE + aggregate shape as
+// BenchmarkSyncQuerySmallTable, but at 50k rows — the scale where the real
+// benchmark-suite comparison (local-support/reporte_benchmark_locaql_vs_bigquery_emulator_2026-08-11.md)
+// found LocaQL 2.9-4.4x slower per query than goccy, to isolate where that
+// gap actually comes from (openMaterializedSQLDatabase's per-query
+// materialization vs. the analyzer/execution/result-conversion steps) via
+// `go test -bench=BenchmarkSyncQueryLargeTable -cpuprofile=cpu.prof`, rather
+// than guessing from reading the code alone.
+func BenchmarkSyncQueryLargeTable(b *testing.B) {
+	s := benchmarkServerWithTable(b, 50000)
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		runBenchQuery(b, s, "SELECT COUNT(*), SUM(amount) FROM bench.bench_events WHERE id > 25000")
+	}
+}
+
 // BenchmarkSyncQueryJoin measures a join between two materialized tables —
 // the path that most exercises openMaterializedSQLDatabase with more than
 // one referenced table.
@@ -215,6 +232,25 @@ func BenchmarkConcurrentSyncQueries(b *testing.B) {
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
 			runBenchQuery(b, s, "SELECT COUNT(*) FROM bench.bench_events")
+		}
+	})
+}
+
+// BenchmarkConcurrentSyncQueriesLargeTable measures the scenario the shared
+// materialization cache (sql_engine_pool.go) targets directly: many
+// concurrent identical read-only queries against the same large table.
+// Before that cache existed, every one of these queries independently paid
+// the full 50k-row materialization cost (74% of a single query's time, see
+// docs/benchmarks.md); with it, concurrent queries sharing the same
+// (table, version) signature join one already-materialized connection
+// instead of each re-materializing from scratch.
+func BenchmarkConcurrentSyncQueriesLargeTable(b *testing.B) {
+	s := benchmarkServerWithTable(b, 50000)
+	b.ResetTimer()
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			runBenchQuery(b, s, "SELECT COUNT(*), SUM(amount) FROM bench.bench_events WHERE id > 25000")
 		}
 	})
 }

@@ -738,6 +738,38 @@ func isPersistentAlterTableStatement(projectID, queryText string) bool {
 	return handled
 }
 
+// isMutatingOrSessionControlStatement is the single source of truth for
+// "does this query text mutate a base table's catalog state, or a session's
+// own temp-table/transaction state, rather than just reading". Every
+// persistent-statement parser is checked, not just parsePersistentSQLStatement
+// — CREATE/DROP [MATERIALIZED] VIEW, CREATE SCHEMA and every ALTER TABLE
+// action each have their own dedicated parser, and a statement type missing
+// from this check is a real, previously-hit bug class (see CREATE VIEW's
+// history in devlog.md): computeQueryJobResultRows' early-poll guard used to
+// check these one at a time inline and had missed some of them; the SQL
+// engine's materialization cache (openMaterializedSQLDatabase) needs the
+// exact same completeness, since a mutating statement must never be allowed
+// to run against a connection shared with concurrent readers of a cached
+// snapshot. Both now call this one function so the two checks cannot drift
+// apart again.
+func isMutatingOrSessionControlStatement(projectID, queryText string) bool {
+	if _, mutating, _ := parsePersistentSQLStatement(projectID, queryText); mutating {
+		return true
+	}
+	if _, viewMutating, _ := parsePersistentViewStatement(projectID, queryText); viewMutating {
+		return true
+	}
+	if _, _, createSchemaMutating := parseCreateSchemaStatement(queryText); createSchemaMutating {
+		return true
+	}
+	if isPersistentAlterTableStatement(projectID, queryText) {
+		return true
+	}
+	trimmedQuery := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(queryText), ";"))
+	return sessionBeginPattern.MatchString(trimmedQuery) || sessionCommitPattern.MatchString(trimmedQuery) ||
+		sessionRollbackPattern.MatchString(trimmedQuery) || sessionCreateTempTablePattern.MatchString(trimmedQuery)
+}
+
 // executePersistentAlterTableStatement is ALTER TABLE's single entry point,
 // trying each action-specific parser in turn (ADD COLUMN, DROP COLUMN,
 // RENAME COLUMN, RENAME TO, SET OPTIONS) and dispatching to whichever one

@@ -563,16 +563,172 @@ func (s *Server) expandWildcardTableRefs(projectID string, refs []datasetTableRe
 // FROM/JOIN, while a CREATE TABLE target needs its dataset schema created even
 // though the table does not exist yet. allowPartitionPruning must remain false
 // for persistent mutations so their materialized source cannot be narrowed.
+// resolvedTableMaterialization is what one referenced table resolves to,
+// computed before any engine is acquired — see openMaterializedSQLDatabase.
+type resolvedTableMaterialization struct {
+	ref            datasetTableRef
+	fields         []tableField
+	rows           [][]string
+	found          bool
+	version        int
+	hasVersion     bool // false for session-scoped temp tables, or a ref not found in the catalog at all
+	processedBytes int64
+}
+
+// materializationPlan groups the inputs to resolveTableForMaterialization
+// that stay constant across every referenced table in one
+// openMaterializedSQLDatabase call, so per-ref calls only need to add what
+// actually varies per ref.
+type materializationPlan struct {
+	projectID             string
+	queryText             string
+	sess                  *sessionRecord
+	visiting              map[string]bool
+	allowPartitionPruning bool
+	singleRef             bool
+}
+
+// catalogTableForRef resolves ref's catalogTable (nil for a session-scoped
+// ref, or one not yet in the catalog) and enforces requirePartitionFilter
+// before any row data is read — exactly the two lookups
+// openMaterializedSQLDatabase's per-ref loop always did.
+func (s *Server) catalogTableForRef(plan materializationPlan, ref datasetTableRef, requireFilterCheck bool) (*tableRecord, error) {
+	if strings.EqualFold(ref.datasetID, sessionDatasetName) {
+		return nil, nil
+	}
+	table, ok, _ := s.tables.get(plan.projectID, ref.datasetID, ref.tableID)
+	if !ok {
+		return nil, nil
+	}
+	if requireFilterCheck && table.RequirePartitionFilter && !queryHasPartitionFilter(plan.queryText, table) {
+		return nil, fmt.Errorf("cannot query over table %s.%s without a filter on its partitioning column", ref.datasetID, ref.tableID)
+	}
+	return table, nil
+}
+
+// pruneIfEligible applies this project's existing single-table partition
+// pruning and reports whether it actually narrowed rows — a pruned result
+// must never be cached (see resolveTableForMaterialization), since it is a
+// subset of the table, not the table itself.
+func pruneIfEligible(plan materializationPlan, ref datasetTableRef, catalogTable *tableRecord, rows [][]string) ([][]string, *tableRecord, bool) {
+	if !plan.allowPartitionPruning || catalogTable == nil || !plan.singleRef {
+		return rows, catalogTable, false
+	}
+	prunedRows, prunedPartitions, pruned := prunePartitionedRows(plan.queryText, plan.projectID, ref, catalogTable, rows)
+	if !pruned {
+		return rows, catalogTable, false
+	}
+	if catalogTable.TimePartitioning != nil && catalogTable.TimePartitioning.Field == "" {
+		materializedTable := *catalogTable
+		materializedTable.IngestionPartitions = prunedPartitions
+		catalogTable = &materializedTable
+	}
+	return prunedRows, catalogTable, true
+}
+
+// resolveTableForMaterialization reproduces exactly what
+// openMaterializedSQLDatabase's per-ref loop always did — the
+// partition-filter check, session-temp-vs-catalog resolution, and partition
+// pruning — but returns its result instead of writing straight into a
+// pooled engine, so the caller can decide *which* engine to write it into
+// (a fresh/private one, or one already shared and up to date) only after
+// every ref has been resolved.
+func (s *Server) resolveTableForMaterialization(plan materializationPlan, ref datasetTableRef, requireFilterCheck bool) (resolvedTableMaterialization, error) {
+	catalogTable, err := s.catalogTableForRef(plan, ref, requireFilterCheck)
+	if err != nil {
+		return resolvedTableMaterialization{}, err
+	}
+
+	r := resolvedTableMaterialization{ref: ref}
+	if plan.sess != nil && strings.EqualFold(ref.datasetID, sessionDatasetName) {
+		if t, ok := plan.sess.getTempTable(ref.tableID); ok {
+			r.fields, r.rows, r.found = t.Fields, t.Rows, true
+		}
+		return r, nil // session-scoped: hasVersion stays false, never cacheable
+	}
+
+	fields, rows, found, err := s.resolveTableRowsVisiting(plan.projectID, ref.datasetID, ref.tableID, plan.visiting)
+	if err != nil {
+		return resolvedTableMaterialization{}, err
+	}
+	r.found = found
+	if !found {
+		return r, nil
+	}
+	if catalogTable != nil && catalogTable.External == nil && catalogTable.View == nil {
+		// Two cases whose Version cannot stand in for "the materialized
+		// rows are still correct": an external table's Version never
+		// changes when its underlying file does (see
+		// TestExternalTableQueryReflectsLiveFileContents), and a view's
+		// Version only changes when the view's own query text changes, not
+		// when a base table it selects from does — resolveTableRowsVisiting
+		// always re-executes the view query fresh regardless, so disabling
+		// the cache here costs nothing beyond that recursive resolution,
+		// which itself still benefits from the shared cache on the base
+		// tables it references.
+		r.version, r.hasVersion = catalogTable.Version, true
+	}
+	var pruned bool
+	rows, catalogTable, pruned = pruneIfEligible(plan, ref, catalogTable, rows)
+	if pruned {
+		r.hasVersion = false // a pruned subset must never be mistaken for the whole table by a later cache lookup
+	}
+	r.processedBytes = estimateRowsByteSize(rows)
+	r.fields, r.rows = materializeIngestionPseudocolumns(catalogTable, fields, rows)
+	return r, nil
+}
+
+// openMaterializedSQLDatabase resolves every table queryText references,
+// then acquires an embedded-engine connection to run it against: a private,
+// exclusively-owned one for anything that can mutate a base table or touches
+// session-scoped/pruned data (matching this project's original,
+// materialize-fresh-every-time behavior exactly), or — for a plain read-only
+// query whose referenced tables are all still at the exact catalog version
+// they were last materialized at — a connection possibly already shared
+// with other concurrent read-only queries wanting the identical table set,
+// skipping materialization entirely on a hit. See sql_engine_pool.go for
+// why table versions make this safe, and docs/benchmarks.md for the
+// profiling that motivated it: materializing a 50k-row table into a fresh
+// engine on every single query was 74% of that query's total time.
 func (s *Server) openMaterializedSQLDatabase(projectID, queryText string, visiting map[string]bool, sess *sessionRecord, extraRefs []datasetTableRef, allowPartitionPruning bool) (db *sql.DB, release func(), processedBytes int64, err error) {
-	pe, err := s.sqlEngines.acquire()
+	combined, requireFilterCheck, singleRef := combinedTableRefs(s, projectID, queryText, extraRefs)
+	plan := materializationPlan{projectID: projectID, queryText: queryText, sess: sess, visiting: visiting, allowPartitionPruning: allowPartitionPruning, singleRef: singleRef}
+	resolved, cacheable, resolveErr := s.resolveAllRefs(plan, combined, requireFilterCheck, !isMutatingOrSessionControlStatement(projectID, queryText))
+	if resolveErr != nil {
+		return nil, nil, 0, resolveErr
+	}
+
+	sig := cacheSignature(cacheable, resolved)
+	pe, hit, shared, err := s.sqlEngines.acquire(sig)
 	if err != nil {
 		return nil, nil, 0, err
 	}
-	db = pe.db
-	release = func() { s.sqlEngines.release(pe) }
+	release = releaseFunc(s.sqlEngines, pe, shared)
 
+	for _, r := range resolved {
+		processedBytes += r.processedBytes
+	}
+	if hit {
+		return pe.db, release, processedBytes, nil
+	}
+	if err := materializeAllResolved(pe, resolved, shared); err != nil {
+		release()
+		return nil, nil, 0, err
+	}
+	if shared {
+		s.sqlEngines.tagSignature(pe, sig)
+	}
+	return pe.db, release, processedBytes, nil
+}
+
+// combinedTableRefs merges queryText's wildcard-expanded table references
+// with extraRefs (deduplicated), and reports which of them need the
+// require-partition-filter check (every directly referenced table, plus an
+// UPDATE/DELETE/MERGE target) and whether refs resolved to exactly one
+// table — the condition under which single-table partition pruning applies.
+func combinedTableRefs(s *Server, projectID, queryText string, extraRefs []datasetTableRef) (combined []datasetTableRef, requireFilterCheck map[datasetTableRef]bool, singleRef bool) {
 	refs := s.expandWildcardTableRefs(projectID, referencedTables(queryText, projectID))
-	requireFilterCheck := make(map[datasetTableRef]bool, len(refs)+len(extraRefs))
+	requireFilterCheck = make(map[datasetTableRef]bool, len(refs)+len(extraRefs))
 	for _, ref := range refs {
 		requireFilterCheck[ref] = true
 	}
@@ -583,7 +739,7 @@ func (s *Server) openMaterializedSQLDatabase(projectID, queryText string, visiti
 		}
 	}
 	seen := make(map[datasetTableRef]bool, len(refs)+len(extraRefs))
-	combined := make([]datasetTableRef, 0, len(refs)+len(extraRefs))
+	combined = make([]datasetTableRef, 0, len(refs)+len(extraRefs))
 	for _, ref := range append(refs, extraRefs...) {
 		if seen[ref] {
 			continue
@@ -591,75 +747,128 @@ func (s *Server) openMaterializedSQLDatabase(projectID, queryText string, visiti
 		seen[ref] = true
 		combined = append(combined, ref)
 	}
+	return combined, requireFilterCheck, len(refs) == 1
+}
+
+// resolveAllRefs resolves every ref in combined and reports whether the
+// whole set remains cacheable — it stops being so the moment any resolved
+// ref lacks a stable catalog version (session-scoped or partition-pruned).
+func (s *Server) resolveAllRefs(plan materializationPlan, combined []datasetTableRef, requireFilterCheck map[datasetTableRef]bool, cacheable bool) ([]resolvedTableMaterialization, bool, error) {
+	resolved := make([]resolvedTableMaterialization, 0, len(combined))
 	for _, ref := range combined {
-		var catalogTable *tableRecord
-		if requireFilterCheck[ref] && !strings.EqualFold(ref.datasetID, sessionDatasetName) {
-			if table, ok, _ := s.tables.get(projectID, ref.datasetID, ref.tableID); ok {
-				catalogTable = table
-				if table.RequirePartitionFilter && !queryHasPartitionFilter(queryText, table) {
-					s.sqlEngines.release(pe)
-					return nil, nil, 0, fmt.Errorf("cannot query over table %s.%s without a filter on its partitioning column", ref.datasetID, ref.tableID)
-				}
-			}
+		r, err := s.resolveTableForMaterialization(plan, ref, requireFilterCheck[ref])
+		if err != nil {
+			return nil, false, err
 		}
-		if catalogTable == nil && !strings.EqualFold(ref.datasetID, sessionDatasetName) {
-			if table, ok, _ := s.tables.get(projectID, ref.datasetID, ref.tableID); ok {
-				catalogTable = table
-			}
+		if !r.hasVersion {
+			cacheable = false
 		}
-		var fields []tableField
-		var rows [][]string
-		found := false
-		if sess != nil && strings.EqualFold(ref.datasetID, sessionDatasetName) {
-			t, ok := sess.getTempTable(ref.tableID)
-			if ok {
-				fields, rows, found = t.Fields, t.Rows, true
-			}
+		resolved = append(resolved, r)
+	}
+	return resolved, cacheable, nil
+}
+
+// cacheSignature computes the shared-cache signature for resolved, or ""
+// when the set isn't cacheable at all — callers treat an empty signature as
+// "always acquire a private, exclusively-owned connection."
+func cacheSignature(cacheable bool, resolved []resolvedTableMaterialization) string {
+	if !cacheable {
+		return ""
+	}
+	cacheRefs := make([]cacheableTableRef, 0, len(resolved))
+	for _, r := range resolved {
+		cacheRefs = append(cacheRefs, cacheableTableRef{datasetID: r.ref.datasetID, tableID: r.ref.tableID, version: r.version})
+	}
+	return tableSignature(cacheRefs)
+}
+
+// releaseFunc closes over which release path pe must go through, so
+// openMaterializedSQLDatabase's callers can defer it without knowing
+// whether the connection ended up shared or private.
+func releaseFunc(pool *sqlEnginePool, pe *pooledEngine, shared bool) func() {
+	return func() {
+		if shared {
+			pool.releaseShared(pe)
 		} else {
-			var ok bool
-			fields, rows, ok, err = s.resolveTableRowsVisiting(projectID, ref.datasetID, ref.tableID, visiting)
-			if err != nil {
-				s.sqlEngines.release(pe)
-				return nil, nil, 0, err
-			}
-			found = ok
-		}
-		if err := pe.ensureSchema(ref.datasetID); err != nil {
-			s.sqlEngines.release(pe)
-			return nil, nil, 0, fmt.Errorf("materialize dataset %s: %w", ref.datasetID, err)
-		}
-		// Marked here, unconditionally, not only after a successful
-		// materializeTable below: a DDL/DML target that does not exist yet
-		// in LocaQL's own catalog (found == false, e.g. a fresh CREATE
-		// TABLE) is never passed to materializeTable, but the statement the
-		// caller runs against this same connection right after
-		// openMaterializedSQLDatabase returns creates it for real on the
-		// engine regardless — release() must drop it before this connection
-		// is reused, or the next reuse's CREATE TABLE for the same name
-		// fails with "table already exists" (a real bug caught by
-		// TestPersistentCreateTableSchemaAndReplace while building this).
-		pe.markTableMaterialized(ref.datasetID, ref.tableID)
-		if !found {
-			continue
-		}
-		if allowPartitionPruning && catalogTable != nil && len(refs) == 1 {
-			if prunedRows, prunedPartitions, pruned := prunePartitionedRows(queryText, projectID, ref, catalogTable, rows); pruned {
-				rows = prunedRows
-				if catalogTable.TimePartitioning != nil && catalogTable.TimePartitioning.Field == "" {
-					materializedTable := *catalogTable
-					materializedTable.IngestionPartitions = prunedPartitions
-					catalogTable = &materializedTable
-				}
-			}
-		}
-		processedBytes += estimateRowsByteSize(rows)
-		fields, rows = materializeIngestionPseudocolumns(catalogTable, fields, rows)
-		if err := materializeTable(db, ref.datasetID, ref.tableID, fields, rows); err != nil {
-			s.sqlEngines.release(pe)
-			return nil, nil, 0, fmt.Errorf("materialize table %s.%s: %w", ref.datasetID, ref.tableID, err)
+			pool.releasePrivate(pe)
 		}
 	}
-	return db, release, processedBytes, nil
+}
+
+// materializeAllResolved reconciles pe (for a shared connection being
+// repurposed to a new signature) and then materializes every resolved ref
+// pe doesn't already have at the right version.
+func materializeAllResolved(pe *pooledEngine, resolved []resolvedTableMaterialization, shared bool) error {
+	if shared {
+		if err := reconcileSharedEngine(pe, resolved); err != nil {
+			return fmt.Errorf("reconcile shared engine: %w", err)
+		}
+	}
+	for _, r := range resolved {
+		if err := materializeResolvedRef(pe, r); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// reconcileSharedEngine drops every table pe currently has materialized that
+// is not part of wanted — necessary before reusing a connection that
+// previously served a *different* signature (a fresh or exact-signature-hit
+// connection never has anything extra, by construction).
+func reconcileSharedEngine(pe *pooledEngine, wanted []resolvedTableMaterialization) error {
+	want := make(map[string]bool, len(wanted))
+	for _, r := range wanted {
+		want[r.ref.datasetID+"."+r.ref.tableID] = true
+	}
+	for key := range pe.tables {
+		if want[key] {
+			continue
+		}
+		datasetID, tableID := splitTableKey(key)
+		if err := pe.dropMaterialized(datasetID, tableID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// materializeResolvedRef brings pe's copy of r's table in line with r,
+// skipping the real materialization work entirely when pe already has it at
+// the exact version r resolved to.
+func materializeResolvedRef(pe *pooledEngine, r resolvedTableMaterialization) error {
+	if existingVersion, ok := pe.materializedVersion(r.ref.datasetID, r.ref.tableID); ok && r.hasVersion && existingVersion == r.version {
+		return nil
+	}
+	if err := pe.ensureSchema(r.ref.datasetID); err != nil {
+		return fmt.Errorf("materialize dataset %s: %w", r.ref.datasetID, err)
+	}
+	// Marked unconditionally, not only after a successful materializeTable
+	// below: a DDL/DML target that does not exist yet in LocaQL's own
+	// catalog (found == false, e.g. a fresh CREATE TABLE) is never passed to
+	// materializeTable, but the statement the caller runs against this same
+	// connection right after openMaterializedSQLDatabase returns creates it
+	// for real on the engine regardless — release must drop it before this
+	// connection is reused, or the next reuse's CREATE TABLE for the same
+	// name fails with "table already exists" (a real bug caught by
+	// TestPersistentCreateTableSchemaAndReplace while building this).
+	pe.markTableMaterialized(r.ref.datasetID, r.ref.tableID, r.version)
+	if !r.found {
+		return nil
+	}
+	if err := materializeTable(pe.db, r.ref.datasetID, r.ref.tableID, r.fields, r.rows); err != nil {
+		return fmt.Errorf("materialize table %s.%s: %w", r.ref.datasetID, r.ref.tableID, err)
+	}
+	return nil
+}
+
+func splitTableKey(key string) (datasetID, tableID string) {
+	for i := 0; i < len(key); i++ {
+		if key[i] == '.' {
+			return key[:i], key[i+1:]
+		}
+	}
+	return key, ""
 }
 
 // rewriteIngestionPseudocolumns replaces public pseudocolumn identifiers only
@@ -1007,35 +1216,82 @@ func materializeTable(db *sql.DB, datasetID, tableID string, fields []tableField
 	if hasNested {
 		return materializeNestedRows(db, qualified, fields, rows)
 	}
+	return materializeScalarRows(db, qualified, fields, rows)
+}
 
+// materializeScalarRows bulk-inserts rows with no RECORD/REPEATED column
+// inside one explicit transaction, one stmt.Exec per row against a single
+// reused prepared statement. Measured directly (go test -bench
+// BenchmarkSyncQueryLargeTable -cpuprofile=cpu.prof, then go tool pprof -top
+// -cum): at 50k rows, a naive one-Exec-per-row loop with no explicit
+// transaction spent 74% of total per-query time here — wrapping it in one
+// transaction (avoiding a separate SQLite commit per row) measurably helps
+// (~11% faster overall in the same benchmark). A multi-row batched INSERT
+// (many rows' values folded into one larger VALUES list per statement) was
+// also tried and measured, expecting a further win by amortizing the fixed
+// per-stmt.Exec cost (value encoding/type resolution inside the
+// WASM-transpiled engine) across more rows — it instead made this
+// benchmark ~5.5x *slower*: the engine's own parse/analyze cost for one
+// large, unprepared statement (hundreds of bound parameters) scales far
+// worse than linearly with statement complexity, dwarfing the per-call
+// overhead it was meant to amortize. Kept as one-row-at-a-time on purpose;
+// do not reintroduce multi-row batching here without re-measuring.
+func materializeScalarRows(db *sql.DB, qualified string, fields []tableField, rows [][]string) error {
 	placeholders := make([]string, len(fields))
 	for i := range placeholders {
 		placeholders[i] = "?"
 	}
-	stmt, err := db.Prepare(fmt.Sprintf("INSERT INTO %s VALUES (%s)", qualified, strings.Join(placeholders, ", ")))
+
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin materialize transaction: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	stmt, err := tx.Prepare(fmt.Sprintf("INSERT INTO %s VALUES (%s)", qualified, strings.Join(placeholders, ", ")))
 	if err != nil {
 		return err
 	}
 	defer stmt.Close()
 
 	for _, row := range rows {
-		values := make([]any, len(fields))
-		for i, f := range fields {
-			cell := storedNullCell
-			if i < len(row) {
-				cell = row[i]
-			}
-			v, err := convertScalarForInsert(f.Type, cell)
-			if err != nil {
-				return fmt.Errorf("column %s: %w", f.Name, err)
-			}
-			values[i] = v
+		values, err := scalarRowValues(fields, row)
+		if err != nil {
+			return err
 		}
 		if _, err := stmt.Exec(values...); err != nil {
 			return err
 		}
 	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit materialize transaction: %w", err)
+	}
+	committed = true
 	return nil
+}
+
+// scalarRowValues converts one stored string-cell row into the driver
+// argument list for materializeScalarRows' prepared INSERT, in column order.
+func scalarRowValues(fields []tableField, row []string) ([]any, error) {
+	values := make([]any, len(fields))
+	for i, f := range fields {
+		cell := storedNullCell
+		if i < len(row) {
+			cell = row[i]
+		}
+		v, err := convertScalarForInsert(f.Type, cell)
+		if err != nil {
+			return nil, fmt.Errorf("column %s: %w", f.Name, err)
+		}
+		values[i] = v
+	}
+	return values, nil
 }
 
 // materializeNestedRows inserts rows for a schema that has at least one
