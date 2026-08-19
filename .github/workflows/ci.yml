@@ -438,7 +438,11 @@ jobs:
           path: licenses.csv
       - name: Fail on forbidden (copyleft-incompatible) licenses
         run: go-licenses check ./...
-      - run: go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@latest
+      # Pinned to v1.10.0: v1.11.0 requires go >= 1.26.0, ahead of this
+      # project's pinned toolchain (go.mod) — @latest picked it up and
+      # failed outright before producing any report. v1.10.0 only requires
+      # go >= 1.25, which this project's pinned version already satisfies.
+      - run: go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.10.0
       - name: Generate CycloneDX SBOM (artifact; not committed — see `make sbom`)
         run: cyclonedx-gomod app -json -output sbom.json -main cmd/locaql -licenses .
       - uses: actions/upload-artifact@v7

@@ -23,6 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.version.outputs.tag }}
+      skip: ${{ steps.version.outputs.skip }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -67,8 +68,18 @@ jobs:
           if git show-ref --verify --quiet "refs/tags/${tag}"; then
             tag_sha=$(git rev-list -n 1 "$tag")
             if [ "$tag_sha" != "$merge_sha" ]; then
-              echo "Tag ${tag} already exists on ${tag_sha}, not promotion commit ${merge_sha}." >&2
-              exit 1
+              # [Unreleased] was already confirmed empty above, so the only
+              # way the dated section right after it can be an
+              # already-tagged version is that prepare-release.yml genuinely
+              # had nothing to promote since that release (e.g. a dev ->
+              # main promotion carrying only non-CHANGELOG-worthy changes,
+              # like license/legal documents) — not a version-number
+              # collision with real new content, which would always show up
+              # as a fresh dated section instead. Skip cleanly rather than
+              # failing red for what is not actually an error.
+              echo "Nothing new to release: the dated section after the empty [Unreleased] is ${tag}, already tagged on ${tag_sha}, not this promotion commit ${merge_sha}. No tag created; this is expected when a promotion carries no CHANGELOG-worthy change."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
             fi
             echo "Tag ${tag} already points to this promotion commit; continuing idempotently."
             exists=true
@@ -89,7 +100,7 @@ jobs:
           echo "exists=$exists" >> "$GITHUB_OUTPUT"
 
       - name: Create and push the release tag
-        if: steps.version.outputs.exists != 'true'
+        if: steps.version.outputs.skip != 'true' && steps.version.outputs.exists != 'true'
         env:
           TAG: ${{ steps.version.outputs.tag }}
         shell: bash
@@ -102,6 +113,7 @@ jobs:
 
   release:
     needs: tag
+    if: needs.tag.outputs.skip != 'true'
     uses: ./.github/workflows/release.yml
     with:
       tag: ${{ needs.tag.outputs.tag }}

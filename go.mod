@@ -1,6 +1,6 @@
 module github.com/lraigosov/LocaQL
 
-go 1.25.12
+go 1.25.14
 
 require (
 	cloud.google.com/go/bigquery v1.79.0

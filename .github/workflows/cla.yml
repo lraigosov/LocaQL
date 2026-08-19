@@ -12,9 +12,10 @@ name: CLA Assistant
 #      cla-signatures — create that branch, e.g. `git switch --orphan
 #      cla-signatures && git commit --allow-empty -m init && git push -u
 #      origin cla-signatures`).
-# Until this setup is done, this workflow will fail on its first real PR
-# instead of silently doing nothing — that failure is the signal the setup
-# step above is still pending, not a bug in the workflow itself.
+# Until that setup is done, the check below skips cleanly (rather than
+# failing red on every single PR, including the owner's own) — the "skipped"
+# step-summary line is the signal the setup above is still pending, not a
+# bug in this workflow.
 
 on:
   issue_comment:
@@ -32,8 +33,13 @@ jobs:
   cla-check:
     runs-on: ubuntu-latest
     steps:
+      - name: Check whether PERSONAL_ACCESS_TOKEN setup (see comment above) is done yet
+        id: setup-check
+        env:
+          PERSONAL_ACCESS_TOKEN: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+        run: echo "configured=${{ env.PERSONAL_ACCESS_TOKEN != '' }}" >> "$GITHUB_OUTPUT"
       - name: CLA Assistant
-        if: (github.event.comment.body == 'I have read the CLA Document and I hereby sign the CLA' || github.event_name == 'pull_request_target') && !github.event.pull_request.merged
+        if: steps.setup-check.outputs.configured == 'true' && (github.event.comment.body == 'I have read the CLA Document and I hereby sign the CLA' || github.event_name == 'pull_request_target') && !github.event.pull_request.merged
         uses: contributor-assistant/github-action@v2.6.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
