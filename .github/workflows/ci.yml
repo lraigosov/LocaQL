@@ -17,6 +17,11 @@ jobs:
   test:
     name: Build, vet, test, race (linux)
     runs-on: ubuntu-latest
+    # Same-repo pull_request events (feature -> dev, dev -> main) are also
+    # covered by the push trigger above for the identical commit — skip here
+    # to avoid running this entire job twice for one commit. Fork PRs (the
+    # only case push can never see) still run normally.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -30,6 +35,11 @@ jobs:
   e2e:
     name: End-to-end console tests (Chrome, linux)
     runs-on: ubuntu-latest
+    # Same-repo pull_request events (feature -> dev, dev -> main) are also
+    # covered by the push trigger above for the identical commit — skip here
+    # to avoid running this entire job twice for one commit. Fork PRs (the
+    # only case push can never see) still run normally.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -43,6 +53,11 @@ jobs:
   python-client:
     name: Official Python clients (BigQuery + Storage)
     runs-on: ubuntu-latest
+    # Same-repo pull_request events (feature -> dev, dev -> main) are also
+    # covered by the push trigger above for the identical commit — skip here
+    # to avoid running this entire job twice for one commit. Fork PRs (the
+    # only case push can never see) still run normally.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -89,6 +104,11 @@ jobs:
   node-client:
     name: Official Node.js client (BigQuery)
     runs-on: ubuntu-latest
+    # Same-repo pull_request events (feature -> dev, dev -> main) are also
+    # covered by the push trigger above for the identical commit — skip here
+    # to avoid running this entire job twice for one commit. Fork PRs (the
+    # only case push can never see) still run normally.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -126,6 +146,11 @@ jobs:
   go-client:
     name: Official Go client (BigQuery)
     runs-on: ubuntu-latest
+    # Same-repo pull_request events (feature -> dev, dev -> main) are also
+    # covered by the push trigger above for the identical commit — skip here
+    # to avoid running this entire job twice for one commit. Fork PRs (the
+    # only case push can never see) still run normally.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -160,6 +185,11 @@ jobs:
   java-client:
     name: Official Java client (BigQuery)
     runs-on: ubuntu-latest
+    # Same-repo pull_request events (feature -> dev, dev -> main) are also
+    # covered by the push trigger above for the identical commit — skip here
+    # to avoid running this entire job twice for one commit. Fork PRs (the
+    # only case push can never see) still run normally.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -198,6 +228,11 @@ jobs:
   bq-client:
     name: Official bq CLI
     runs-on: ubuntu-latest
+    # Same-repo pull_request events (feature -> dev, dev -> main) are also
+    # covered by the push trigger above for the identical commit — skip here
+    # to avoid running this entire job twice for one commit. Fork PRs (the
+    # only case push can never see) still run normally.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -230,6 +265,11 @@ jobs:
   ruby-client:
     name: Official Ruby client (BigQuery)
     runs-on: ubuntu-latest
+    # Same-repo pull_request events (feature -> dev, dev -> main) are also
+    # covered by the push trigger above for the identical commit — skip here
+    # to avoid running this entire job twice for one commit. Fork PRs (the
+    # only case push can never see) still run normally.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -264,6 +304,11 @@ jobs:
   php-client:
     name: Official PHP client (BigQuery)
     runs-on: ubuntu-latest
+    # Same-repo pull_request events (feature -> dev, dev -> main) are also
+    # covered by the push trigger above for the identical commit — skip here
+    # to avoid running this entire job twice for one commit. Fork PRs (the
+    # only case push can never see) still run normally.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -300,6 +345,11 @@ jobs:
   dbt-client:
     name: Official dbt-bigquery adapter
     runs-on: ubuntu-latest
+    # Same-repo pull_request events (feature -> dev, dev -> main) are also
+    # covered by the push trigger above for the identical commit — skip here
+    # to avoid running this entire job twice for one commit. Fork PRs (the
+    # only case push can never see) still run normally.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -343,6 +393,11 @@ jobs:
       matrix:
         os: [windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    # Same-repo pull_request events (feature -> dev, dev -> main) are also
+    # covered by the push trigger above for the identical commit — skip here
+    # to avoid running this entire job twice for one commit. Fork PRs (the
+    # only case push can never see) still run normally.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -364,6 +419,11 @@ jobs:
   cross-build:
     name: Cross-compile (${{ matrix.goos }}/${{ matrix.goarch }})
     runs-on: ubuntu-latest
+    # Same-repo pull_request events (feature -> dev, dev -> main) are also
+    # covered by the push trigger above for the identical commit — skip here
+    # to avoid running this entire job twice for one commit. Fork PRs (the
+    # only case push can never see) still run normally.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     strategy:
       fail-fast: false
       matrix:
@@ -393,6 +453,11 @@ jobs:
   vulnerability-scan:
     name: Dependency vulnerability scan (govulncheck)
     runs-on: ubuntu-latest
+    # Same-repo pull_request events (feature -> dev, dev -> main) are also
+    # covered by the push trigger above for the identical commit — skip here
+    # to avoid running this entire job twice for one commit. Fork PRs (the
+    # only case push can never see) still run normally.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -419,6 +484,11 @@ jobs:
   license-scan:
     name: Dependency license scan and SBOM
     runs-on: ubuntu-latest
+    # Same-repo pull_request events (feature -> dev, dev -> main) are also
+    # covered by the push trigger above for the identical commit — skip here
+    # to avoid running this entire job twice for one commit. Fork PRs (the
+    # only case push can never see) still run normally.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7

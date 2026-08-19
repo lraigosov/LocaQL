@@ -1,8 +1,20 @@
 # LocaQL
 
 [![CI](https://github.com/lraigosov/LocaQL/actions/workflows/ci.yml/badge.svg)](https://github.com/lraigosov/LocaQL/actions/workflows/ci.yml)
-[![Go Report Card](https://goreportcard.com/badge/github.com/lraigosov/LocaQL)](https://goreportcard.com/report/github.com/lraigosov/LocaQL)
-[![Latest release](https://img.shields.io/github/v/release/lraigosov/LocaQL)](https://github.com/lraigosov/LocaQL/releases)
+<!-- "Latest release" badge (img.shields.io/github/v/release) removed for now:
+     shields.io's release badge calls the public GitHub API unauthenticated,
+     which cannot see a private repository's releases at all — it renders a
+     hard "no releases or repo not found" regardless of how many real
+     releases exist (verified: 8 real GitHub Releases exist, v0.10.0-v0.17.0).
+     Restore this single line once the repo is public again — no other
+     change needed:
+     [![Latest release](https://img.shields.io/github/v/release/lraigosov/LocaQL)](https://github.com/lraigosov/LocaQL/releases) -->
+<!-- "Go Report Card" badge (goreportcard.com) removed permanently: the
+     service itself was sunset after a decade of operation (announced on
+     goreportcard.com, not specific to this repo) — the badge can never
+     resolve for any project going forward. golangci-lint is the suggested
+     modern replacement for the underlying static-analysis purpose, but it
+     has no equivalent public badge service to link back to. -->
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
 LocaQL is a local BigQuery-compatible development platform.
