@@ -1,11 +1,17 @@
 ================================================================================
-                         LOCAQL END USER LICENSE AGREEMENT
+              LOCAQL COMMUNITY / EVALUATION LICENSE AND EULA
 ================================================================================
 
-This End User License Agreement ("Agreement" or "EULA") is a legal agreement 
-between you (either an individual or a single legal entity, "You" or "User") 
-and Luis Raigoso ("Licensor"), the sole owner and copyright holder of the LocaQL 
-software platform, including all associated source code, binaries, documentation, 
+This is LocaQL's Community/Evaluation License — the free tier, scoped to
+research, education, and limited local evaluation (see Section 4). A
+production, commercial, hosted, OEM, or redistribution use of LocaQL is
+governed by a separate Commercial License (see `COMMERCIAL_LICENSE.md`),
+not by this document.
+
+This End User License Agreement ("Agreement" or "EULA") is a legal agreement
+between you (either an individual or a single legal entity, "You" or "User")
+and Luis Raigoso ("Licensor"), the sole owner and copyright holder of the LocaQL
+software platform, including all associated source code, binaries, documentation,
 and assets (collectively, the "Software").
 
 BY DOWNLOADING, INSTALLING, COPYING, OR OTHERWISE USING THE SOFTWARE, YOU AGREE 
@@ -14,33 +20,71 @@ DO NOT DOWNLOAD, INSTALL, COPY, OR USE THE SOFTWARE.
 
 1. OWNERSHIP AND INTELLECTUAL PROPERTY
 --------------------------------------
-The Software is licensed, not sold. All right, title, and interest in and to 
-the Software—including but not limited to any copyrights, patents, trademarks, 
-trade secrets, designs, and other intellectual property rights—are and shall 
-remain the exclusive property of the Licensor (Luis Raigoso). This Agreement 
-does not transfer any ownership rights to You.
+The Software is licensed, not sold. All right, title, and interest in and to
+the Software—including but not limited to any copyrights, patents, trademarks,
+trade secrets, designs, and other intellectual property rights that the
+Licensor itself owns in the Software—are and shall remain the exclusive
+property of the Licensor (Luis Raigoso). This Agreement does not transfer any
+ownership rights to You. Section 2 below defines exactly what "the Software"
+means for purposes of this ownership claim, and what it does not.
 
-2. PROPRIETARY AND NON-OPEN-SOURCE STATUS
+2. LICENSOR IP VS. THIRD-PARTY COMPONENTS
+--------------------------------------------
+The Software is composed of two distinct categories of material, and this
+Agreement's ownership and licensing terms apply differently to each:
+
+  (a) Licensor IP: the REST API surface, catalog/dataset/table/job
+      orchestration logic, the BigQuery Storage API implementation, the
+      materialized-table caching layer, client-conformance work, and all
+      other original source code, documentation, and design authored by or
+      for the Licensor. This is the material Section 1's ownership claim
+      covers, and the material this Agreement's restrictions in Section 5
+      protect.
+  (b) Third-Party Components: every open-source dependency the Software is
+      built on or distributed with (each under its own license — MIT,
+      Apache License 2.0, BSD, or similar permissive terms; none copyleft),
+      including without limitation the real Google `google/googlesql`
+      (GoogleSQL/ZetaSQL) query engine that the Software runs by way of a
+      dependency chain through `goccy/go-googlesql` and
+      `goccy/googlesqlite`. The Licensor does not own, and does not claim
+      to own, any Third-Party Component — the Licensor's rights over a
+      Third-Party Component extend only as far as that component's own
+      license permits, same as any other user of it. The complete,
+      itemized inventory of Third-Party Components and their licenses is
+      maintained in `THIRD_PARTY_NOTICES.md`, and the specific attribution
+      required for the Google GoogleSQL engine is set out in `NOTICE` —
+      both are incorporated into this Agreement by reference and must be
+      preserved, unmodified, in any copy or distribution of the Software.
+
+Nothing in this Agreement restricts You from independently obtaining, using,
+or distributing any Third-Party Component under its own separate license,
+outside of the Software — this Agreement only governs the Software as
+Licensor distributes it.
+
+3. PROPRIETARY AND NON-OPEN-SOURCE STATUS
 ------------------------------------------
-The Software is proprietary software. It is not licensed under any open-source, 
-free-software, or copyleft licenses (such as GPL, MIT, or Apache 2.0). Nothing 
-in this Agreement shall be construed as making the Software "open-source."
+The Licensor IP defined in Section 2(a) is proprietary software. It is not
+licensed under any open-source, free-software, or copyleft license (such as
+GPL, MIT, or Apache 2.0) — the Third-Party Components described in Section
+2(b) remain under their own respective open-source licenses regardless.
+Nothing in this Agreement shall be construed as making the Licensor IP
+"open-source."
 
-3. LICENSE GRANT AND PERMITTED USES
+4. LICENSE GRANT AND PERMITTED USES
 -----------------------------------
-Subject to Your strict compliance with all terms of this Agreement, the Licensor 
-hereby grants You a personal, worldwide, non-exclusive, non-transferable, 
-non-sublicensable, revocable, and royalty-free license to use and execute the 
+Subject to Your strict compliance with all terms of this Agreement, the Licensor
+hereby grants You a personal, worldwide, non-exclusive, non-transferable,
+non-sublicensable, revocable, and royalty-free license to use and execute the
 Software solely for the following limited purposes:
   (a) Academic and scientific research;
   (b) Personal education, training, and self-learning;
-  (c) Limited Local Development Testing (strictly subject to the constraints 
-      defined in Section 4).
+  (c) Limited Local Development Testing (strictly subject to the constraints
+      defined in Section 5).
 
-4. LIMITS AND CONSTRAINTS FOR LOCAL DEVELOPMENT TESTING
+5. LIMITS AND CONSTRAINTS FOR LOCAL DEVELOPMENT TESTING
 -------------------------------------------------------
-To qualify as permitted "Limited Local Development Testing" under Section 3(c), 
-Your execution and use of the Software must adhere strictly to all of the 
+To qualify as permitted "Limited Local Development Testing" under Section 4(c),
+Your execution and use of the Software must adhere strictly to all of the
 following operational boundaries:
   
   (a) Single-Workstation Execution: The Software must run solely on a single, 
@@ -67,20 +111,42 @@ following operational boundaries:
       in any production environment, live application, or for any core 
       commercial business operations.
 
-5. RESTRICTIONS
+6. RESTRICTIONS
 ---------------
-Except as explicitly permitted in Section 3, You shall not (and shall not 
-permit any third party to):
-  (a) Sublicense, sell, rent, lease, distribute, redistribute, host, or 
-      otherwise commercially exploit or transfer the Software or any rights 
-      granted under this Agreement to third parties.
-  (b) Modify, adapt, translate, reverse engineer, decompile, or disassemble 
-      the Software, except to the minimum extent necessary for debugging or 
-      compatibility as permitted by applicable law.
-  (c) Create derivative works, commercial forks, or use the Software or its 
-      design as the basis for building a competing product or service.
+Except as explicitly permitted in Section 4, You shall not (and shall not
+permit any third party to), whether directly or through an intermediary,
+affiliate, contractor, or automated agent:
+  (a) Software-as-a-Service / Hosting: host, operate, or make the Software
+      (or any modified or derivative version of it) available to any third
+      party over a network, whether as a paid or free offering, including
+      but not limited to any "LocaQL-as-a-Service" product, a managed or
+      hosted instance, or embedding it as the backing engine of another
+      hosted service;
+  (b) OEM / Reseller / Sublicensing / Redistribution: embed, bundle,
+      resell, distribute, redistribute, sublicense, white-label, or offer
+      the Software as part of another product or service (an "OEM"
+      arrangement), whether for a fee or at no charge, to any third party;
+  (c) Sale, Rental, or Transfer: sell, rent, lease, lend, or otherwise
+      transfer the Software or any rights granted under this Agreement to
+      any third party;
+  (d) Reverse Engineering: modify, adapt, translate, reverse engineer,
+      decompile, or disassemble the Software, except to the minimum extent
+      necessary for debugging or interoperability as expressly permitted by
+      applicable law notwithstanding this restriction;
+  (e) Competing Products: create derivative works or commercial forks of
+      the Software, or use the Software, its source code, or its design as
+      the basis for building, developing, marketing, or distributing a
+      product or service that competes with the Software or with any
+      commercial offering the Licensor provides based on the Software.
 
-6. CONTRIBUTIONS AND INTELLECTUAL PROPERTY ASSIGNMENT
+Each of the uses restricted in this Section may be separately authorized
+under a written Commercial License, OEM Agreement, or other agreement
+executed by the Licensor — this Agreement's restrictions apply only in the
+absence of such a separate, express written agreement, and nothing in this
+Section should be read as an offer to enter into one. For information about
+obtaining such an agreement, contact the Licensor at [CONTACT EMAIL].
+
+7. CONTRIBUTIONS AND INTELLECTUAL PROPERTY ASSIGNMENT
 ------------------------------------------------------
 By submitting any code, documentation, bug reports, feature requests, or 
 other feedback ("Contributions") to the LocaQL repository, project, or Licensor, 
@@ -96,7 +162,7 @@ derivative works of, sublicense, and re-license Your Contributions under any
 terms (including proprietary, fully commercial, or closed-source models) at the 
 Licensor's sole discretion, without credit or compensation to You.
 
-7. RESERVATION OF RIGHTS AND FUTURE MONETIZATION
+8. RESERVATION OF RIGHTS AND FUTURE MONETIZATION
 -------------------------------------------------
 The Licensor reserves all rights not expressly granted to You in this Agreement. 
 The Licensor reserves the right, at his sole and absolute discretion, to:
@@ -108,7 +174,7 @@ The Licensor reserves the right, at his sole and absolute discretion, to:
       transaction or change of terms shall not affect the proprietary ownership 
       of the Software by the Licensor or his designated successors.
 
-8. TERMINATION
+9. TERMINATION
 --------------
 This Agreement and the license granted hereunder shall terminate automatically 
 and immediately, without notice from the Licensor, if You fail to comply with 
@@ -116,7 +182,7 @@ any term or condition of this Agreement. Upon termination, You must immediately
 cease all use of the Software and destroy all copies of the Software in Your 
 possession.
 
-9. DISCLAIMER OF WARRANTY
+10. DISCLAIMER OF WARRANTY
 -------------------------
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR 
 IMPLIED—INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS 
