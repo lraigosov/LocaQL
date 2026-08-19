@@ -18,9 +18,9 @@ type Rule struct {
 
 // Result contains a validation report for a workspace.
 type Result struct {
-	Root              string
-	Found             []string
-	MissingRequired   []string
+	Root               string
+	Found              []string
+	MissingRequired    []string
 	MissingRecommended []string
 }
 

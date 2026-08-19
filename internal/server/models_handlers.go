@@ -57,10 +57,10 @@ func (s *Server) insertModel(w http.ResponseWriter, r *http.Request, projectID, 
 	}()
 
 	var payload struct {
-		ModelType     string            `json:"modelType"`
-		FriendlyName  string            `json:"friendlyName"`
-		Description   string            `json:"description"`
-		Labels        map[string]string `json:"labels"`
+		ModelType      string            `json:"modelType"`
+		FriendlyName   string            `json:"friendlyName"`
+		Description    string            `json:"description"`
+		Labels         map[string]string `json:"labels"`
 		ModelReference struct {
 			ModelID string `json:"modelId"`
 		} `json:"modelReference"`

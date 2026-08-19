@@ -85,7 +85,7 @@ func TestRunWorkspaceApplyDeleteMissingWithConfirmation(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(target, "queries", "legacy.sql")); !os.IsNotExist(err) {
 		t.Fatalf("expected legacy.sql removed, got: %v", err)
 	}
-	
+
 }
 
 func TestRunWorkspaceApplyManifestOutput(t *testing.T) {
