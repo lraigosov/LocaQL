@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted. Extends [ADR 0004](0004-transition-to-proprietary-eula-license.md); does not supersede it.
+Partially superseded by [ADR 0006](0006-revert-to-apache-2.0-retire-proprietary-eula.md): the `LICENSE` restructuring and `COMMERCIAL_LICENSE.md` decisions below no longer apply now that the project has reverted to Apache-2.0. The `LICENSE_HISTORY.md`, `CLA.md`, `THIRD_PARTY_NOTICES.md`, and `.mailmap` decisions remain in effect unchanged. Originally accepted; extended [ADR 0004](0004-transition-to-proprietary-eula-license.md) without superseding it.
 
 ## Context
 

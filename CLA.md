@@ -34,9 +34,9 @@ transferable, sublicensable, and irrevocable license to use, reproduce,
 modify, create derivative works of, publicly display, publicly perform,
 sublicense, and distribute Your Contribution, and to relicense it — alone
 or combined with other work — under any terms the Licensor chooses,
-including the current proprietary `LICENSE`, a future Commercial License,
-or any other license, without further consent from, credit to, or
-compensation owed to You.
+including the current `LICENSE` (Apache License, Version 2.0), a future
+license for a different edition of the Software, or any other license,
+without further consent from, credit to, or compensation owed to You.
 
 ## 3. Patent License
 
@@ -77,6 +77,6 @@ this CLA before the revocation.
 
 ---
 
-[DRAFT NOTE: have a lawyer review this alongside `LICENSE`, `CONTRIBUTING.md`,
-and the Commercial License before relying on it for a real external
-contribution — this is not legal advice.]
+[DRAFT NOTE: have a lawyer review this alongside `LICENSE` and
+`CONTRIBUTING.md` before relying on it for a real external contribution —
+this is not legal advice.]

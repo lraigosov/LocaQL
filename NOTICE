@@ -1,20 +1,8 @@
 LocaQL
 Copyright 2026 LuisRai (github.com/lraigosov), LocaQL project authors
 
-This product is licensed under a proprietary End User License Agreement (EULA).
+This product is licensed under the Apache License, Version 2.0.
 See the LICENSE file for the full license text.
-
-Ownership and attribution
---------------------------
-LocaQL is proprietary software. Sublicensing, distributing, hosting, or 
-otherwise commercially exploiting or transferring the Software or creating 
-derivative works or commercial forks is strictly prohibited. 
-
-For any permitted non-commercial uses (such as research, education, or 
-authorized local development testing), You must keep a visible credit to the 
-original LocaQL project and its author, Luis Raigoso (linking to 
-https://github.com/lraigosov/LocaQL where practical) in any associated 
-documentation or credits surface.
 
 Project origin and non-affiliation
 -----------------------------------
@@ -53,11 +41,12 @@ intermediate `goccy/*` repositories shipped a NOTICE file carrying that
 attribution forward themselves (verified by checking each repository
 directly) — so LocaQL states it explicitly here instead of silently
 passing the gap through. Apache License 2.0 is used under license, not
-under any Google trademark or endorsement grant: LocaQL's proprietary 
-license is compatible with consuming Apache-2.0-licensed dependencies
-(no license-conflict issue), and using Google's real, permissively
-licensed open-source code here is exactly what "compatible with
-selected Google BigQuery APIs" means in practice — the SQL dialect
+under any Google trademark or endorsement grant: using Google's real,
+permissively licensed open-source code here is exactly what "compatible
+with selected Google BigQuery APIs" means in practice — the SQL dialect
 itself comes from Google's own real implementation, not a guess at its
 behavior. It does not create, and should not be read as implying,
 sponsorship, endorsement, or any other affiliation with Google LLC.
+
+See `THIRD_PARTY_NOTICES.md` for the complete, itemized inventory of
+every third-party dependency and its license.

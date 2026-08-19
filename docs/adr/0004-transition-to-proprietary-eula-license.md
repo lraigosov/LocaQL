@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted (decided in Sesión 89 to protect intellectual property and future commercial monetization). Supersedes the licensing part of [ADR 0001](0001-independent-project-apache-2.0-non-affiliation.md).
+Superseded by [ADR 0006](0006-revert-to-apache-2.0-retire-proprietary-eula.md), which reverts the project to Apache-2.0. Originally accepted (decided in Sesión 89 to protect intellectual property and future commercial monetization) and superseded the licensing part of [ADR 0001](0001-independent-project-apache-2.0-non-affiliation.md); kept here unedited as the historical record of that decision — no version of LocaQL was ever released under the proprietary terms this ADR adopted.
 
 ## Context
 
