@@ -69,7 +69,10 @@ clean:
 # see .github/workflows/ci.yml's license-scan job).
 sbom:
 	@mkdir -p $(DIST)
-	@command -v cyclonedx-gomod >/dev/null || go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@latest
+	# Pinned to v1.10.0, not @latest: v1.11.0 requires go >= 1.26.0, ahead of
+	# this project's pinned toolchain (go.mod) — see .github/workflows/ci.yml's
+	# license-scan job for the same pin and the CI failure it fixes.
+	@command -v cyclonedx-gomod >/dev/null || go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.10.0
 	cyclonedx-gomod app -json -output $(DIST)/sbom.json -main cmd/locaql -licenses .
 
 # vuln scans every imported package for known CVEs against the official Go

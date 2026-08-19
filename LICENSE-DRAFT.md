@@ -85,7 +85,7 @@ license from the Licensor:
       the Software.
 
 For information about obtaining a commercial license covering the uses
-restricted in this Section, contact the Licensor at [CONTACT EMAIL].
+restricted in this Section, contact the Licensor at luisraigoso79@gmail.com.
 
 5. CHANGE DATE AND CHANGE LICENSE
 ------------------------------------
