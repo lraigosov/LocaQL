@@ -10,3 +10,4 @@ never renumbered or deleted once accepted; a superseded decision gets a new ADR 
 | [0002](0002-real-googlesql-engine-via-goccy-googlesqlite.md) | Real GoogleSQL execution via `goccy/googlesqlite`, not a hand-rolled interpreter |
 | [0003](0003-sessions-and-transactions-in-locaqls-own-catalog.md) | Session temp tables and transactions live in LocaQL's own catalog, not the engine's |
 | [0004](0004-transition-to-proprietary-eula-license.md) | Transition from Apache-2.0 to Proprietary End User License Agreement (EULA) |
+| [0005](0005-license-hardening-third-party-split-cla-commercial-license.md) | License hardening: Third-Party Component split, CLA, and separate Commercial License |

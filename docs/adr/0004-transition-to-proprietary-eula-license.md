@@ -18,7 +18,7 @@ As LocaQL matures and is considered a viable commercial asset or a solution whos
   - **Single-Workstation execution only:** No hosting on shared local networks, cloud instances, or shared servers.
   - **No automated corporate pipelines:** Prohibit execution inside organizational CI/CD, testing, or deployment pipelines.
   - **Data scale limit:** Limit the local catalog data to 100,000 rows per table and 1 GB of cumulative storage.
-- **Contributor IP Assignment (CLA):** Per Section 6 of the EULA, any submitted code, pull requests, or suggestions automatically assign full copyright and intellectual property ownership to the Licensor (Luis Raigoso), ensuring the project can be sold or commercially licensed in the future without obtaining individual consent from community contributors.
+- **Contributor IP Assignment (CLA):** Per Section 7 of the EULA (renumbered by [ADR 0005](0005-license-hardening-third-party-split-cla-commercial-license.md)), any submitted code, pull requests, or suggestions automatically assign full copyright and intellectual property ownership to the Licensor (Luis Raigoso), ensuring the project can be sold or commercially licensed in the future without obtaining individual consent from community contributors.
 
 ## Consequences
 
