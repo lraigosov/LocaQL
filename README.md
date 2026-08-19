@@ -3,7 +3,7 @@
 [![CI](https://github.com/lraigosov/LocaQL/actions/workflows/ci.yml/badge.svg)](https://github.com/lraigosov/LocaQL/actions/workflows/ci.yml)
 [![Go Report Card](https://goreportcard.com/badge/github.com/lraigosov/LocaQL)](https://goreportcard.com/report/github.com/lraigosov/LocaQL)
 [![Latest release](https://img.shields.io/github/v/release/lraigosov/LocaQL)](https://github.com/lraigosov/LocaQL/releases)
-[![License: Proprietary](https://img.shields.io/badge/license-Proprietary-red.svg)](LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
 LocaQL is a local BigQuery-compatible development platform.
 
@@ -1107,6 +1107,6 @@ See [`SECURITY.md`](SECURITY.md) for supported versions, scope, and how to repor
 
 ## License
 
-LocaQL is licensed under a proprietary Community/Evaluation [End User License Agreement (EULA)](LICENSE). The Software is free to use strictly for academic research, personal education, training, and limited personal local development testing under that license.
+LocaQL is licensed under the [Apache License, Version 2.0](LICENSE) — the same license every tagged release has used since v0.9.0 (see [`LICENSE_HISTORY.md`](LICENSE_HISTORY.md) and [ADR 0006](docs/adr/0006-revert-to-apache-2.0-retire-proprietary-eula.md) for the full history, including a brief, never-released proprietary-EULA period that was reverted).
 
-Read the [`LICENSE`](LICENSE) file for the full terms, conditions, and strict operational boundaries of "Limited Local Development Testing" (including single-workstation constraints, prohibition of network hosting, prohibition of corporate automated pipelines, and dataset size limits of 100,000 rows/1 GB) — it also distinguishes LocaQL's own IP from the open-source Third-Party Components it's built on. Production use, hosting the Software for third parties, OEM/embedded distribution, or reselling it requires a separate [Commercial License](COMMERCIAL_LICENSE.md). Contributing code requires accepting the [Contributor License Agreement](CLA.md) (see [Contributing](#contributing)). Read [`NOTICE`](NOTICE) before using the Software for the full third-party attribution story, and [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) for the itemized dependency license inventory — both clarify that LocaQL is not affiliated with Google or BigQuery.
+Read the [`LICENSE`](LICENSE) file for the full terms. Contributing code requires accepting the [Contributor License Agreement](CLA.md) (see [Contributing](#contributing)). Read [`NOTICE`](NOTICE) before using the Software for the third-party attribution story, and [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) for the itemized dependency license inventory — both clarify that LocaQL is not affiliated with Google or BigQuery.

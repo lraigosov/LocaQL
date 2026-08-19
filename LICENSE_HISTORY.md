@@ -12,7 +12,8 @@ as dated notes, not silent changes.
 | Period | Versions | License |
 |---|---|---|
 | 2026-07-27 – 2026-08-12 (09:45 UTC-5) | v0.9.0 through v0.17.0 (every publicly tagged release to date) | Apache License, Version 2.0 |
-| 2026-08-12 (11:27 UTC-5) onward | Unreleased commits after `a2937f9`; first release under these terms is v0.18.0 or later, whichever ships next | Proprietary EULA (see `LICENSE`) |
+| 2026-08-12 (11:27 UTC-5) – 2026-08-19 | Unreleased commits after `a2937f9`; no version was ever tagged or released under these terms | Proprietary EULA (superseded, see note below) |
+| 2026-08-19 onward | All unreleased commits from this point forward; the next tagged release (v0.18.0 or later) ships under these terms | Apache License, Version 2.0 (reinstated — see [ADR 0006](docs/adr/0006-revert-to-apache-2.0-retire-proprietary-eula.md)) |
 
 ## Detail
 
@@ -44,6 +45,29 @@ as dated notes, not silent changes.
   an old MIT/Apache-licensed release even after a project relicenses going
   forward) and is not something this document, or any later change to
   `LICENSE`, alters.
+
+## Reversion to Apache-2.0 (2026-08-19)
+
+The proprietary EULA adopted at `a2937f9` (2026-08-12) is retired. The
+decision, its full context, and the reasoning behind reverting are recorded
+in [ADR 0006](docs/adr/0006-revert-to-apache-2.0-retire-proprietary-eula.md);
+in short, no version was ever released under the proprietary terms, so this
+reversion has no user-facing migration cost, and a repo/market-validation
+audit found no evidence of external adoption to build a closed-license
+business on top of yet. `LICENSE` is restored to the same Apache License,
+Version 2.0 text used for v0.9.0–v0.17.0. `COMMERCIAL_LICENSE.md` is
+removed — it granted, for a fee, rights (SaaS/hosting, OEM, reselling,
+sublicensing) that Apache-2.0 already grants to everyone at no charge, so
+keeping it would have been self-contradictory. `CLA.md` remains in force
+unchanged in substance: contributor IP assignment is independent of which
+license currently governs users, and keeping it preserves the owner's
+ability to offer a different license for a future edition of the Software
+if a genuine commercial opportunity ever materializes.
+
+This does not reopen or alter anything in the table above: the proprietary
+period is recorded as having genuinely applied to unreleased commits between
+`a2937f9` and this reversion, exactly as it happened, per this document's
+own no-silent-editing rule.
 
 ## A note on an unrelated dangling artifact (corrected after further verification)
 
