@@ -4,6 +4,8 @@ All notable user-facing changes to LocaQL are documented here, in the style of [
 
 ## [Unreleased]
 
+## [0.17.1] - 2026-09-04
+
 ### Changed
 - Reverted `LICENSE` to the Apache License, Version 2.0 — the same license every tagged release has used since v0.9.0. A brief proprietary EULA period (introduced after v0.17.0) never had a release ship under it and is now retired; `COMMERCIAL_LICENSE.md` is removed since it granted, for a fee, rights Apache-2.0 already grants everyone at no charge. `CLA.md` is unchanged in substance. See [`LICENSE_HISTORY.md`](LICENSE_HISTORY.md) and [ADR 0006](docs/adr/0006-revert-to-apache-2.0-retire-proprietary-eula.md) for the full reasoning.
 
